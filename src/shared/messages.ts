@@ -1,4 +1,8 @@
 import { err, ok, type AppError, type Result } from './result';
+import type {
+  TranslationErrorCode,
+  TranslationProviderSelection,
+} from '../translation/types';
 
 export const MESSAGE_PROTOCOL = 'subtwin' as const;
 export const MESSAGE_PROTOCOL_VERSION = 1 as const;
@@ -11,6 +15,52 @@ export type ExtensionContext =
   | 'popup';
 
 export interface MessagePayloadMap {
+  readonly 'translation/cancel': {
+    readonly sessionId: string;
+    readonly episodeGeneration: number;
+    readonly providerGeneration: number;
+    readonly reason:
+      | 'disabled'
+      | 'episode-change'
+      | 'official-track'
+      | 'player-disposed'
+      | 'provider-change';
+  };
+  readonly 'translation/cancelled': {
+    readonly sessionId: string;
+    readonly episodeGeneration: number;
+    readonly providerGeneration: number;
+    readonly accepted: boolean;
+  };
+  readonly 'translation/request': {
+    readonly taskId: string;
+    readonly sessionId: string;
+    readonly episodeId: string;
+    readonly trackHash: string;
+    readonly provider: TranslationProviderSelection;
+    readonly sourceLanguage: 'en';
+    readonly targetLanguage: 'zh-Hans';
+    readonly episodeGeneration: number;
+    readonly providerGeneration: number;
+    readonly priority: 'bulk' | 'urgent';
+    readonly cues: readonly TranslationMessageCue[];
+    readonly context: readonly TranslationMessageCue[];
+  };
+  readonly 'translation/result': {
+    readonly taskId: string;
+    readonly sessionId: string;
+    readonly provider: TranslationProviderSelection;
+    readonly episodeGeneration: number;
+    readonly providerGeneration: number;
+    readonly status: 'error' | 'success';
+    readonly translations: readonly {
+      readonly cueId: string;
+      readonly text: string;
+    }[];
+    readonly retryCueIds: readonly string[];
+    readonly errorCode: TranslationErrorCode | null;
+    readonly retryable: boolean;
+  };
   readonly 'netflix/catalog-summary': {
     readonly sessionId: string;
     readonly generation: number;
@@ -33,6 +83,13 @@ export interface MessagePayloadMap {
     readonly requestId: string;
     readonly ready: true;
   };
+}
+
+export interface TranslationMessageCue {
+  readonly id: string;
+  readonly startMs: number;
+  readonly endMs: number;
+  readonly text: string;
 }
 
 export type MessageType = keyof MessagePayloadMap;
@@ -106,6 +163,58 @@ export function parseMessageEnvelope(
 
   if (
     input.source === 'content' &&
+    input.type === 'translation/cancel' &&
+    isTranslationCancelPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { ...input.payload },
+    }));
+  }
+
+  if (
+    input.source === 'background' &&
+    input.type === 'translation/cancelled' &&
+    isTranslationCancelledPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { ...input.payload },
+    }));
+  }
+
+  if (
+    input.source === 'content' &&
+    input.type === 'translation/request' &&
+    isTranslationRequestPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: snapshotTranslationRequestPayload(input.payload),
+    }));
+  }
+
+  if (
+    input.source === 'background' &&
+    input.type === 'translation/result' &&
+    isTranslationResultPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: snapshotTranslationResultPayload(input.payload),
+    }));
+  }
+
+  if (
+    input.source === 'content' &&
     input.type === 'netflix/probe-status' &&
     isNetflixProbeStatusPayload(input.payload)
   ) {
@@ -163,6 +272,246 @@ export function parseMessageEnvelope(
   }
 
   return invalidMessage();
+}
+
+function isTranslationCancelPayload(
+  value: unknown,
+): value is MessagePayloadMap['translation/cancel'] {
+  return (
+    isRecord(value) &&
+    hasExactlyKeys(value, [
+      'episodeGeneration',
+      'providerGeneration',
+      'reason',
+      'sessionId',
+    ]) &&
+    isOpaqueId(value.sessionId) &&
+    isGeneration(value.episodeGeneration) &&
+    isGeneration(value.providerGeneration) &&
+    (value.reason === 'disabled' ||
+      value.reason === 'episode-change' ||
+      value.reason === 'official-track' ||
+      value.reason === 'player-disposed' ||
+      value.reason === 'provider-change')
+  );
+}
+
+function isTranslationCancelledPayload(
+  value: unknown,
+): value is MessagePayloadMap['translation/cancelled'] {
+  return (
+    isRecord(value) &&
+    hasExactlyKeys(value, [
+      'accepted',
+      'episodeGeneration',
+      'providerGeneration',
+      'sessionId',
+    ]) &&
+    isOpaqueId(value.sessionId) &&
+    isGeneration(value.episodeGeneration) &&
+    isGeneration(value.providerGeneration) &&
+    typeof value.accepted === 'boolean'
+  );
+}
+
+const TRANSLATION_REQUEST_KEYS = [
+  'context',
+  'cues',
+  'episodeGeneration',
+  'episodeId',
+  'priority',
+  'provider',
+  'providerGeneration',
+  'sessionId',
+  'sourceLanguage',
+  'targetLanguage',
+  'taskId',
+  'trackHash',
+] as const;
+
+function isTranslationRequestPayload(
+  value: unknown,
+): value is MessagePayloadMap['translation/request'] {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, TRANSLATION_REQUEST_KEYS) ||
+    !isOpaqueId(value.taskId) ||
+    !isOpaqueId(value.sessionId) ||
+    !isOpaqueId(value.episodeId) ||
+    !isOpaqueId(value.trackHash) ||
+    !isTranslationProviderSelection(value.provider) ||
+    value.sourceLanguage !== 'en' ||
+    value.targetLanguage !== 'zh-Hans' ||
+    !isGeneration(value.episodeGeneration) ||
+    !isGeneration(value.providerGeneration) ||
+    (value.priority !== 'bulk' && value.priority !== 'urgent') ||
+    !Array.isArray(value.cues) ||
+    !Array.isArray(value.context) ||
+    value.context.length > 50 ||
+    !value.cues.every(isTranslationMessageCue) ||
+    !value.context.every(isTranslationMessageCue)
+  ) return false;
+
+  const cueIds = value.cues.map(({ id }) => id);
+  if (new Set(cueIds).size !== cueIds.length) return false;
+
+  if (value.provider === 'google-free' && value.cues.length !== 1) return false;
+  if (value.provider !== 'google-free' && (value.cues.length < 1 || value.cues.length > 25)) {
+    return false;
+  }
+  return boundedJsonBytes(value, 512 * 1024);
+}
+
+function isTranslationResultPayload(
+  value: unknown,
+): value is MessagePayloadMap['translation/result'] {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, [
+      'episodeGeneration',
+      'errorCode',
+      'provider',
+      'providerGeneration',
+      'retryCueIds',
+      'retryable',
+      'sessionId',
+      'status',
+      'taskId',
+      'translations',
+    ]) ||
+    !isOpaqueId(value.taskId) ||
+    !isOpaqueId(value.sessionId) ||
+    !isTranslationProviderSelection(value.provider) ||
+    !isGeneration(value.episodeGeneration) ||
+    !isGeneration(value.providerGeneration) ||
+    (value.status !== 'error' && value.status !== 'success') ||
+    !Array.isArray(value.translations) ||
+    value.translations.length > 25 ||
+    !value.translations.every(isTranslationResultCue) ||
+    !Array.isArray(value.retryCueIds) ||
+    value.retryCueIds.length > 25 ||
+    !value.retryCueIds.every(isOpaqueId) ||
+    typeof value.retryable !== 'boolean'
+  ) return false;
+
+  if (value.status === 'success') {
+    if (value.provider === 'unset' || value.errorCode !== null || value.retryable) return false;
+  } else if (!isTranslationErrorCode(value.errorCode)) {
+    return false;
+  } else if (value.translations.length > 0 || value.retryCueIds.length > 0) {
+    return false;
+  }
+  const translatedIds = value.translations.map(({ cueId }) => cueId);
+  if (new Set(translatedIds).size !== translatedIds.length) return false;
+  if (new Set(value.retryCueIds).size !== value.retryCueIds.length) return false;
+  const translatedSet = new Set(translatedIds);
+  if (value.retryCueIds.some((cueId) => translatedSet.has(cueId))) return false;
+  return boundedJsonBytes(value, 512 * 1024);
+}
+
+function snapshotTranslationRequestPayload(
+  payload: MessagePayloadMap['translation/request'],
+): MessagePayloadMap['translation/request'] {
+  return {
+    taskId: payload.taskId,
+    sessionId: payload.sessionId,
+    episodeId: payload.episodeId,
+    trackHash: payload.trackHash,
+    provider: payload.provider,
+    sourceLanguage: payload.sourceLanguage,
+    targetLanguage: payload.targetLanguage,
+    episodeGeneration: payload.episodeGeneration,
+    providerGeneration: payload.providerGeneration,
+    priority: payload.priority,
+    cues: payload.cues.map(snapshotTranslationCue),
+    context: payload.context.map(snapshotTranslationCue),
+  };
+}
+
+function snapshotTranslationResultPayload(
+  payload: MessagePayloadMap['translation/result'],
+): MessagePayloadMap['translation/result'] {
+  return {
+    taskId: payload.taskId,
+    sessionId: payload.sessionId,
+    provider: payload.provider,
+    episodeGeneration: payload.episodeGeneration,
+    providerGeneration: payload.providerGeneration,
+    status: payload.status,
+    translations: payload.translations.map(({ cueId, text }) => ({ cueId, text })),
+    retryCueIds: [...payload.retryCueIds],
+    errorCode: payload.errorCode,
+    retryable: payload.retryable,
+  };
+}
+
+function snapshotTranslationCue(cue: TranslationMessageCue): TranslationMessageCue {
+  return {
+    id: cue.id,
+    startMs: cue.startMs,
+    endMs: cue.endMs,
+    text: cue.text,
+  };
+}
+
+function isTranslationMessageCue(value: unknown): value is TranslationMessageCue {
+  return (
+    isRecord(value) &&
+    hasExactlyKeys(value, ['endMs', 'id', 'startMs', 'text']) &&
+    isOpaqueId(value.id) &&
+    isTimestamp(value.startMs) &&
+    isTimestamp(value.endMs) &&
+    value.endMs > value.startMs &&
+    typeof value.text === 'string' &&
+    value.text.trim().length > 0 &&
+    value.text.length <= 32_768
+  );
+}
+
+function isTranslationResultCue(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    hasExactlyKeys(value, ['cueId', 'text']) &&
+    isOpaqueId(value.cueId) &&
+    typeof value.text === 'string' &&
+    value.text.trim().length > 0 &&
+    value.text.length <= 16_384
+  );
+}
+
+function isTranslationProviderSelection(value: unknown): boolean {
+  return value === 'deepseek' || value === 'google-free' || value === 'unset';
+}
+
+const TRANSLATION_ERROR_CODES: readonly TranslationErrorCode[] = [
+  'aborted',
+  'authentication_failed',
+  'insufficient_balance',
+  'invalid_configuration',
+  'invalid_request',
+  'invalid_response',
+  'provider_forbidden',
+  'provider_unavailable',
+  'provider_unset',
+  'rate_limited',
+  'stale_generation',
+  'timeout',
+];
+
+function isTranslationErrorCode(value: unknown): value is TranslationErrorCode {
+  return typeof value === 'string' && TRANSLATION_ERROR_CODES.some((code) => code === value);
+}
+
+function isTimestamp(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function boundedJsonBytes(value: unknown, maximum: number): boolean {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength <= maximum;
+  } catch {
+    return false;
+  }
 }
 
 const EXTENSION_CONTEXTS: readonly ExtensionContext[] = [

@@ -109,6 +109,166 @@ describe('cross-context message envelopes', () => {
     });
   });
 
+  it('accepts only an exact credential-free translation request schema', () => {
+    const request = createMessage({
+      id: 'translation-1',
+      source: 'content',
+      type: 'translation/request',
+      payload: {
+        taskId: 'task-1',
+        sessionId: 'session-1',
+        episodeId: 'episode_hash_1',
+        trackHash: 'track_hash_1',
+        provider: 'deepseek',
+        sourceLanguage: 'en',
+        targetLanguage: 'zh-Hans',
+        episodeGeneration: 1,
+        providerGeneration: 2,
+        priority: 'urgent',
+        cues: [{ id: 'cue-1', startMs: 0, endMs: 1_000, text: 'Hello.' }],
+        context: [],
+      },
+    });
+
+    expect(parseMessageEnvelope(request)).toEqual({ ok: true, value: request });
+    for (const forbidden of [
+      { apiKey: 'secret' },
+      { Authorization: 'Bearer secret' },
+      { headers: { Authorization: 'secret' } },
+      { endpoint: 'https://example.test' },
+      { model: 'deepseek-v4-pro' },
+    ]) {
+      expect(parseMessageEnvelope({
+        ...request,
+        payload: { ...request.payload, ...forbidden },
+      }).ok).toBe(false);
+    }
+  });
+
+  it('accepts only an exact content-originated translation cancellation schema', () => {
+    const cancel = createMessage({
+      id: 'translation-cancel-1',
+      source: 'content',
+      type: 'translation/cancel',
+      payload: {
+        sessionId: 'session-1',
+        episodeGeneration: 3,
+        providerGeneration: 2,
+        reason: 'official-track',
+      },
+    });
+    const acknowledgement = createMessage({
+      id: 'translation-cancel-1:background',
+      source: 'background',
+      type: 'translation/cancelled',
+      payload: {
+        sessionId: 'session-1',
+        episodeGeneration: 3,
+        providerGeneration: 2,
+        accepted: true,
+      },
+    });
+
+    expect(parseMessageEnvelope(cancel)).toEqual({ ok: true, value: cancel });
+    expect(parseMessageEnvelope(acknowledgement)).toEqual({
+      ok: true,
+      value: acknowledgement,
+    });
+    expect(parseMessageEnvelope({
+      ...cancel,
+      payload: { ...cancel.payload, apiKey: 'must-not-cross-the-boundary' },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({ ...cancel, source: 'page' }).ok).toBe(false);
+    expect(parseMessageEnvelope({ ...acknowledgement, source: 'content' }).ok).toBe(false);
+  });
+
+  it('snapshots translation fields before any asynchronous background work', () => {
+    const candidate = {
+      protocol: 'subtwin',
+      version: 1,
+      id: 'translation-snapshot',
+      source: 'content',
+      type: 'translation/request',
+      payload: {
+        taskId: 'task-1',
+        sessionId: 'session-1',
+        episodeId: 'episode_hash_1',
+        trackHash: 'track_hash_1',
+        provider: 'deepseek',
+        sourceLanguage: 'en',
+        targetLanguage: 'zh-Hans',
+        episodeGeneration: 1,
+        providerGeneration: 1,
+        priority: 'urgent',
+        cues: [{ id: 'cue-1', startMs: 0, endMs: 1_000, text: 'Original' }],
+        context: [],
+      },
+    };
+
+    const parsed = parseMessageEnvelope(candidate);
+    candidate.payload.cues[0]!.text = 'Mutated after validation';
+
+    expect(parsed).toMatchObject({
+      ok: true,
+      value: { payload: { cues: [{ text: 'Original' }] } },
+    });
+  });
+
+  it('rejects duplicate request cue IDs and inconsistent result sets', () => {
+    const basePayload = {
+      taskId: 'task-1',
+      sessionId: 'session-1',
+      episodeId: 'episode_hash_1',
+      trackHash: 'track_hash_1',
+      provider: 'deepseek',
+      sourceLanguage: 'en',
+      targetLanguage: 'zh-Hans',
+      episodeGeneration: 1,
+      providerGeneration: 1,
+      priority: 'urgent',
+      cues: [
+        { id: 'cue-1', startMs: 0, endMs: 1_000, text: 'One' },
+        { id: 'cue-1', startMs: 1_000, endMs: 2_000, text: 'Duplicate' },
+      ],
+      context: [],
+    };
+    expect(parseMessageEnvelope({
+      protocol: 'subtwin', version: 1, id: 'duplicate', source: 'content',
+      type: 'translation/request', payload: basePayload,
+    }).ok).toBe(false);
+
+    const resultBase = {
+      taskId: 'task-1',
+      sessionId: 'session-1',
+      provider: 'deepseek',
+      episodeGeneration: 1,
+      providerGeneration: 1,
+      status: 'success',
+      translations: [{ cueId: 'cue-1', text: '译文' }],
+      retryCueIds: [],
+      errorCode: null,
+      retryable: false,
+    };
+    const envelope = (payload: unknown) => ({
+      protocol: 'subtwin', version: 1, id: 'result', source: 'background',
+      type: 'translation/result', payload,
+    });
+    expect(parseMessageEnvelope(envelope({
+      ...resultBase,
+      translations: [...resultBase.translations, ...resultBase.translations],
+    })).ok).toBe(false);
+    expect(parseMessageEnvelope(envelope({
+      ...resultBase,
+      retryCueIds: ['cue-1'],
+    })).ok).toBe(false);
+    expect(parseMessageEnvelope(envelope({
+      ...resultBase,
+      status: 'error',
+      errorCode: 'provider_unavailable',
+      retryable: true,
+    })).ok).toBe(false);
+  });
+
   it.each([
     null,
     [],
