@@ -10,6 +10,124 @@ import {
 import { DEFAULT_SETTINGS } from '../../src/storage/schema';
 
 describe('cross-context message envelopes', () => {
+  it('accepts only credential-free runtime settings exchange between content and background', () => {
+    const getSettings = createMessage({
+      id: 'runtime-settings-get-1',
+      source: 'content',
+      type: 'runtime/settings-get',
+      payload: {},
+    });
+    const settingsState = createMessage({
+      id: 'runtime-settings-get-1:background',
+      source: 'background',
+      type: 'runtime/settings-state',
+      payload: {
+        enabled: true,
+        provider: 'deepseek',
+        deepseekKeyReady: true,
+        appearance: DEFAULT_SETTINGS.appearance,
+      },
+    });
+
+    expect(parseMessageEnvelope(getSettings)).toEqual({
+      ok: true,
+      value: getSettings,
+    });
+    expect(parseMessageEnvelope(settingsState)).toEqual({
+      ok: true,
+      value: settingsState,
+    });
+
+    for (const forbidden of [
+      { apiKey: 'must-stay-in-background' },
+      { model: 'deepseek-v4-pro' },
+      { deepseek: { apiKey: 'secret', model: 'deepseek-v4-pro' } },
+      { diagnostic: 'free-form text' },
+    ]) {
+      expect(parseMessageEnvelope({
+        ...settingsState,
+        payload: { ...settingsState.payload, ...forbidden },
+      }).ok).toBe(false);
+    }
+
+    expect(parseMessageEnvelope({
+      ...getSettings,
+      payload: { apiKey: 'secret' },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({ ...getSettings, source: 'popup' }).ok).toBe(false);
+    expect(parseMessageEnvelope({ ...settingsState, source: 'content' }).ok).toBe(false);
+  });
+
+  it('accepts only a strict content-originated runtime status', () => {
+    const official = createMessage({
+      id: 'runtime-status-1',
+      source: 'content',
+      type: 'runtime/status-set',
+      payload: { mode: 'official' },
+    });
+    const failure = createMessage({
+      id: 'runtime-status-2',
+      source: 'content',
+      type: 'runtime/status-set',
+      payload: { mode: 'error', code: 'authentication_failed' },
+    });
+
+    expect(parseMessageEnvelope(official)).toEqual({ ok: true, value: official });
+    expect(parseMessageEnvelope(failure)).toEqual({ ok: true, value: failure });
+    expect(parseMessageEnvelope({
+      ...official,
+      payload: { mode: 'official', message: 'free-form status text' },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({
+      ...failure,
+      payload: {
+        mode: 'error',
+        code: 'provider_unavailable',
+        details: 'Bearer secret',
+      },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({
+      ...failure,
+      payload: { mode: 'error', code: 'arbitrary_failure' },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({ ...official, source: 'background' }).ok).toBe(false);
+  });
+
+  it('accepts only exact content-originated Netflix session lifecycle state', () => {
+    const active = createMessage({
+      id: 'netflix-session-1',
+      source: 'content',
+      type: 'netflix/session-state',
+      payload: {
+        sessionId: 'session-1',
+        episodeId: 'episode_hash_1',
+        generation: 3,
+        state: 'active',
+      },
+    });
+    const disposed = createMessage({
+      ...active,
+      id: 'netflix-session-2',
+      payload: { ...active.payload, state: 'disposed' },
+    });
+
+    expect(parseMessageEnvelope(active)).toEqual({ ok: true, value: active });
+    expect(parseMessageEnvelope(disposed)).toEqual({ ok: true, value: disposed });
+    expect(parseMessageEnvelope({
+      ...active,
+      payload: { ...active.payload, rawTitle: 'private title' },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({
+      ...active,
+      payload: { ...active.payload, state: 'paused' },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({
+      ...active,
+      payload: { ...active.payload, generation: -1 },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({ ...active, source: 'page' }).ok).toBe(false);
+  });
+
   it('creates a versioned, type-safe health-check request', () => {
     const message = createMessage({
       id: 'request-1',

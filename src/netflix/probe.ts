@@ -3,7 +3,6 @@ import {
   MAX_NETFLIX_BRIDGE_BYTES,
   type NetflixCatalogPayload,
   type NetflixCatalogTrackDescriptor,
-  type NetflixTimedTextPayload,
 } from './bridge';
 
 export const MAX_TIMED_TEXT_BYTES = MAX_NETFLIX_BRIDGE_BYTES;
@@ -40,6 +39,17 @@ export interface TimedTextResourceIdentity {
   readonly resourceId: string;
   readonly trackId: string;
   readonly language: string;
+}
+
+/** A page-observed body is not bridge-ready until runtime binds it to an
+ * authoritative Player title and matching track. */
+export interface NetflixObservedTimedTextPayload {
+  readonly type: 'timed-text';
+  readonly resourceId: string;
+  readonly trackId: string;
+  readonly language: string;
+  readonly format: 'ttml' | 'webvtt';
+  readonly body: string;
 }
 
 export function canonicalizeNetflixTimedTextResource(
@@ -182,8 +192,10 @@ export interface ProbeInstallation {
 export interface NetworkProbeOptions {
   readonly generation: number;
   readonly currentGeneration: () => number;
-  readonly onTimedText: (payload: NetflixTimedTextPayload) => void;
+  readonly onTimedText: (payload: NetflixObservedTimedTextPayload) => void;
   readonly onCatalog?: (payload: NetflixCatalogPayload) => void;
+  /** MAIN-world only. Raw metadata must never be bridged, logged, or persisted. */
+  readonly onCatalogMetadata?: (metadata: unknown) => void;
   readonly maxBytes?: number;
   readonly schedule?: (task: () => void) => void;
 }
@@ -191,8 +203,9 @@ export interface NetworkProbeOptions {
 interface ResolvedNetworkProbeOptions {
   readonly generation: number;
   readonly currentGeneration: () => number;
-  readonly onTimedText: (payload: NetflixTimedTextPayload) => void;
+  readonly onTimedText: (payload: NetflixObservedTimedTextPayload) => void;
   readonly onCatalog: (payload: NetflixCatalogPayload) => void;
+  readonly onCatalogMetadata: (metadata: unknown) => void;
   readonly maxBytes: number;
   readonly schedule: (task: () => void) => void;
 }
@@ -205,6 +218,7 @@ function snapshotProbeOptions(
     currentGeneration: options.currentGeneration,
     onTimedText: options.onTimedText,
     onCatalog: options.onCatalog ?? (() => undefined),
+    onCatalogMetadata: options.onCatalogMetadata ?? (() => undefined),
     maxBytes: options.maxBytes ?? MAX_TIMED_TEXT_BYTES,
     schedule: options.schedule ?? queueMicrotask,
   };
@@ -264,9 +278,13 @@ export function installFetchProbe(
                 catalog,
                 observedOptions.maxBytes,
               ).then(
-                (payload) => {
-                  if (payload !== null && isCurrent(observedOptions)) {
-                    safeEmit(observedOptions.onCatalog, payload);
+                (inspected) => {
+                  if (inspected !== null && isCurrent(observedOptions)) {
+                    safeEmit(
+                      observedOptions.onCatalogMetadata,
+                      inspected.metadata,
+                    );
+                    safeEmit(observedOptions.onCatalog, inspected.payload);
                   }
                 },
                 () => undefined,
@@ -375,7 +393,7 @@ function prepareFetchResponse(
 async function inspectFetchResponse(
   response: PreparedFetchResponse,
   maxBytes: number,
-): Promise<NetflixTimedTextPayload | null> {
+): Promise<NetflixObservedTimedTextPayload | null> {
   const timedText = await readBoundedTimedText(
     response.clone,
     response.contentType,
@@ -431,7 +449,10 @@ function prepareCatalogFetchResponse(
 async function inspectCatalogFetchResponse(
   response: PreparedCatalogFetchResponse,
   maxBytes: number,
-): Promise<NetflixCatalogPayload | null> {
+): Promise<{
+  readonly metadata: unknown;
+  readonly payload: NetflixCatalogPayload;
+} | null> {
   const body = await readBoundedUtf8(
     response.clone,
     response.contentLength,
@@ -448,7 +469,7 @@ async function inspectCatalogFetchResponse(
   const catalog = extractCatalogObservation(parsed, {
     allowSyntheticAuthoritative: false,
   });
-  return catalog.ok ? catalog.value : null;
+  return catalog.ok ? { metadata: parsed, payload: catalog.value } : null;
 }
 
 async function readBoundedUtf8(
@@ -774,6 +795,7 @@ export function installXhrProbe(
                 observedOptions.maxBytes,
                 observedOptions.onTimedText,
                 observedOptions.onCatalog,
+                observedOptions.onCatalogMetadata,
               );
             } catch {
               // Observation failures must never escape into Netflix callbacks.
@@ -841,8 +863,9 @@ function inspectLoadedXhr(
   xhr: XhrLike,
   openedCandidate: string | null,
   maxBytes: number,
-  emit: (payload: NetflixTimedTextPayload) => void,
+  emit: (payload: NetflixObservedTimedTextPayload) => void,
   emitCatalog: (payload: NetflixCatalogPayload) => void,
+  emitCatalogMetadata: (metadata: unknown) => void,
 ): void {
   if (xhr.responseType !== '' && xhr.responseType !== 'text') return;
   if (openedCandidate === null) return;
@@ -893,7 +916,10 @@ function inspectLoadedXhr(
     const catalog = extractCatalogObservation(parsed, {
       allowSyntheticAuthoritative: false,
     });
-    if (catalog.ok) safeEmit(emitCatalog, catalog.value);
+    if (catalog.ok) {
+      safeEmit(emitCatalogMetadata, parsed);
+      safeEmit(emitCatalog, catalog.value);
+    }
     return;
   }
 

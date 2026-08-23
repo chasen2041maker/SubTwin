@@ -1,24 +1,22 @@
-import { ok } from '../src/shared/result';
 import {
-  createMessage,
-  parseMessageEnvelope,
-} from '../src/shared/messages';
+  createBackgroundMessageRouter,
+  createNetflixSessionRegistry,
+} from '../src/app/background-runtime';
+import { RUNTIME_STATUS_STORAGE_KEY } from '../src/app/status';
+import { createMessage } from '../src/shared/messages';
 import { createBackgroundTranslationHandler } from '../src/translation/background';
 import { TranslationCache } from '../src/translation/cache';
 import { createSettingsActionHandler } from '../src/storage/background-actions';
 import { restrictStorageToTrustedContexts } from '../src/storage/access';
 import { SettingsStore } from '../src/storage/settings';
-import {
-  isTrustedSettingsSender,
-  type SettingsPageAudience,
-} from '../src/storage/trusted-sender';
-import type { MessageType } from '../src/shared/messages';
 
 export default defineBackground({
   type: 'module',
   main() {
     const cache = new TranslationCache();
     const settingsStore = new SettingsStore();
+    const sessions = createNetflixSessionRegistry();
+    let pushSequence = 0;
     const ready = (async () => {
       await restrictStorageToTrustedContexts(browser.storage.local);
       await settingsStore.load();
@@ -40,71 +38,49 @@ export default defineBackground({
       fetch: globalThis.fetch.bind(globalThis),
       cache,
       settingsStore,
-      readCurrentEpisodeId: async () => undefined,
+      readCurrentEpisodeId: async () => sessions.readCurrentEpisodeId(),
     });
-
+    const routeMessage = createBackgroundMessageRouter({
+      runtimeId: browser.runtime.id,
+      extensionBaseUrl: browser.runtime.getURL(''),
+      sessionRegistry: sessions,
+      loadSettings: () => settingsStore.load(),
+      handleTranslation,
+      handleSettingsAction,
+      writeRuntimeStatus: async (status) => {
+        await browser.storage.local.set({
+          [RUNTIME_STATUS_STORAGE_KEY]: status,
+        });
+      },
+      broadcastRuntimeSettings: async (
+        settings,
+        translationConfigurationChanged,
+      ) => {
+        const message = createMessage({
+          id: `runtime-settings-push-${
+            translationConfigurationChanged ? 'config' : 'display'
+          }-${Date.now()}-${++pushSequence}`,
+          source: 'background',
+          type: 'runtime/settings-state',
+          payload: settings,
+        });
+        const tabs = await browser.tabs.query({
+          url: 'https://www.netflix.com/*',
+        });
+        await Promise.all(tabs.map(async (tab) => {
+          if (tab.id === undefined) return;
+          try {
+            await browser.tabs.sendMessage(tab.id, message);
+          } catch {
+            // A Netflix tab without an active content script is expected.
+          }
+        }));
+      },
+    });
     browser.runtime.onMessage.addListener(async (candidate: unknown, sender) => {
       await ready;
-      const boundary = parseMessageEnvelope(candidate);
-      if (boundary.ok) {
-        const audience = settingsActionAudience(
-          boundary.value.type,
-          boundary.value.source,
-        );
-        if (audience !== null) {
-          if (!isTrustedSettingsSender(
-            sender,
-            audience,
-            browser.runtime.id,
-            browser.runtime.getURL(''),
-          )) return undefined;
-          return handleSettingsAction(boundary.value);
-        }
-      }
-
-      const translation = await handleTranslation(candidate);
-      if (translation !== undefined) return translation;
-
-      const parsed = boundary;
-
-      if (!parsed.ok) {
-        return parsed;
-      }
-
-      if (parsed.value.type !== 'system/health-check') {
-        return undefined;
-      }
-
-      return ok(
-          createMessage({
-            id: `${parsed.value.id}:background`,
-            source: 'background',
-            type: 'system/health-response',
-            payload: {
-              requestId: parsed.value.id,
-              ready: true,
-            },
-          }),
-        );
+      return routeMessage(candidate, sender);
     });
+    browser.tabs.onRemoved.addListener((tabId) => sessions.removeTab(tabId));
   },
 });
-
-function settingsActionAudience(
-  type: MessageType,
-  source: string,
-): SettingsPageAudience | null {
-  if (
-    type === 'settings/cache-clear' ||
-    type === 'settings/deepseek-test' ||
-    type === 'settings/options-update' ||
-    type === 'settings/private-get'
-  ) return 'options';
-  if (type === 'settings/enabled-set' && (source === 'options' || source === 'popup')) {
-    return source;
-  }
-  if (type === 'settings/public-get') {
-    return 'popup';
-  }
-  return null;
-}

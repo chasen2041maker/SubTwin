@@ -15,6 +15,7 @@ const WINDOW_SOURCE = {};
 
 const timedText: NetflixBridgePayload = {
   type: 'timed-text',
+  titleId: 'title-1',
   resourceId: 'tt_0123456789abcdef',
   trackId: 'en-main',
   language: 'en',
@@ -104,6 +105,14 @@ describe('Netflix MAIN-world bridge', () => {
       parse({
         ...base,
         payload: { type: 'media', drm: 'widevine', body: 'bytes' },
+      }).ok,
+    ).toBe(false);
+    const { titleId: _missingTitleId, ...unboundTimedText } = timedText;
+    expect(parse({ ...base, payload: unboundTimedText }).ok).toBe(false);
+    expect(
+      parse({
+        ...base,
+        payload: { ...timedText, titleId: '../unsafe-title' },
       }).ok,
     ).toBe(false);
   });

@@ -1,11 +1,14 @@
 import { err, ok, type AppError, type Result } from './result';
+import { parseRuntimeStatus, type RuntimeStatus } from '../app/status';
 import type {
   TranslationErrorCode,
   TranslationProviderSelection,
 } from '../translation/types';
 import {
   isExactSubTwinSettings,
+  isExactRuntimeSettingsState,
   normalizeSettings,
+  type RuntimeSettingsState,
   type SubTwinSettings,
   type TranslationProviderSetting,
 } from '../storage/schema';
@@ -21,6 +24,9 @@ export type ExtensionContext =
   | 'popup';
 
 export interface MessagePayloadMap {
+  readonly 'runtime/settings-get': Record<string, never>;
+  readonly 'runtime/settings-state': RuntimeSettingsState;
+  readonly 'runtime/status-set': RuntimeStatus;
   readonly 'settings/enabled-set': {
     readonly enabled: boolean;
   };
@@ -126,6 +132,12 @@ export interface MessagePayloadMap {
     readonly generation: number;
     readonly status: 'connected' | 'disposed' | 'unsupported';
   };
+  readonly 'netflix/session-state': {
+    readonly sessionId: string;
+    readonly episodeId: string;
+    readonly generation: number;
+    readonly state: 'active' | 'disposed';
+  };
   readonly 'system/health-check': {
     readonly sentAt: number;
   };
@@ -213,6 +225,47 @@ export function parseMessageEnvelope(
     !isExtensionContext(input.source)
   ) {
     return invalidMessage();
+  }
+
+  if (
+    input.source === 'content' &&
+    input.type === 'runtime/settings-get' &&
+    isEmptyRecord(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: {},
+    }));
+  }
+
+  if (
+    input.source === 'background' &&
+    input.type === 'runtime/settings-state' &&
+    isExactRuntimeSettingsState(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: snapshotRuntimeSettingsState(input.payload),
+    }));
+  }
+
+  if (
+    input.source === 'content' &&
+    input.type === 'runtime/status-set'
+  ) {
+    const status = parseRuntimeStatus(input.payload);
+    if (status !== null) {
+      return ok(createMessage({
+        id: input.id,
+        source: input.source,
+        type: input.type,
+        payload: status,
+      }));
+    }
   }
 
   if (
@@ -457,6 +510,19 @@ export function parseMessageEnvelope(
   }
 
   if (
+    input.source === 'content' &&
+    input.type === 'netflix/session-state' &&
+    isNetflixSessionStatePayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { ...input.payload },
+    }));
+  }
+
+  if (
     input.type === 'system/health-check' &&
     isHealthCheckPayload(input.payload)
   ) {
@@ -489,6 +555,25 @@ export function parseMessageEnvelope(
 
 function isEmptyRecord(value: unknown): value is Record<string, never> {
   return isRecord(value) && Object.keys(value).length === 0;
+}
+
+function snapshotRuntimeSettingsState(
+  value: RuntimeSettingsState,
+): RuntimeSettingsState {
+  return {
+    enabled: value.enabled,
+    provider: value.provider,
+    deepseekKeyReady: value.deepseekKeyReady,
+    appearance: {
+      english: { ...value.appearance.english },
+      chinese: { ...value.appearance.chinese },
+      order: value.appearance.order,
+      lineSpacingPx: value.appearance.lineSpacingPx,
+      verticalOffsetPercent: value.appearance.verticalOffsetPercent,
+      backgroundOpacity: value.appearance.backgroundOpacity,
+      shadow: value.appearance.shadow,
+    },
+  };
 }
 
 function isSettingsEnabledSetPayload(
@@ -905,6 +990,17 @@ function isNetflixCatalogSummaryPayload(
     value.tracks.length <= 256 &&
     value.tracks.every(isNetflixCatalogTrack)
   );
+}
+
+function isNetflixSessionStatePayload(
+  value: unknown,
+): value is MessagePayloadMap['netflix/session-state'] {
+  return isRecord(value) &&
+    hasExactlyKeys(value, ['episodeId', 'generation', 'sessionId', 'state']) &&
+    isOpaqueId(value.sessionId) &&
+    isOpaqueId(value.episodeId) &&
+    isGeneration(value.generation) &&
+    (value.state === 'active' || value.state === 'disposed');
 }
 
 function isNetflixCatalogTrack(

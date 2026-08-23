@@ -24,6 +24,7 @@ export interface NetflixCatalogPayload {
 
 export interface NetflixTimedTextPayload {
   readonly type: 'timed-text';
+  readonly titleId: string;
   readonly resourceId: string;
   readonly trackId: string;
   readonly language: string;
@@ -260,9 +261,11 @@ function parsePayload(
       'format',
       'language',
       'resourceId',
+      'titleId',
       'trackId',
       'type',
     ]) &&
+    isOpaqueId(value.titleId) &&
     isOpaqueResourceId(value.resourceId) &&
     isOpaqueId(value.trackId) &&
     isLanguage(value.language) &&
@@ -274,6 +277,7 @@ function parsePayload(
     }
     return ok({
       type: 'timed-text',
+      titleId: value.titleId,
       resourceId: value.resourceId,
       trackId: value.trackId,
       language: value.language,

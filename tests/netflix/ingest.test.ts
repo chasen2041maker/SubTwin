@@ -8,6 +8,7 @@ describe('isolated-world timed-text ingestion', () => {
     const result = parseNetflixTimedTextPayload(
       {
         type: 'timed-text',
+        titleId: 'title-1',
         resourceId: 'tt_0123456789abcdef',
         trackId: 'en-main',
         language: 'en-US',
@@ -15,6 +16,7 @@ describe('isolated-world timed-text ingestion', () => {
         body: 'WEBVTT\n\n00:00.000 --> 00:01.000\nHello world',
       },
       {
+        titleId: 'title-1',
         resourceId: 'tt_0123456789abcdef',
         trackId: 'en-main',
         languageTag: 'en-US',
@@ -36,6 +38,7 @@ describe('isolated-world timed-text ingestion', () => {
     const ttml = parseNetflixTimedTextPayload(
       {
         type: 'timed-text',
+        titleId: 'title-1',
         resourceId: 'tt_1111111111111111',
         trackId: 'zh-main',
         language: 'zh-CN',
@@ -43,6 +46,7 @@ describe('isolated-world timed-text ingestion', () => {
         body: '<tt xmlns="http://www.w3.org/ns/ttml"><body><div><p begin="0s" end="1s">你好</p></div></body></tt>',
       },
       {
+        titleId: 'title-1',
         resourceId: 'tt_1111111111111111',
         trackId: 'zh-main',
         languageTag: 'zh-CN',
@@ -57,6 +61,7 @@ describe('isolated-world timed-text ingestion', () => {
     const mismatch = parseNetflixTimedTextPayload(
       {
         type: 'timed-text',
+        titleId: 'title-1',
         resourceId: 'tt_2222222222222222',
         trackId: 'en-main',
         language: 'en',
@@ -64,6 +69,7 @@ describe('isolated-world timed-text ingestion', () => {
         body: 'WEBVTT\n\nsecret subtitle',
       },
       {
+        titleId: 'title-1',
         resourceId: 'tt_3333333333333333',
         trackId: 'en-main',
         languageTag: 'en',
@@ -81,6 +87,7 @@ describe('isolated-world timed-text ingestion', () => {
     const mismatch = parseNetflixTimedTextPayload(
       {
         type: 'timed-text',
+        titleId: 'title-1',
         resourceId: 'tt_0123456789abcdef',
         trackId: 'zh-main',
         language: 'zh-CN',
@@ -88,6 +95,7 @@ describe('isolated-world timed-text ingestion', () => {
         body: 'WEBVTT\n\nprivate subtitle text',
       },
       {
+        titleId: 'title-1',
         resourceId: 'tt_0123456789abcdef',
         trackId: 'en-main',
         languageTag: 'en-US',
@@ -102,10 +110,38 @@ describe('isolated-world timed-text ingestion', () => {
     expect(JSON.stringify(mismatch)).not.toContain('private subtitle text');
   });
 
+  it('rejects a body bound to another title before parsing it', () => {
+    const mismatch = parseNetflixTimedTextPayload(
+      {
+        type: 'timed-text',
+        titleId: 'preview-title',
+        resourceId: 'tt_0123456789abcdef',
+        trackId: 'en-main',
+        language: 'en',
+        format: 'webvtt',
+        body: 'WEBVTT\n\nprivate cross-title subtitle',
+      },
+      {
+        titleId: 'title-1',
+        resourceId: 'tt_0123456789abcdef',
+        trackId: 'en-main',
+        languageTag: 'en',
+        kind: 'subtitle',
+      },
+    );
+
+    expect(mismatch).toMatchObject({
+      ok: false,
+      error: { code: 'netflix_timed_text_identity_mismatch' },
+    });
+    expect(JSON.stringify(mismatch)).not.toContain('private cross-title subtitle');
+  });
+
   it('rejects direct payloads above the bridge byte limit', () => {
     const result = parseNetflixTimedTextPayload(
       {
         type: 'timed-text',
+        titleId: 'title-1',
         resourceId: 'tt_0123456789abcdef',
         trackId: 'en-main',
         language: 'en',
@@ -113,6 +149,7 @@ describe('isolated-world timed-text ingestion', () => {
         body: 'x'.repeat(MAX_NETFLIX_BRIDGE_BYTES + 1),
       },
       {
+        titleId: 'title-1',
         resourceId: 'tt_0123456789abcdef',
         trackId: 'en-main',
         languageTag: 'en',

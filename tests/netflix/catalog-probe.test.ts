@@ -105,11 +105,13 @@ describe('conservative Netflix catalog observation', () => {
       fetch: vi.fn(() => originalPromise),
     };
     const onCatalog = vi.fn();
+    const onCatalogMetadata = vi.fn();
     const handle = installFetchProbe(target, {
       generation: 1,
       currentGeneration: () => 1,
       onTimedText: vi.fn(),
       onCatalog,
+      onCatalogMetadata,
     });
 
     expect(
@@ -127,6 +129,7 @@ describe('conservative Netflix catalog observation', () => {
         ]),
       }),
     );
+    expect(onCatalogMetadata).toHaveBeenCalledWith(catalogFixture());
     handle.dispose();
   });
 

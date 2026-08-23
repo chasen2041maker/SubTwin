@@ -44,6 +44,13 @@ export interface PublicSubTwinSettings {
   appearance: SubtitleAppearanceSettings;
 }
 
+export interface RuntimeSettingsState {
+  enabled: boolean;
+  provider: TranslationProviderSetting;
+  deepseekKeyReady: boolean;
+  appearance: SubtitleAppearanceSettings;
+}
+
 const mutableDefaults: SubTwinSettings = {
   schemaVersion: SETTINGS_SCHEMA_VERSION,
   enabled: true,
@@ -81,6 +88,68 @@ export function normalizeSettings(input: unknown): SubTwinSettings {
 
 export function isExactSubTwinSettings(input: unknown): input is SubTwinSettings {
   return jsonValuesEqual(input, normalizeCandidate(input));
+}
+
+export function isExactSubtitleAppearanceSettings(
+  input: unknown,
+): input is SubtitleAppearanceSettings {
+  const value = asRecord(input);
+  return value !== null &&
+    hasExactlyKeys(value, [
+      'backgroundOpacity',
+      'chinese',
+      'english',
+      'lineSpacingPx',
+      'order',
+      'shadow',
+      'verticalOffsetPercent',
+    ]) &&
+    isExactLanguageAppearance(value.english) &&
+    isExactLanguageAppearance(value.chinese) &&
+    (value.order === 'english-first' || value.order === 'chinese-first') &&
+    isIntegerInRange(value.lineSpacingPx, 0, 48) &&
+    isNumberInRange(value.verticalOffsetPercent, 0, 40) &&
+    isNumberInRange(value.backgroundOpacity, 0, 1) &&
+    (value.shadow === 'none' || value.shadow === 'soft' || value.shadow === 'strong');
+}
+
+export function isExactPublicSubTwinSettings(
+  input: unknown,
+): input is PublicSubTwinSettings {
+  const value = asRecord(input);
+  const deepseek = asRecord(value?.deepseek);
+  return value !== null &&
+    hasExactlyKeys(value, [
+      'appearance',
+      'deepseek',
+      'enabled',
+      'provider',
+      'schemaVersion',
+    ]) &&
+    value.schemaVersion === SETTINGS_SCHEMA_VERSION &&
+    typeof value.enabled === 'boolean' &&
+    isTranslationProviderSetting(value.provider) &&
+    deepseek !== null &&
+    hasExactlyKeys(deepseek, ['model']) &&
+    isDeepSeekModelSetting(deepseek.model) &&
+    isExactSubtitleAppearanceSettings(value.appearance);
+}
+
+export function isExactRuntimeSettingsState(
+  input: unknown,
+): input is RuntimeSettingsState {
+  const value = asRecord(input);
+  return value !== null &&
+    hasExactlyKeys(value, [
+      'appearance',
+      'deepseekKeyReady',
+      'enabled',
+      'provider',
+    ]) &&
+    typeof value.enabled === 'boolean' &&
+    isTranslationProviderSetting(value.provider) &&
+    typeof value.deepseekKeyReady === 'boolean' &&
+    isExactSubtitleAppearanceSettings(value.appearance);
 }
 
 export function migrateSettings(input: unknown): SubTwinSettings {
@@ -185,6 +254,29 @@ function normalizeLanguageAppearance(
   };
 }
 
+function isExactLanguageAppearance(
+  input: unknown,
+): input is SubtitleLanguageAppearance {
+  const value = asRecord(input);
+  return value !== null &&
+    hasExactlyKeys(value, ['color', 'fontSizePx', 'fontWeight', 'visible']) &&
+    typeof value.visible === 'boolean' &&
+    typeof value.color === 'string' &&
+    /^#[\dA-F]{6}$/u.test(value.color) &&
+    isIntegerInRange(value.fontSizePx, 12, 72) &&
+    isIntegerInRange(value.fontWeight, 100, 900);
+}
+
+function isTranslationProviderSetting(
+  value: unknown,
+): value is TranslationProviderSetting {
+  return value === 'deepseek' || value === 'google-free' || value === 'unset';
+}
+
+function isDeepSeekModelSetting(value: unknown): value is DeepSeekModelSetting {
+  return value === 'deepseek-v4-flash' || value === 'deepseek-v4-pro';
+}
+
 function normalizeProvider(value: unknown): TranslationProviderSetting {
   return value === 'google-free' || value === 'deepseek' || value === 'unset'
     ? value
@@ -241,10 +333,38 @@ function finiteNumberInRange(
   return integer ? Math.round(clamped) : clamped;
 }
 
+function isNumberInRange(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+): value is number {
+  return typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= minimum &&
+    value <= maximum;
+}
+
+function isIntegerInRange(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+): value is number {
+  return isNumberInRange(value, minimum, maximum) && Number.isInteger(value);
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function hasExactlyKeys(
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length &&
+    keys.every((key) => expected.includes(key));
 }
 
 function jsonValuesEqual(left: unknown, right: unknown): boolean {

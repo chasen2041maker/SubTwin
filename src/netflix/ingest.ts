@@ -17,6 +17,7 @@ const SAFE_TRACK_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const RESOURCE_ID = /^tt_[a-f0-9]{16}$/u;
 
 export interface NetflixTimedTextIdentity {
+  readonly titleId: string;
   readonly resourceId: string;
   readonly trackId: string;
   readonly languageTag: string;
@@ -44,6 +45,7 @@ export function parseNetflixTimedTextPayload(
 
   const language = normalizeNetflixLanguageTag(identity.languageTag);
   if (
+    !SAFE_TRACK_ID.test(identity.titleId) ||
     !RESOURCE_ID.test(identity.resourceId) ||
     !SAFE_TRACK_ID.test(identity.trackId) ||
     language === null ||
@@ -55,7 +57,10 @@ export function parseNetflixTimedTextPayload(
     );
   }
 
-  if (payload.resourceId !== identity.resourceId) {
+  if (
+    payload.titleId !== identity.titleId ||
+    payload.resourceId !== identity.resourceId
+  ) {
     return ingestError(
       'netflix_timed_text_identity_mismatch',
       'The Netflix timed-text payload belongs to another resource.',
@@ -95,16 +100,19 @@ function isTimedTextPayload(value: unknown): value is NetflixTimedTextPayload {
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
   return (
-    keys.length === 6 &&
+    keys.length === 7 &&
     keys.every((key) => [
       'body',
       'format',
       'language',
       'resourceId',
       'trackId',
+      'titleId',
       'type',
     ].includes(key)) &&
     record.type === 'timed-text' &&
+    typeof record.titleId === 'string' &&
+    SAFE_TRACK_ID.test(record.titleId) &&
     typeof record.resourceId === 'string' &&
     RESOURCE_ID.test(record.resourceId) &&
     typeof record.trackId === 'string' &&
