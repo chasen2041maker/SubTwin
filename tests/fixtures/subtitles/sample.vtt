@@ -1,0 +1,19 @@
+﻿WEBVTT - artificial fixture
+
+STYLE
+::cue { color: lime; }
+
+REGION
+id:bottom
+width:80%
+
+NOTE generated example only
+This block is ignored.
+
+alpha-source
+00:00:01.000 --> 00:00:02.500 line:90% align:start
+Alpha &amp; <b>beta</b>
+Gamma &#33;
+
+00:03.000 --> 00:04.250
+Delta &#x1F44B; &lt;epsilon&gt;.

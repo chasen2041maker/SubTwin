@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tt:tt xmlns:tt="http://www.w3.org/ns/ttml"
+       xmlns:ttp="http://www.w3.org/ns/ttml#parameter"
+       xmlns:xml="http://www.w3.org/XML/1998/namespace"
+       xml:lang="en"
+       ttp:frameRate="30"
+       ttp:frameRateMultiplier="1000 1001"
+       ttp:tickRate="100">
+  <tt:body>
+    <tt:div>
+      <tt:p xml:id="line-a" begin="1s" end="2.5s">Alpha <tt:span>&amp; beta</tt:span><tt:br/>Gamma.</tt:p>
+      <tt:p begin="300t" dur="60f">Delta &lt; epsilon.</tt:p>
+    </tt:div>
+  </tt:body>
+</tt:tt>
