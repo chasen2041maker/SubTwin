@@ -2,9 +2,9 @@
 
 **Source Plan:** `docs/plans/2026-08-23-subtwin-mvp.md`
 
-**Generated:** 2026-08-23T18:00:00+08:00
+**Updated:** 2026-08-23
 
-**Status:** PENDING_APPROVAL
+**Status:** APPROVED_FOR_IMPLEMENTATION
 
 ---
 
@@ -27,7 +27,7 @@
 
 - [ ] Test, type-check, and production build scripts pass.
 - [ ] Output is a valid MV3 extension without secrets.
-- [ ] Permissions follow least privilege.
+- [ ] Permissions follow least privilege and include only fixed Netflix, DeepSeek, and Google Translate hosts; any Netflix CDN pattern must be justified by the technical probe.
 
 ### chunk-02: Subtitle domain, parsers, and official-track alignment
 
@@ -44,7 +44,8 @@
 
 **Acceptance Criteria:**
 
-- [ ] TTML and WebVTT normalize deterministically.
+- [ ] TTML namespaces, nested spans, `<br>`, entities, WebVTT settings, and malformed inputs normalize deterministically.
+- [ ] `tickRate`, `frameRate`, and `frameRateMultiplier` are honored without a hard-coded 24 fps assumption.
 - [ ] Time-based alignment covers segmentation edge cases.
 - [ ] Malformed input returns typed failures.
 - [ ] Official alignment is independent from translation.
@@ -59,17 +60,23 @@
 
 **Files:**
 
-- creates: subtitle-source contract, Netflix types/adapter, main-world probe, isolated content entrypoint, adapter tests
+- creates: subtitle-source contract, Netflix types/adapter, native subtitle clock, main-world probe, isolated content entrypoint, adapter/clock tests
 - modifies: `src/shared/messages.ts`, `wxt.config.ts`
 
 **Acceptance Criteria:**
 
 - [ ] Manual probe enumerates relevant tracks.
 - [ ] Only sanitized timed-text data crosses the bridge.
+- [ ] Page bridge messages use a nonce and strict URL/shape/size validation.
+- [ ] Fetch/XHR instrumentation is idempotent/non-blocking and rejects audio, video, and bodies over 10 MB.
+- [ ] Range URL canonicalization deduplicates segments without merging language tracks.
+- [ ] Only an authoritative current-title track catalog can unlock external translation.
+- [ ] Provisional tracks are urgent-window only; bulk work requires active/confirmed state.
+- [ ] Old-generation callbacks and signed-URL logging/persistence are prohibited.
 - [ ] Episode/remount lifecycle is disposable.
 - [ ] Unsupported payloads preserve native behavior.
 
-### chunk-04: DeepSeek provider, validation, scheduling, and cache
+### chunk-04: Translation providers, validation, scheduling, and persistent cache
 
 **Skill:** frontend-dev
 
@@ -79,15 +86,20 @@
 
 **Files:**
 
-- creates: translation contracts, provider, prompt, validator, scheduler, cache, and related tests
+- creates: translation contracts, Google Free and DeepSeek providers, prompt, validator, scheduler, persistent cache, and related tests
 - modifies: `entrypoints/background.ts`, `src/shared/messages.ts`
 
 **Acceptance Criteria:**
 
-- [ ] Provider error matrix is covered by contract tests.
+- [ ] Google Free and DeepSeek error matrices are covered by provider contract tests.
+- [ ] Google uses `en` to `zh-CN`, a versioned parser, bounded throttling/backoff, no 403 retry, and query-safe diagnostics.
+- [ ] Provider failures never trigger automatic cross-provider calls.
 - [ ] Scheduling prioritizes playback and avoids duplicate work.
+- [ ] Urgent work has reserved capacity and can promote queued background work.
 - [ ] Partial retry is bounded and targeted.
-- [ ] Cache prevents repeat API calls.
+- [ ] Provider-separated persistent cache prevents repeat API calls across browser restarts.
+- [ ] Provider/episode generation changes reject late render and cache writes.
+- [ ] Only background reads the DeepSeek key; `provider = unset` produces zero calls.
 - [ ] Secrets cannot leak across page/log/test boundaries.
 
 ### chunk-05: Versioned settings, popup, options, and subtitle overlay
@@ -107,7 +119,9 @@
 
 - [ ] Practical appearance settings preview and persist.
 - [ ] Schema migration is covered.
+- [ ] First-run provider is `unset`; explicit selection, Google privacy disclosure, and experimental labeling are visible and persistent.
 - [ ] Overlay is isolated and pointer-transparent.
+- [ ] Overlay accepts normalized active-cue state and contains no Netflix selector/timing logic.
 - [ ] Key presentation and diagnostics do not leak secrets.
 - [ ] Native subtitle restoration is reliable.
 
@@ -126,8 +140,12 @@
 
 **Acceptance Criteria:**
 
-- [ ] Official bilingual mode makes zero provider calls.
-- [ ] AI mode prioritizes, warms, and caches translations.
+- [ ] Official bilingual mode makes zero external provider calls.
+- [ ] Discovery and `provider = unset` modes make zero external provider calls.
+- [ ] Google Free and DeepSeek modes use only the explicitly selected provider.
+- [ ] Provider-neutral scheduling prioritizes, warms, and caches translations by provider.
+- [ ] Switching provider or discovering an official track aborts the old generation and rejects stale results.
+- [ ] Native subtitle mutation timing has a tested binary-search time fallback.
 - [ ] Failures preserve playback/subtitles.
 - [ ] Player lifecycle does not leak overlays/listeners.
 - [ ] Automated and manual release checks pass.
@@ -182,8 +200,9 @@ Chunks 03, 04, and 05 are independent after chunk-02 and may be developed in par
 
 ---
 
-## User Decision Required
+## Execution Readiness
 
-- [ ] Approve chunk breakdown.
-- [ ] Approve execution order.
-- [ ] Confirm readiness to execute.
+- [x] Chunk breakdown approved.
+- [x] Execution order approved.
+- [x] Architecture/provider choices confirmed.
+- [ ] Implementation has not started.
