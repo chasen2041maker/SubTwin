@@ -1,0 +1,39 @@
+{
+  "name": "subtwin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Official-first English and Simplified Chinese subtitles for Netflix.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.12.0",
+    "pnpm": ">=10"
+  },
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "dev": "wxt --browser chrome --mv3",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "wxt prepare && tsc --noEmit --project tsconfig.json",
+    "build": "wxt build --browser chrome --mv3",
+    "zip": "wxt zip --browser chrome --mv3",
+    "release": "pnpm run test && pnpm run typecheck && pnpm run zip",
+    "postinstall": "wxt prepare"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.2.7",
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@wxt-dev/module-react": "1.2.2",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vitest": "4.1.11",
+    "web-ext": "10.6.0",
+    "wxt": "0.21.4"
+  }
+}
