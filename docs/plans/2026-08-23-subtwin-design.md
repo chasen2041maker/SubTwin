@@ -1,7 +1,8 @@
 # SubTwin MVP Design
 
-**Date:** 2026-08-23  
-**Status:** Approved  
+**Date:** 2026-08-23
+
+**Status:** Approved
 **Target:** Personal-use Chrome extension, with clean boundaries for a future paid product
 
 ## 1. Product goal

@@ -1,7 +1,9 @@
 # Chunked Execution Analysis
 
-**Source Plan:** `docs/plans/2026-08-23-subtwin-mvp.md`  
-**Generated:** 2026-08-23T18:00:00+08:00  
+**Source Plan:** `docs/plans/2026-08-23-subtwin-mvp.md`
+
+**Generated:** 2026-08-23T18:00:00+08:00
+
 **Status:** PENDING_APPROVAL
 
 ---
@@ -10,8 +12,10 @@
 
 ### chunk-01: Extension scaffold and shared contracts
 
-**Skill:** frontend-dev  
-**Complexity:** COMPLEX  
+**Skill:** frontend-dev
+
+**Complexity:** COMPLEX
+
 **Dependencies:** none
 
 **Files:**
@@ -27,8 +31,10 @@
 
 ### chunk-02: Subtitle domain, parsers, and official-track alignment
 
-**Skill:** frontend-dev  
-**Complexity:** COMPLEX  
+**Skill:** frontend-dev
+
+**Complexity:** COMPLEX
+
 **Dependencies:** chunk-01
 
 **Files:**
@@ -45,8 +51,10 @@
 
 ### chunk-03: Netflix subtitle-source adapter and technical probe
 
-**Skill:** frontend-dev  
-**Complexity:** COMPLEX  
+**Skill:** frontend-dev
+
+**Complexity:** COMPLEX
+
 **Dependencies:** chunk-01, chunk-02
 
 **Files:**
@@ -63,8 +71,10 @@
 
 ### chunk-04: DeepSeek provider, validation, scheduling, and cache
 
-**Skill:** frontend-dev  
-**Complexity:** COMPLEX  
+**Skill:** frontend-dev
+
+**Complexity:** COMPLEX
+
 **Dependencies:** chunk-01, chunk-02
 
 **Files:**
@@ -82,8 +92,10 @@
 
 ### chunk-05: Versioned settings, popup, options, and subtitle overlay
 
-**Skill:** frontend-dev + frontend-design + react-best-practices  
-**Complexity:** COMPLEX  
+**Skill:** frontend-dev + frontend-design + react-best-practices
+
+**Complexity:** COMPLEX
+
 **Dependencies:** chunk-01, chunk-02
 
 **Files:**
@@ -101,8 +113,10 @@
 
 ### chunk-06: Routing controller, integration, and release verification
 
-**Skill:** frontend-dev + react-best-practices  
-**Complexity:** COMPLEX  
+**Skill:** frontend-dev + react-best-practices
+
+**Complexity:** COMPLEX
+
 **Dependencies:** chunk-03, chunk-04, chunk-05
 
 **Files:**

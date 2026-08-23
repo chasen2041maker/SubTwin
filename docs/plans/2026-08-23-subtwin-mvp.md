@@ -191,4 +191,3 @@ Wire collection, routing, official alignment, AI scheduling, cache, status, and 
 - `chrome.storage.local` is suitable for a personal BYOK MVP but is not a secure place for a vendor-owned key in a public paid extension.
 - Hiding native subtitles before the custom overlay is ready could leave the user with no subtitles; restoration is a release gate.
 - Manual Netflix verification requires the user's authenticated browser session and suitable titles in the user's region.
-
