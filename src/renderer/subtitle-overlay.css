@@ -1,0 +1,82 @@
+:host {
+  all: initial;
+  position: fixed;
+  inset: 0;
+  z-index: 2147483000;
+  display: block;
+  overflow: hidden;
+  pointer-events: none;
+  contain: layout style;
+}
+
+.subtwin-overlay-root,
+.subtwin-overlay {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.subtwin-overlay {
+  box-sizing: border-box;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0 max(4vw, env(safe-area-inset-right, 0px))
+    calc(
+      env(safe-area-inset-bottom, 0px) + max(2vh, 16px) +
+        (var(--subtwin-vertical-offset) * 1vh)
+    )
+    max(4vw, env(safe-area-inset-left, 0px));
+  font-family:
+    Bahnschrift, "Avenir Next", "Microsoft YaHei", sans-serif;
+  text-align: center;
+  text-rendering: geometricPrecision;
+}
+
+.subtwin-overlay__cue {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: var(--subtwin-line-spacing);
+  max-width: min(92vw, 72rem);
+  padding: 0.18em 0.48em 0.24em;
+  border-radius: 0.16em;
+  background: rgb(0 0 0 / var(--subtwin-background-opacity));
+}
+
+.subtwin-overlay__line {
+  margin: 0;
+  padding: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.26;
+  white-space: pre-wrap;
+  text-shadow: var(--subtwin-text-shadow);
+}
+
+.subtwin-overlay__line--english {
+  color: var(--subtwin-en-color);
+  font-size: var(--subtwin-en-size);
+  font-weight: var(--subtwin-en-weight);
+}
+
+.subtwin-overlay__line--chinese {
+  color: var(--subtwin-zh-color);
+  font-size: var(--subtwin-zh-size);
+  font-weight: var(--subtwin-zh-weight);
+}
+
+@media (max-width: 700px), (max-height: 520px) {
+  .subtwin-overlay__cue {
+    max-width: 96vw;
+  }
+
+  .subtwin-overlay__line--english {
+    font-size: min(var(--subtwin-en-size), 5.2vw);
+  }
+
+  .subtwin-overlay__line--chinese {
+    font-size: min(var(--subtwin-zh-size), 5.8vw);
+  }
+}

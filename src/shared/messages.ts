@@ -3,6 +3,12 @@ import type {
   TranslationErrorCode,
   TranslationProviderSelection,
 } from '../translation/types';
+import {
+  isExactSubTwinSettings,
+  normalizeSettings,
+  type SubTwinSettings,
+  type TranslationProviderSetting,
+} from '../storage/schema';
 
 export const MESSAGE_PROTOCOL = 'subtwin' as const;
 export const MESSAGE_PROTOCOL_VERSION = 1 as const;
@@ -15,6 +21,50 @@ export type ExtensionContext =
   | 'popup';
 
 export interface MessagePayloadMap {
+  readonly 'settings/enabled-set': {
+    readonly enabled: boolean;
+  };
+  readonly 'settings/enabled-set-result': {
+    readonly status: 'error' | 'success';
+    readonly errorCode: 'settings_unavailable' | null;
+    readonly enabled: boolean;
+    readonly provider: TranslationProviderSetting;
+  };
+  readonly 'settings/options-update': {
+    readonly settings: SubTwinSettings;
+    readonly updateEnabled: boolean;
+  };
+  readonly 'settings/options-update-result': {
+    readonly status: 'error' | 'success';
+    readonly errorCode: 'settings_unavailable' | null;
+    readonly enabled: boolean;
+  };
+  readonly 'settings/private-get': Record<string, never>;
+  readonly 'settings/private-get-result': {
+    readonly settings: SubTwinSettings;
+  };
+  readonly 'settings/public-get': Record<string, never>;
+  readonly 'settings/public-get-result': {
+    readonly enabled: boolean;
+    readonly provider: TranslationProviderSetting;
+  };
+  readonly 'settings/cache-clear': {
+    readonly scope: 'all' | 'episode';
+  };
+  readonly 'settings/cache-clear-result': {
+    readonly scope: 'all' | 'episode';
+    readonly status: 'error' | 'success';
+    readonly errorCode:
+      | 'cache_unavailable'
+      | 'current_episode_unavailable'
+      | null;
+  };
+  readonly 'settings/deepseek-test': Record<string, never>;
+  readonly 'settings/deepseek-test-result': {
+    readonly status: 'error' | 'success';
+    readonly errorCode: TranslationErrorCode | null;
+    readonly retryable: boolean;
+  };
   readonly 'translation/cancel': {
     readonly sessionId: string;
     readonly episodeGeneration: number;
@@ -134,7 +184,11 @@ export function createMessage<Type extends MessageType>(
 export function parseMessageEnvelope(
   input: unknown,
 ): Result<ExtensionMessage, MessageValidationError> {
-  if (!isRecord(input) || input.protocol !== MESSAGE_PROTOCOL) {
+  if (
+    !isRecord(input) ||
+    !hasExactlyKeys(input, ['id', 'payload', 'protocol', 'source', 'type', 'version']) ||
+    input.protocol !== MESSAGE_PROTOCOL
+  ) {
     return invalidMessage();
   }
 
@@ -159,6 +213,165 @@ export function parseMessageEnvelope(
     !isExtensionContext(input.source)
   ) {
     return invalidMessage();
+  }
+
+  if (
+    input.source === 'options' &&
+    input.type === 'settings/private-get' &&
+    isEmptyRecord(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: {},
+    }));
+  }
+
+  if (
+    input.source === 'popup' &&
+    input.type === 'settings/public-get' &&
+    isEmptyRecord(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: {},
+    }));
+  }
+
+  if (
+    (input.source === 'popup' || input.source === 'options') &&
+    input.type === 'settings/enabled-set' &&
+    isSettingsEnabledSetPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { enabled: input.payload.enabled },
+    }));
+  }
+
+  if (
+    input.source === 'options' &&
+    input.type === 'settings/options-update' &&
+    isSettingsOptionsUpdatePayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: {
+        settings: normalizeSettings(input.payload.settings),
+        updateEnabled: input.payload.updateEnabled,
+      },
+    }));
+  }
+
+  if (
+    input.source === 'options' &&
+    input.type === 'settings/deepseek-test' &&
+    isEmptyRecord(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: {},
+    }));
+  }
+
+  if (
+    input.source === 'options' &&
+    input.type === 'settings/cache-clear' &&
+    isSettingsCacheClearPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { scope: input.payload.scope },
+    }));
+  }
+
+  if (
+    input.source === 'background' &&
+    input.type === 'settings/private-get-result' &&
+    isSettingsPrivateGetResultPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { settings: normalizeSettings(input.payload.settings) },
+    }));
+  }
+
+  if (
+    input.source === 'background' &&
+    input.type === 'settings/public-get-result' &&
+    isSettingsPublicGetResultPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { ...input.payload },
+    }));
+  }
+
+  if (
+    input.source === 'background' &&
+    input.type === 'settings/enabled-set-result' &&
+    isSettingsEnabledSetResultPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { ...input.payload },
+    }));
+  }
+
+  if (
+    input.source === 'background' &&
+    input.type === 'settings/options-update-result' &&
+    isSettingsOptionsUpdateResultPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { ...input.payload },
+    }));
+  }
+
+  if (
+    input.source === 'background' &&
+    input.type === 'settings/deepseek-test-result' &&
+    isSettingsDeepSeekTestResultPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { ...input.payload },
+    }));
+  }
+
+  if (
+    input.source === 'background' &&
+    input.type === 'settings/cache-clear-result' &&
+    isSettingsCacheClearResultPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: { ...input.payload },
+    }));
   }
 
   if (
@@ -272,6 +485,114 @@ export function parseMessageEnvelope(
   }
 
   return invalidMessage();
+}
+
+function isEmptyRecord(value: unknown): value is Record<string, never> {
+  return isRecord(value) && Object.keys(value).length === 0;
+}
+
+function isSettingsEnabledSetPayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/enabled-set'] {
+  return isRecord(value) &&
+    hasExactlyKeys(value, ['enabled']) &&
+    typeof value.enabled === 'boolean';
+}
+
+function isSettingsOptionsUpdatePayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/options-update'] {
+  return isRecord(value) &&
+    hasExactlyKeys(value, ['settings', 'updateEnabled']) &&
+    typeof value.updateEnabled === 'boolean' &&
+    isExactSubTwinSettings(value.settings);
+}
+
+function isSettingsPublicGetResultPayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/public-get-result'] {
+  return isRecord(value) &&
+    hasExactlyKeys(value, ['enabled', 'provider']) &&
+    typeof value.enabled === 'boolean' &&
+    isSettingsProvider(value.provider);
+}
+
+function isSettingsPrivateGetResultPayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/private-get-result'] {
+  return isRecord(value) &&
+    hasExactlyKeys(value, ['settings']) &&
+    isExactSubTwinSettings(value.settings);
+}
+
+function isSettingsEnabledSetResultPayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/enabled-set-result'] {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, ['enabled', 'errorCode', 'provider', 'status']) ||
+    typeof value.enabled !== 'boolean' ||
+    !isSettingsProvider(value.provider) ||
+    (value.status !== 'error' && value.status !== 'success')
+  ) return false;
+  return value.status === 'success'
+    ? value.errorCode === null
+    : value.errorCode === 'settings_unavailable';
+}
+
+function isSettingsOptionsUpdateResultPayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/options-update-result'] {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, ['enabled', 'errorCode', 'status']) ||
+    typeof value.enabled !== 'boolean' ||
+    (value.status !== 'error' && value.status !== 'success')
+  ) return false;
+  return value.status === 'success'
+    ? value.errorCode === null
+    : value.errorCode === 'settings_unavailable';
+}
+
+function isSettingsProvider(value: unknown): value is TranslationProviderSetting {
+  return value === 'unset' || value === 'google-free' || value === 'deepseek';
+}
+
+function isSettingsCacheClearPayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/cache-clear'] {
+  return isRecord(value) &&
+    hasExactlyKeys(value, ['scope']) &&
+    (value.scope === 'all' || value.scope === 'episode');
+}
+
+function isSettingsDeepSeekTestResultPayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/deepseek-test-result'] {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, ['errorCode', 'retryable', 'status']) ||
+    (value.status !== 'error' && value.status !== 'success') ||
+    typeof value.retryable !== 'boolean'
+  ) return false;
+  return value.status === 'success'
+    ? value.errorCode === null && !value.retryable
+    : isTranslationErrorCode(value.errorCode);
+}
+
+function isSettingsCacheClearResultPayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/cache-clear-result'] {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, ['errorCode', 'scope', 'status']) ||
+    (value.scope !== 'all' && value.scope !== 'episode') ||
+    (value.status !== 'error' && value.status !== 'success')
+  ) return false;
+  return value.status === 'success'
+    ? value.errorCode === null
+    : value.errorCode === 'cache_unavailable' ||
+        value.errorCode === 'current_episode_unavailable';
 }
 
 function isTranslationCancelPayload(

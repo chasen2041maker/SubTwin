@@ -7,6 +7,7 @@ import {
   parseMessageEnvelope,
   type MessageFor,
 } from '../../src/shared/messages';
+import { DEFAULT_SETTINGS } from '../../src/storage/schema';
 
 describe('cross-context message envelopes', () => {
   it('creates a versioned, type-safe health-check request', () => {
@@ -180,6 +181,113 @@ describe('cross-context message envelopes', () => {
     }).ok).toBe(false);
     expect(parseMessageEnvelope({ ...cancel, source: 'page' }).ok).toBe(false);
     expect(parseMessageEnvelope({ ...acknowledgement, source: 'content' }).ok).toBe(false);
+  });
+
+  it('accepts strict credential-free options actions and background results', () => {
+    const deepseekTest = createMessage({
+      id: 'settings-test-1',
+      source: 'options',
+      type: 'settings/deepseek-test',
+      payload: {},
+    });
+    const cacheClear = createMessage({
+      id: 'settings-cache-1',
+      source: 'options',
+      type: 'settings/cache-clear',
+      payload: { scope: 'all' },
+    });
+    const deepseekResult = createMessage({
+      id: 'settings-test-1:background',
+      source: 'background',
+      type: 'settings/deepseek-test-result',
+      payload: {
+        status: 'success',
+        errorCode: null,
+        retryable: false,
+      },
+    });
+    const cacheResult = createMessage({
+      id: 'settings-cache-1:background',
+      source: 'background',
+      type: 'settings/cache-clear-result',
+      payload: { scope: 'all', status: 'success', errorCode: null },
+    });
+
+    for (const message of [deepseekTest, cacheClear, deepseekResult, cacheResult]) {
+      expect(parseMessageEnvelope(message)).toEqual({ ok: true, value: message });
+    }
+    expect(parseMessageEnvelope({
+      ...deepseekTest,
+      payload: { apiKey: 'must-remain-in-background-storage' },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({
+      ...cacheClear,
+      payload: { scope: 'episode', episodeId: 'private-title-id' },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({ ...deepseekTest, source: 'content' }).ok).toBe(false);
+  });
+
+  it('accepts exact page-scoped settings mutations and safe popup results', () => {
+    const optionsUpdate = createMessage({
+      id: 'settings-update-1',
+      source: 'options',
+      type: 'settings/options-update',
+      payload: { settings: DEFAULT_SETTINGS, updateEnabled: false },
+    });
+    const publicGet = createMessage({
+      id: 'settings-public-1',
+      source: 'popup',
+      type: 'settings/public-get',
+      payload: {},
+    });
+    const privateGet = createMessage({
+      id: 'settings-private-1',
+      source: 'options',
+      type: 'settings/private-get',
+      payload: {},
+    });
+    const privateResult = createMessage({
+      id: 'settings-private-1:background',
+      source: 'background',
+      type: 'settings/private-get-result',
+      payload: { settings: DEFAULT_SETTINGS },
+    });
+    const enabledSet = createMessage({
+      id: 'settings-enabled-1',
+      source: 'popup',
+      type: 'settings/enabled-set',
+      payload: { enabled: false },
+    });
+    const optionsEnabledSet = { ...enabledSet, id: 'settings-enabled-options', source: 'options' } as const;
+    const safeResult = createMessage({
+      id: 'settings-public-1:background',
+      source: 'background',
+      type: 'settings/public-get-result',
+      payload: { enabled: true, provider: 'deepseek' },
+    });
+
+    for (const message of [
+      optionsUpdate,
+      privateGet,
+      privateResult,
+      publicGet,
+      enabledSet,
+      optionsEnabledSet,
+      safeResult,
+    ]) {
+      expect(parseMessageEnvelope(message)).toEqual({ ok: true, value: message });
+    }
+    expect(parseMessageEnvelope({ ...optionsUpdate, source: 'content' }).ok).toBe(false);
+    expect(parseMessageEnvelope({
+      ...optionsUpdate,
+      payload: {
+        settings: { ...DEFAULT_SETTINGS, apiKey: 'unexpected-extra-field' },
+      },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({
+      ...safeResult,
+      payload: { ...safeResult.payload, apiKey: 'must-not-reach-popup' },
+    }).ok).toBe(false);
   });
 
   it('snapshots translation fields before any asynchronous background work', () => {
