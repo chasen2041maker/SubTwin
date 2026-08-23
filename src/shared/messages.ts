@@ -11,6 +11,21 @@ export type ExtensionContext =
   | 'popup';
 
 export interface MessagePayloadMap {
+  readonly 'netflix/catalog-summary': {
+    readonly sessionId: string;
+    readonly generation: number;
+    readonly authority: 'authoritative' | 'provisional';
+    readonly tracks: readonly {
+      readonly id: string;
+      readonly language: string;
+      readonly kind: 'closed-caption' | 'subtitle';
+    }[];
+  };
+  readonly 'netflix/probe-status': {
+    readonly sessionId: string;
+    readonly generation: number;
+    readonly status: 'connected' | 'disposed' | 'unsupported';
+  };
   readonly 'system/health-check': {
     readonly sentAt: number;
   };
@@ -90,6 +105,36 @@ export function parseMessageEnvelope(
   }
 
   if (
+    input.source === 'content' &&
+    input.type === 'netflix/probe-status' &&
+    isNetflixProbeStatusPayload(input.payload)
+  ) {
+    return ok(
+      createMessage({
+        id: input.id,
+        source: input.source,
+        type: input.type,
+        payload: input.payload,
+      }),
+    );
+  }
+
+  if (
+    input.source === 'content' &&
+    input.type === 'netflix/catalog-summary' &&
+    isNetflixCatalogSummaryPayload(input.payload)
+  ) {
+    return ok(
+      createMessage({
+        id: input.id,
+        source: input.source,
+        type: input.type,
+        payload: input.payload,
+      }),
+    );
+  }
+
+  if (
     input.type === 'system/health-check' &&
     isHealthCheckPayload(input.payload)
   ) {
@@ -161,6 +206,62 @@ function isHealthResponsePayload(
     value.ready === true &&
     isNonEmptyString(value.requestId)
   );
+}
+
+function isNetflixProbeStatusPayload(
+  value: unknown,
+): value is MessagePayloadMap['netflix/probe-status'] {
+  return (
+    isRecord(value) &&
+    hasExactlyKeys(value, ['generation', 'sessionId', 'status']) &&
+    isOpaqueId(value.sessionId) &&
+    isGeneration(value.generation) &&
+    (value.status === 'connected' ||
+      value.status === 'disposed' ||
+      value.status === 'unsupported')
+  );
+}
+
+function isNetflixCatalogSummaryPayload(
+  value: unknown,
+): value is MessagePayloadMap['netflix/catalog-summary'] {
+  return (
+    isRecord(value) &&
+    hasExactlyKeys(value, ['authority', 'generation', 'sessionId', 'tracks']) &&
+    isOpaqueId(value.sessionId) &&
+    isGeneration(value.generation) &&
+    (value.authority === 'authoritative' || value.authority === 'provisional') &&
+    Array.isArray(value.tracks) &&
+    value.tracks.length <= 256 &&
+    value.tracks.every(isNetflixCatalogTrack)
+  );
+}
+
+function isNetflixCatalogTrack(
+  value: unknown,
+): value is MessagePayloadMap['netflix/catalog-summary']['tracks'][number] {
+  return (
+    isRecord(value) &&
+    hasExactlyKeys(value, ['id', 'kind', 'language']) &&
+    isOpaqueId(value.id) &&
+    typeof value.language === 'string' &&
+    value.language.length <= 35 &&
+    /^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u.test(value.language) &&
+    (value.kind === 'closed-caption' || value.kind === 'subtitle')
+  );
+}
+
+function isOpaqueId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 128 &&
+    /^[A-Za-z0-9._:-]+$/u.test(value)
+  );
+}
+
+function isGeneration(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 function hasExactlyKeys(

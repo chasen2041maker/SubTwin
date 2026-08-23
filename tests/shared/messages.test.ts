@@ -45,6 +45,49 @@ describe('cross-context message envelopes', () => {
     expect(result).toEqual({ ok: true, value: input });
   });
 
+  it('parses only sanitized Netflix probe status and catalog summaries', () => {
+    const status = createMessage({
+      id: 'probe-1',
+      source: 'content',
+      type: 'netflix/probe-status',
+      payload: {
+        sessionId: 'nfs_0123456789abcdef',
+        generation: 7,
+        status: 'connected',
+      },
+    });
+    const catalog = createMessage({
+      id: 'catalog-1',
+      source: 'content',
+      type: 'netflix/catalog-summary',
+      payload: {
+        sessionId: 'nfs_0123456789abcdef',
+        generation: 7,
+        authority: 'provisional',
+        tracks: [
+          { id: 'en-main', language: 'en-US', kind: 'subtitle' },
+        ],
+      },
+    });
+
+    expect(parseMessageEnvelope(status)).toEqual({ ok: true, value: status });
+    expect(parseMessageEnvelope(catalog)).toEqual({ ok: true, value: catalog });
+    expect(
+      parseMessageEnvelope({
+        ...catalog,
+        payload: {
+          ...catalog.payload,
+          tracks: [
+            {
+              ...catalog.payload.tracks[0],
+              rawUrl: 'https://example.test/?token=secret',
+            },
+          ],
+        },
+      }).ok,
+    ).toBe(false);
+  });
+
   it('returns a typed error for an unsupported protocol version', () => {
     const result = parseMessageEnvelope({
       protocol: 'subtwin',
