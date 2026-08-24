@@ -31,6 +31,9 @@ class Tasks implements ProviderNeutralTaskClient {
     this.values.push({ task, callbacks });
   }
   cancel(_generation: SchedulerGeneration): void {}
+  current(): Array<{ task: ScheduledTranslationTask; callbacks: TranslationTaskCallbacks }> {
+    return this.values.filter(({ callbacks }) => callbacks.isCurrent());
+  }
 }
 
 const overlay: SessionOverlaySink = {
@@ -108,12 +111,17 @@ describe('Netflix multi-English track selection', () => {
     expect(tasks.values).toHaveLength(0);
     ticks.emit({ visibleText: 'CC subtitle line', currentTimeMs: 500 });
 
-    expect(tasks.values.length).toBeGreaterThan(0);
-    const translatedTexts = tasks.values.flatMap(({ task }) =>
+    const currentTasks = tasks.current();
+    expect(currentTasks.length).toBeGreaterThan(0);
+    const translatedTexts = currentTasks.flatMap(({ task }) =>
       task.cues.map(({ text }) => text));
     expect(translatedTexts).toContain('CC subtitle line');
     expect(translatedTexts).not.toContain('Normal subtitle line');
-    expect(tasks.values.every(({ task }) => task.provider === 'google-free')).toBe(true);
+    expect(currentTasks.every(({ task }) => task.provider === 'google-free')).toBe(true);
+    expect(tasks.values
+      .filter(({ callbacks }) => !callbacks.isCurrent())
+      .every(({ task }) => task.cues.some(({ text }) => text.includes('Normal'))))
+      .toBe(true);
   });
 
   it('does not guess when the same native line matches both English tracks', () => {
