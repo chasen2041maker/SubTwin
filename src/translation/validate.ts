@@ -99,15 +99,11 @@ export function validateGoogleFreePayload(
   const text = translatedSegments.join('').trim();
   if (!isValidTranslatedText(text, sourceText)) return invalidResponse();
   if (isUnchangedTranslation(text, sourceText)) {
-    return ok(isClearlyPassThroughSource(sourceText)
-      ? {
-          translations: [{ cueId, text }],
-          retryCueIds: [],
-        }
-      : {
-          translations: [],
-          retryCueIds: [cueId],
-        });
+    if (!isClearlyPassThroughSource(sourceText)) return invalidResponse();
+    return ok({
+      translations: [{ cueId, text }],
+      retryCueIds: [],
+    });
   }
 
   return ok({
@@ -140,8 +136,9 @@ function isUnchangedTranslation(text: string, sourceText: string): boolean {
 
 /**
  * Only tokens that are very unlikely to have a meaningful Chinese rendering
- * bypass the one-cue retry. Ordinary proper nouns get one bounded retry and
- * then settle locally rather than becoming a provider-level failure.
+ * bypass unchanged-output rejection. Other unchanged Google results remain an
+ * invalid response, but the extension task boundary treats Google validation
+ * failures as cue-local so one awkward subtitle cannot kill the whole episode.
  */
 function isClearlyPassThroughSource(sourceText: string): boolean {
   const source = sourceText.trim();
