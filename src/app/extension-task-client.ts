@@ -51,26 +51,39 @@ export function createExtensionTranslationTaskClient(
   ): TranslationTaskCallbacks | undefined =>
     callbacksByTask.get(callbackKey(task));
 
+  const publishRuntimeStatus = (status: RuntimeStatus): void => {
+    try {
+      options.onRuntimeStatus?.(status);
+    } catch {
+      // Runtime status is diagnostic-only.
+    }
+  };
+
   const reportError = (
     task: ScheduledTranslationTask,
     error: TranslationError,
     offline: boolean,
   ): void => {
     const callbacks = callbacksFor(task);
-    if (callbacks?.isCurrent()) {
-      try {
-        callbacks.onError(error);
-      } catch {
-        // A controller callback cannot break queue cleanup.
-      }
-      if (offline) {
-        try {
-          options.onRuntimeStatus?.({ mode: 'error', code: 'offline' });
-        } catch {
-          // Runtime status is diagnostic-only.
-        }
-      }
+    if (!callbacks?.isCurrent()) return;
+
+    // Retryable failures are deliberately NOT forwarded to the session
+    // controller. The controller treats onError as a terminal provider failure
+    // and invalidates the generation, which used to turn a single timeout/429
+    // into a dead translation session for the rest of the episode. The
+    // scheduler leaves retryable cues incomplete, so a later seek/promotion can
+    // try them again while already translated cues stay visible.
+    if (error.retryable) {
+      publishRuntimeStatus(runtimeStatusForRetryableError(error, offline));
+      return;
     }
+
+    try {
+      callbacks.onError(error);
+    } catch {
+      // A controller callback cannot break queue cleanup.
+    }
+    if (offline) publishRuntimeStatus({ mode: 'error', code: 'offline' });
   };
 
   const execute = async (
@@ -277,6 +290,23 @@ function translationFailure(
   retryable: boolean,
 ): TranslationResult {
   return err({ code, message, retryable });
+}
+
+function runtimeStatusForRetryableError(
+  error: TranslationError,
+  offline: boolean,
+): RuntimeStatus {
+  if (offline) return { mode: 'error', code: 'offline' };
+  switch (error.code) {
+    case 'rate_limited':
+      return { mode: 'error', code: 'rate_limited' };
+    case 'timeout':
+      return { mode: 'error', code: 'timeout' };
+    case 'provider_unavailable':
+      return { mode: 'error', code: 'provider_unavailable' };
+    default:
+      return { mode: 'error', code: 'provider_unavailable' };
+  }
 }
 
 function generationOf(task: ScheduledTranslationTask): SchedulerGeneration {
