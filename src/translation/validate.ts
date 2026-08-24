@@ -57,6 +57,13 @@ export function validateDeepSeekPayload(
       retryCueIds.push(cue.id);
       continue;
     }
+    if (
+      isUnchangedTranslation(candidate.text, cue.text) &&
+      !isLikelyPassThroughSource(cue.text)
+    ) {
+      retryCueIds.push(cue.id);
+      continue;
+    }
     translations.push({ cueId: cue.id, text: candidate.text.trim() });
   }
 
@@ -90,6 +97,15 @@ export function validateGoogleFreePayload(
   if (translatedSegments.length === 0) return invalidResponse();
   const text = translatedSegments.join('').trim();
   if (!isValidTranslatedText(text, sourceText)) return invalidResponse();
+  if (
+    isUnchangedTranslation(text, sourceText) &&
+    !isLikelyPassThroughSource(sourceText)
+  ) {
+    return ok({
+      translations: [],
+      retryCueIds: [cueId],
+    });
+  }
 
   return ok({
     translations: [{ cueId, text }],
@@ -108,13 +124,32 @@ function isValidTranslatedText(text: string, sourceText: string): boolean {
     ),
   );
   const comparable = normalizeComparableText(normalized);
-  const comparableSource = normalizeComparableText(source);
   return (
     normalized.length > 0 &&
     normalized.length <= reasonableLimit &&
-    comparable.length > 0 &&
-    comparable !== comparableSource
+    comparable.length > 0
   );
+}
+
+function isUnchangedTranslation(text: string, sourceText: string): boolean {
+  return normalizeComparableText(text) === normalizeComparableText(sourceText);
+}
+
+/**
+ * Some subtitle cues are identifiers, names, acronyms or numeric tokens that a
+ * translator should legitimately preserve. Treating those as provider failures
+ * can otherwise disable useful translation after a perfectly valid response.
+ */
+function isLikelyPassThroughSource(sourceText: string): boolean {
+  const source = sourceText.trim();
+  if (source.length === 0) return false;
+  if (!/[A-Za-z]/u.test(source)) return true;
+  if (/^(?:https?:\/\/|www\.|@)/iu.test(source)) return true;
+  if (/^[A-Z0-9][A-Z0-9._:/+#-]{0,31}$/u.test(source)) return true;
+  if (/^[A-Z][A-Za-z0-9.'’_-]{1,31}$/u.test(source) && !/\s/u.test(source)) {
+    return true;
+  }
+  return false;
 }
 
 function normalizeComparableText(value: string): string {
