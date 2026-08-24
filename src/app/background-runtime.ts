@@ -37,18 +37,33 @@ interface ActiveNetflixSession {
   readonly catalog?: RegisteredNetflixCatalog;
 }
 
+interface PendingNetflixCatalog {
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly order: number;
+  readonly catalog: RegisteredNetflixCatalog;
+}
+
 const MAX_ACTIVE_NETFLIX_TABS = 128;
 
 export function createNetflixSessionRegistry(): NetflixSessionRegistry {
   const sessions = new Map<number, ActiveNetflixSession>();
+  const pendingCatalogs = new Map<number, PendingNetflixCatalog>();
   let order = 0;
 
   const prune = (): void => {
-    if (sessions.size <= MAX_ACTIVE_NETFLIX_TABS) return;
-    const oldest = [...sessions.entries()].sort(
-      ([, left], [, right]) => left.order - right.order,
-    )[0];
-    if (oldest !== undefined) sessions.delete(oldest[0]);
+    if (sessions.size > MAX_ACTIVE_NETFLIX_TABS) {
+      const oldest = [...sessions.entries()].sort(
+        ([, left], [, right]) => left.order - right.order,
+      )[0];
+      if (oldest !== undefined) sessions.delete(oldest[0]);
+    }
+    if (pendingCatalogs.size > MAX_ACTIVE_NETFLIX_TABS) {
+      const oldest = [...pendingCatalogs.entries()].sort(
+        ([, left], [, right]) => left.order - right.order,
+      )[0];
+      if (oldest !== undefined) pendingCatalogs.delete(oldest[0]);
+    }
   };
 
   return {
@@ -56,6 +71,10 @@ export function createNetflixSessionRegistry(): NetflixSessionRegistry {
       const current = sessions.get(tabId);
       const next = message.payload;
       if (next.state === 'disposed') {
+        const pending = pendingCatalogs.get(tabId);
+        if (pending?.sessionId === next.sessionId && next.generation >= pending.generation) {
+          pendingCatalogs.delete(tabId);
+        }
         if (
           current === undefined ||
           current.sessionId !== next.sessionId ||
@@ -75,12 +94,21 @@ export function createNetflixSessionRegistry(): NetflixSessionRegistry {
         current.generation === next.generation
           ? current.catalog
           : undefined;
+      const pending = pendingCatalogs.get(tabId);
+      const pendingCatalog =
+        pending?.sessionId === next.sessionId &&
+        pending.generation === next.generation
+          ? pending.catalog
+          : undefined;
+      if (pendingCatalog !== undefined) pendingCatalogs.delete(tabId);
       sessions.set(tabId, {
         sessionId: next.sessionId,
         episodeId: next.episodeId,
         generation: next.generation,
         order: ++order,
-        ...(preserveCatalog === undefined ? {} : { catalog: preserveCatalog }),
+        ...((preserveCatalog ?? pendingCatalog) === undefined
+          ? {}
+          : { catalog: preserveCatalog ?? pendingCatalog }),
       });
       prune();
       return true;
@@ -89,35 +117,52 @@ export function createNetflixSessionRegistry(): NetflixSessionRegistry {
     recordCatalog(tabId, message) {
       const current = sessions.get(tabId);
       const next = message.payload;
+      const catalog = summarizeCatalog(message);
       if (
-        current === undefined ||
-        current.sessionId !== next.sessionId ||
-        current.generation !== next.generation
-      ) return false;
-      if (
-        current.catalog?.authority === 'authoritative' &&
-        next.authority === 'provisional'
-      ) return false;
-
-      let englishAvailable = false;
-      let simplifiedChineseAvailable = false;
-      for (const track of next.tracks) {
-        const language = normalizeNetflixLanguageTag(track.language);
-        if (language?.category === 'english') englishAvailable = true;
-        if (language?.category === 'simplified-chinese') {
-          simplifiedChineseAvailable = true;
-        }
+        current !== undefined &&
+        current.sessionId === next.sessionId &&
+        current.generation === next.generation
+      ) {
+        if (
+          current.catalog?.authority === 'authoritative' &&
+          next.authority === 'provisional'
+        ) return false;
+        pendingCatalogs.delete(tabId);
+        sessions.set(tabId, {
+          ...current,
+          order: ++order,
+          catalog,
+        });
+        return true;
       }
-      sessions.set(tabId, {
-        ...current,
+
+      // Runtime messages are sent independently. On a cold service-worker start
+      // the authoritative catalog can reach the background a few milliseconds
+      // before session-state. Keep it quarantined until the matching tab,
+      // session and generation are registered; it can never authorize a request
+      // by itself.
+      if (
+        current?.sessionId === next.sessionId &&
+        current.generation > next.generation
+      ) return false;
+      const pending = pendingCatalogs.get(tabId);
+      if (
+        pending?.sessionId === next.sessionId &&
+        pending.generation > next.generation
+      ) return false;
+      if (
+        pending?.sessionId === next.sessionId &&
+        pending.generation === next.generation &&
+        pending.catalog.authority === 'authoritative' &&
+        catalog.authority === 'provisional'
+      ) return false;
+      pendingCatalogs.set(tabId, {
+        sessionId: next.sessionId,
+        generation: next.generation,
         order: ++order,
-        catalog: {
-          authority: next.authority,
-          englishAvailable,
-          simplifiedChineseAvailable,
-          generation: next.generation,
-        },
+        catalog,
       });
+      prune();
       return true;
     },
 
@@ -144,7 +189,28 @@ export function createNetflixSessionRegistry(): NetflixSessionRegistry {
 
     removeTab(tabId) {
       sessions.delete(tabId);
+      pendingCatalogs.delete(tabId);
     },
+  };
+}
+
+function summarizeCatalog(
+  message: MessageFor<'netflix/catalog-summary'>,
+): RegisteredNetflixCatalog {
+  let englishAvailable = false;
+  let simplifiedChineseAvailable = false;
+  for (const track of message.payload.tracks) {
+    const language = normalizeNetflixLanguageTag(track.language);
+    if (language?.category === 'english') englishAvailable = true;
+    if (language?.category === 'simplified-chinese') {
+      simplifiedChineseAvailable = true;
+    }
+  }
+  return {
+    authority: message.payload.authority,
+    englishAvailable,
+    simplifiedChineseAvailable,
+    generation: message.payload.generation,
   };
 }
 
