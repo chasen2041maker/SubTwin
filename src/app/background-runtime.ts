@@ -101,14 +101,13 @@ export function createNetflixSessionRegistry(): NetflixSessionRegistry {
           ? pending.catalog
           : undefined;
       if (pendingCatalog !== undefined) pendingCatalogs.delete(tabId);
+      const attachedCatalog = preserveCatalog ?? pendingCatalog;
       sessions.set(tabId, {
         sessionId: next.sessionId,
         episodeId: next.episodeId,
         generation: next.generation,
         order: ++order,
-        ...((preserveCatalog ?? pendingCatalog) === undefined
-          ? {}
-          : { catalog: preserveCatalog ?? pendingCatalog }),
+        ...(attachedCatalog === undefined ? {} : { catalog: attachedCatalog }),
       });
       prune();
       return true;
