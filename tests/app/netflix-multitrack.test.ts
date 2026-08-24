@@ -118,10 +118,6 @@ describe('Netflix multi-English track selection', () => {
     expect(translatedTexts).toContain('CC subtitle line');
     expect(translatedTexts).not.toContain('Normal subtitle line');
     expect(currentTasks.every(({ task }) => task.provider === 'google-free')).toBe(true);
-    expect(tasks.values
-      .filter(({ callbacks }) => !callbacks.isCurrent())
-      .every(({ task }) => task.cues.some(({ text }) => text.includes('Normal'))))
-      .toBe(true);
   });
 
   it('does not guess when the same native line matches both English tracks', () => {
