@@ -67,14 +67,15 @@ export function createExtensionTranslationTaskClient(
     const callbacks = callbacksFor(task);
     if (!callbacks?.isCurrent()) return;
 
-    // Retryable failures are deliberately NOT forwarded to the session
-    // controller. The controller treats onError as a terminal provider failure
-    // and invalidates the generation, which used to turn a single timeout/429
-    // into a dead translation session for the rest of the episode. The
-    // scheduler leaves retryable cues incomplete, so a later seek/promotion can
-    // try them again while already translated cues stay visible.
-    if (error.retryable) {
-      publishRuntimeStatus(runtimeStatusForRetryableError(error, offline));
+    // Network/rate-limit failures and Google cue-shape failures are deliberately
+    // NOT forwarded to the session controller. The controller treats onError as
+    // terminal and invalidates the whole generation. Google Free is an
+    // experimental, single-cue provider, so one unchanged/odd response must not
+    // disable translation for the remaining episode.
+    const cueLocal = error.retryable ||
+      (task.provider === 'google-free' && error.code === 'invalid_response');
+    if (cueLocal) {
+      publishRuntimeStatus(runtimeStatusForRecoverableError(error, offline));
       return;
     }
 
@@ -292,7 +293,7 @@ function translationFailure(
   return err({ code, message, retryable });
 }
 
-function runtimeStatusForRetryableError(
+function runtimeStatusForRecoverableError(
   error: TranslationError,
   offline: boolean,
 ): RuntimeStatus {
@@ -303,6 +304,7 @@ function runtimeStatusForRetryableError(
     case 'timeout':
       return { mode: 'error', code: 'timeout' };
     case 'provider_unavailable':
+    case 'invalid_response':
       return { mode: 'error', code: 'provider_unavailable' };
     default:
       return { mode: 'error', code: 'provider_unavailable' };
