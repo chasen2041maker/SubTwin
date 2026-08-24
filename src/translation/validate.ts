@@ -57,6 +57,14 @@ export function validateDeepSeekPayload(
       retryCueIds.push(cue.id);
       continue;
     }
+    if (isUnchangedTranslation(candidate.text, cue.text)) {
+      if (isClearlyPassThroughSource(cue.text)) {
+        translations.push({ cueId: cue.id, text: candidate.text.trim() });
+      } else {
+        retryCueIds.push(cue.id);
+      }
+      continue;
+    }
     translations.push({ cueId: cue.id, text: candidate.text.trim() });
   }
 
@@ -90,6 +98,13 @@ export function validateGoogleFreePayload(
   if (translatedSegments.length === 0) return invalidResponse();
   const text = translatedSegments.join('').trim();
   if (!isValidTranslatedText(text, sourceText)) return invalidResponse();
+  if (isUnchangedTranslation(text, sourceText)) {
+    if (!isClearlyPassThroughSource(sourceText)) return invalidResponse();
+    return ok({
+      translations: [{ cueId, text }],
+      retryCueIds: [],
+    });
+  }
 
   return ok({
     translations: [{ cueId, text }],
@@ -108,13 +123,30 @@ function isValidTranslatedText(text: string, sourceText: string): boolean {
     ),
   );
   const comparable = normalizeComparableText(normalized);
-  const comparableSource = normalizeComparableText(source);
   return (
     normalized.length > 0 &&
     normalized.length <= reasonableLimit &&
-    comparable.length > 0 &&
-    comparable !== comparableSource
+    comparable.length > 0
   );
+}
+
+function isUnchangedTranslation(text: string, sourceText: string): boolean {
+  return normalizeComparableText(text) === normalizeComparableText(sourceText);
+}
+
+/**
+ * Only tokens that are very unlikely to have a meaningful Chinese rendering
+ * bypass unchanged-output rejection. Other unchanged Google results remain an
+ * invalid response, but the extension task boundary treats Google validation
+ * failures as cue-local so one awkward subtitle cannot kill the whole episode.
+ */
+function isClearlyPassThroughSource(sourceText: string): boolean {
+  const source = sourceText.trim();
+  if (source.length === 0) return false;
+  if (!/[A-Za-z]/u.test(source)) return true;
+  if (/^(?:https?:\/\/|www\.|@)/iu.test(source)) return true;
+  if (/^[A-Z0-9][A-Z0-9._:/+#-]{1,31}$/u.test(source)) return true;
+  return source.toLocaleLowerCase('en-US') === 'netflix';
 }
 
 function normalizeComparableText(value: string): string {

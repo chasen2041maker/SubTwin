@@ -51,26 +51,40 @@ export function createExtensionTranslationTaskClient(
   ): TranslationTaskCallbacks | undefined =>
     callbacksByTask.get(callbackKey(task));
 
+  const publishRuntimeStatus = (status: RuntimeStatus): void => {
+    try {
+      options.onRuntimeStatus?.(status);
+    } catch {
+      // Runtime status is diagnostic-only.
+    }
+  };
+
   const reportError = (
     task: ScheduledTranslationTask,
     error: TranslationError,
     offline: boolean,
   ): void => {
     const callbacks = callbacksFor(task);
-    if (callbacks?.isCurrent()) {
-      try {
-        callbacks.onError(error);
-      } catch {
-        // A controller callback cannot break queue cleanup.
-      }
-      if (offline) {
-        try {
-          options.onRuntimeStatus?.({ mode: 'error', code: 'offline' });
-        } catch {
-          // Runtime status is diagnostic-only.
-        }
-      }
+    if (!callbacks?.isCurrent()) return;
+
+    // Network/rate-limit failures and Google cue-shape failures are deliberately
+    // NOT forwarded to the session controller. The controller treats onError as
+    // terminal and invalidates the whole generation. Google Free is an
+    // experimental, single-cue provider, so one unchanged/odd response must not
+    // disable translation for the remaining episode.
+    const cueLocal = error.retryable ||
+      (task.provider === 'google-free' && error.code === 'invalid_response');
+    if (cueLocal) {
+      publishRuntimeStatus(runtimeStatusForRecoverableError(error, offline));
+      return;
     }
+
+    try {
+      callbacks.onError(error);
+    } catch {
+      // A controller callback cannot break queue cleanup.
+    }
+    if (offline) publishRuntimeStatus({ mode: 'error', code: 'offline' });
   };
 
   const execute = async (
@@ -277,6 +291,24 @@ function translationFailure(
   retryable: boolean,
 ): TranslationResult {
   return err({ code, message, retryable });
+}
+
+function runtimeStatusForRecoverableError(
+  error: TranslationError,
+  offline: boolean,
+): RuntimeStatus {
+  if (offline) return { mode: 'error', code: 'offline' };
+  switch (error.code) {
+    case 'rate_limited':
+      return { mode: 'error', code: 'rate_limited' };
+    case 'timeout':
+      return { mode: 'error', code: 'timeout' };
+    case 'provider_unavailable':
+    case 'invalid_response':
+      return { mode: 'error', code: 'provider_unavailable' };
+    default:
+      return { mode: 'error', code: 'provider_unavailable' };
+  }
 }
 
 function generationOf(task: ScheduledTranslationTask): SchedulerGeneration {

@@ -6,7 +6,7 @@
   "description": "Official-first English and Simplified Chinese subtitles for Netflix.",
   "license": "UNLICENSED",
   "engines": {
-    "node": ">=22.12.0",
+    "node": ">=22.13.0",
     "pnpm": ">=10"
   },
   "packageManager": "pnpm@11.19.0",

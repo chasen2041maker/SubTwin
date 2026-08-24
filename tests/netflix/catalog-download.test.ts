@@ -82,7 +82,7 @@ function resource(overrides: Partial<NetflixCatalogDownloadResource> = {}) {
 }
 
 describe('Netflix catalog download resource extraction', () => {
-  it('finds only one English and one Simplified Chinese downloadable resource', () => {
+  it('finds the English and Simplified Chinese downloadable resources in the fixture', () => {
     const result = extractNetflixCatalogDownloadResources(extractFixture());
 
     expect(result.ok).toBe(true);
@@ -108,7 +108,7 @@ describe('Netflix catalog download resource extraction', () => {
     expect(JSON.stringify(result.value)).not.toContain('must-not-copy');
   });
 
-  it('supports URL map keys and chooses a deterministic duplicate per language', () => {
+  it('preserves separate English tracks and chooses a deterministic resource per track', () => {
     const metadata = {
       titleId: 'title-2',
       textTracks: [
@@ -143,6 +143,12 @@ describe('Netflix catalog download resource extraction', () => {
         titleId: 'title-2',
         trackId: 'a-English',
         language: 'en-US',
+      }),
+      expect.objectContaining({
+        url: EN_URL,
+        titleId: 'title-2',
+        trackId: 'z-English',
+        language: 'en-GB',
       }),
     ]);
   });

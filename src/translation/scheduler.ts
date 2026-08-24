@@ -108,9 +108,12 @@ export class TranslationScheduler {
       if (this.#completed.has(key)) return false;
       if (this.#isQueued(key, 'urgent')) return false;
       if (this.#isInFlight(key, 'urgent')) return false;
-      return task.priority === 'urgent' || (
-        !this.#isQueued(key, 'bulk') && !this.#isInFlight(key, 'bulk')
-      );
+      // Urgent work can still promote a cue out of a queued bulk task, but an
+      // already in-flight bulk request owns that cue until it settles. Sending
+      // the same subtitle twice creates duplicate provider charges and lets a
+      // late bulk response overwrite the urgent result/cache.
+      if (this.#isInFlight(key, 'bulk')) return false;
+      return task.priority === 'urgent' || !this.#isQueued(key, 'bulk');
     });
     if (cues.length === 0) return 'deduplicated';
 

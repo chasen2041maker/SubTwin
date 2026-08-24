@@ -37,3 +37,15 @@ jobs:
 
       - name: Build extension
         run: pnpm build
+
+      - name: Package Chrome extension
+        run: pnpm zip
+
+      - name: Upload installable Chrome ZIP
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: subtwin-chrome-${{ github.sha }}
+          path: .output/*.zip
+          if-no-files-found: error
+          retention-days: 30

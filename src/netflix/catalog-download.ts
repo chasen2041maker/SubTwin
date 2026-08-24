@@ -159,7 +159,11 @@ export function extractNetflixCatalogDownloadResources(
   candidates.sort(compareResourceCandidates);
   const selected = new Map<string, NetflixCatalogDownloadResource>();
   for (const candidate of candidates) {
-    const key = `${candidate.titleId}\u001f${candidate.category}`;
+    // Keep one deterministic downloadable resource for every Netflix track.
+    // English subtitles and English CC are separate tracks and must both reach
+    // the isolated world so the native on-screen text can identify which one
+    // the viewer actually selected.
+    const key = `${candidate.titleId}\u001f${candidate.trackId}`;
     if (selected.has(key)) continue;
     selected.set(key, {
       url: candidate.url,

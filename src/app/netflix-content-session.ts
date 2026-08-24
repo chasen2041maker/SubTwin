@@ -196,18 +196,41 @@ export function createNetflixContentSession(
     generation: adapter.session.generation,
   } as const);
 
+  const parsedTrackCandidates = (
+    category: 'english' | 'simplified-chinese',
+  ): SubtitleTrack[] => descriptors
+    .filter((descriptor) =>
+      normalizeNetflixLanguageTag(descriptor.language)?.category === category)
+    .sort(compareTrackDescriptors)
+    .flatMap((descriptor) => {
+      const parsed = parsedTracks.get(descriptor.id);
+      return parsed === undefined ? [] : [parsed];
+    });
+
   const selectParsedTrack = (
     category: 'english' | 'simplified-chinese',
   ): SubtitleTrack | null => {
-    const candidates = descriptors
-      .filter((descriptor) =>
-        normalizeNetflixLanguageTag(descriptor.language)?.category === category)
-      .sort(compareTrackDescriptors);
-    for (const candidate of candidates) {
-      const parsed = parsedTracks.get(candidate.id);
-      if (parsed !== undefined) return parsed;
+    const candidates = parsedTrackCandidates(category);
+    if (candidates.length === 0) return null;
+
+    // Once native Netflix text identifies the user's selected track, make that
+    // track authoritative for rendering/scheduling instead of relying on
+    // lexical track-id ordering (which can confuse English and English [CC]).
+    const activeTrackId = adapter?.tracks.find(
+      ({ active, language, lifecycle }) =>
+        active && lifecycle !== 'disposed' && language.category === category,
+    )?.trackId;
+    if (activeTrackId !== undefined) {
+      const active = candidates.find(({ id }) => id === activeTrackId);
+      if (active !== undefined) return active;
     }
-    return null;
+    if (category === 'english' && stronglyConfirmedTrackId !== null) {
+      const stronglyConfirmed = candidates.find(
+        ({ id }) => id === stronglyConfirmedTrackId,
+      );
+      if (stronglyConfirmed !== undefined) return stronglyConfirmed;
+    }
+    return candidates[0] ?? null;
   };
 
   const currentTrackHash = (englishTrack: SubtitleTrack | null): string =>
@@ -468,15 +491,22 @@ export function createNetflixContentSession(
 
   function confirmActiveTrack(tick: SubtitleSessionTick): void {
     if (adapter === null) return;
-    const englishTrack = selectParsedTrack('english');
     const visibleText = normalizeVisibleText(tick.visibleText);
-    if (englishTrack === null || visibleText === null) return;
-    const matchedCue = findNativeCueMatch(
-      englishTrack,
-      visibleText,
-      tick.currentTimeMs,
-    );
-    if (matchedCue === null) return;
+    if (visibleText === null) return;
+
+    const matches = parsedTrackCandidates('english').flatMap((track) => {
+      const cue = findNativeCueMatch(track, visibleText, tick.currentTimeMs);
+      return cue === null ? [] : [{ track, cue }];
+    });
+    // If two tracks display the same line at the same time, that line does not
+    // identify the user's selection. Waiting is safer than translating a track
+    // that may not be the one Netflix is showing.
+    if (matches.length !== 1) return;
+    const match = matches[0];
+    if (match === undefined) return;
+    const englishTrack = match.track;
+    const matchedCue = match.cue;
+
     let becameStronglyConfirmed = false;
     if (isDistinctiveNativeCueEvidence(englishTrack, matchedCue, visibleText)) {
       const evidence = nativeEvidenceByTrack.get(englishTrack.id) ?? new Set<string>();

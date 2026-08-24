@@ -179,7 +179,7 @@ describe('TranslationScheduler priority and capacity', () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 
-  it('lets urgent work overlap an in-flight bulk batch without waiting for it', async () => {
+  it('deduplicates an urgent cue that is already owned by an in-flight bulk request', async () => {
     const bulk = deferred<TranslationResult>();
     const execute = vi.fn((scheduled: ScheduledTranslationTask) =>
       scheduled.priority === 'bulk'
@@ -197,15 +197,15 @@ describe('TranslationScheduler priority and capacity', () => {
 
     scheduler.enqueue(task('bulk', 'bulk', ['cue-1', 'cue-2', 'cue-3']));
     await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
-    expect(scheduler.enqueue(task('seek', 'urgent', ['cue-2']))).toBe('queued');
-    await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
-    expect(execute.mock.calls[1]?.[0].priority).toBe('urgent');
+    expect(scheduler.enqueue(task('seek', 'urgent', ['cue-2']))).toBe('deduplicated');
+    expect(execute).toHaveBeenCalledOnce();
 
     bulk.resolve(translated(['cue-1', 'cue-2', 'cue-3']));
     await scheduler.whenIdle();
+    expect(execute).toHaveBeenCalledOnce();
   });
 
-  it('tracks overlapping bulk and urgent executions independently until both settle', async () => {
+  it('filters only overlapping in-flight bulk cues and still runs new urgent cues', async () => {
     const bulk = deferred<TranslationResult>();
     const urgent = deferred<TranslationResult>();
     const execute = vi.fn((scheduled: ScheduledTranslationTask) =>
@@ -222,23 +222,19 @@ describe('TranslationScheduler priority and capacity', () => {
 
     scheduler.enqueue(task('bulk', 'bulk', ['cue-1']));
     await vi.waitFor(() => expect(scheduler.snapshot().inFlight).toBe(1));
-    scheduler.enqueue(task('seek', 'urgent', ['cue-1']));
+    expect(scheduler.enqueue(task('seek', 'urgent', ['cue-1', 'cue-2']))).toBe('queued');
     await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+    expect(execute.mock.calls[1]?.[0].cues.map(({ id }) => id)).toEqual(['cue-2']);
     expect(scheduler.snapshot().inFlight).toBe(2);
 
-    let idle = false;
-    const idlePromise = scheduler.whenIdle().then(() => { idle = true; });
-    urgent.resolve(translated(['cue-1']));
-    await vi.waitFor(() => expect(scheduler.snapshot().inFlight).toBe(1));
-    expect(idle).toBe(false);
-
+    urgent.resolve(translated(['cue-2']));
     bulk.resolve(translated(['cue-1']));
-    await idlePromise;
+    await scheduler.whenIdle();
     expect(scheduler.snapshot().inFlight).toBe(0);
   });
 
   it.each(['dispose', 'generation'] as const)(
-    '%s aborts every overlapping execution controller',
+    '%s aborts every concurrent execution controller',
     async (action) => {
       const pending = [deferred<TranslationResult>(), deferred<TranslationResult>()];
       const signals: AbortSignal[] = [];
@@ -260,7 +256,7 @@ describe('TranslationScheduler priority and capacity', () => {
 
       scheduler.enqueue(task('bulk', 'bulk', ['cue-1']));
       await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
-      scheduler.enqueue(task('seek', 'urgent', ['cue-1']));
+      scheduler.enqueue(task('seek', 'urgent', ['cue-2']));
       await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
 
       if (action === 'dispose') scheduler.dispose();
@@ -269,7 +265,7 @@ describe('TranslationScheduler priority and capacity', () => {
       expect(signals).toHaveLength(2);
       expect(signals.every(({ aborted }) => aborted)).toBe(true);
       pending[0]!.resolve(translated(['cue-1']));
-      pending[1]!.resolve(translated(['cue-1']));
+      pending[1]!.resolve(translated(['cue-2']));
       await scheduler.whenIdle();
     },
   );
