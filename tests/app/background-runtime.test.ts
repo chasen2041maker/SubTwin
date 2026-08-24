@@ -88,10 +88,47 @@ function harness() {
   };
 }
 
+function registerCatalog(
+  runtime: ReturnType<typeof harness>,
+  options: {
+    readonly authority?: 'authoritative' | 'provisional';
+    readonly chinese?: boolean;
+  } = {},
+): void {
+  runtime.registry.record(CONTENT_SENDER.tab.id, createMessage({
+    id: 'session-active',
+    source: 'content',
+    type: 'netflix/session-state',
+    payload: {
+      sessionId: 'session-1',
+      episodeId: 'episode_hash_1',
+      generation: 1,
+      state: 'active',
+    },
+  }));
+  runtime.registry.recordCatalog(CONTENT_SENDER.tab.id, createMessage({
+    id: 'catalog-current',
+    source: 'content',
+    type: 'netflix/catalog-summary',
+    payload: {
+      sessionId: 'session-1',
+      generation: 1,
+      authority: options.authority ?? 'authoritative',
+      tracks: [
+        { id: 'en', language: 'en', kind: 'subtitle' },
+        ...(options.chinese === true
+          ? [{ id: 'zh', language: 'zh-Hans', kind: 'subtitle' as const }]
+          : []),
+      ],
+    },
+  }));
+}
+
 describe('background runtime security router', () => {
-  it('routes translation only from this extension running in a Netflix tab', async () => {
+  it('routes translation only from this extension running in an authorized Netflix tab', async () => {
     const runtime = harness();
     const request = translationRequest();
+    registerCatalog(runtime);
 
     await expect(runtime.router(request, CONTENT_SENDER)).resolves.toEqual({
       translation: true,
@@ -106,6 +143,43 @@ describe('background runtime security router', () => {
       await expect(runtime.router(request, sender)).resolves.toBeUndefined();
     }
     expect(runtime.handleTranslation).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed before external translation until an authoritative English-only catalog is registered', async () => {
+    const request = translationRequest();
+
+    const unregistered = harness();
+    const unregisteredResponse = await unregistered.router(request, CONTENT_SENDER);
+    expect(unregistered.handleTranslation).not.toHaveBeenCalled();
+    expect(JSON.stringify(unregisteredResponse)).toContain('provider_unavailable');
+    expect(JSON.stringify(unregisteredResponse)).toContain('"retryable":true');
+
+    const provisional = harness();
+    registerCatalog(provisional, { authority: 'provisional' });
+    await provisional.router(request, CONTENT_SENDER);
+    expect(provisional.handleTranslation).not.toHaveBeenCalled();
+
+    const officialChinese = harness();
+    registerCatalog(officialChinese, { chinese: true });
+    await officialChinese.router(request, CONTENT_SENDER);
+    expect(officialChinese.handleTranslation).not.toHaveBeenCalled();
+
+    const authorized = harness();
+    registerCatalog(authorized);
+    await authorized.router(request, CONTENT_SENDER);
+    expect(authorized.handleTranslation).toHaveBeenCalledOnce();
+  });
+
+  it('does not authorize a catalog from another tab or session', () => {
+    const runtime = harness();
+    registerCatalog(runtime);
+    const request = translationRequest();
+    expect(runtime.registry.authorizeTranslation(CONTENT_SENDER.tab.id, request)).toBe(true);
+    expect(runtime.registry.authorizeTranslation(99, request)).toBe(false);
+    expect(runtime.registry.authorizeTranslation(CONTENT_SENDER.tab.id, createMessage({
+      ...request,
+      payload: { ...request.payload, sessionId: 'other-session' },
+    }))).toBe(false);
   });
 
   it('returns a credential-free settings snapshot only to a trusted Netflix tab', async () => {
