@@ -49,11 +49,15 @@ describe('translation pass-through validation', () => {
     },
   );
 
-  it('keeps a full unchanged English sentence as a cue-level retry instead of a provider failure', () => {
+  it('keeps unchanged DeepSeek prose as a cue-level retry and keeps Google validation strict', () => {
     const source = 'How are you today?';
     expect(validateGoogleFreePayload(source, 'cue-1', googlePayload(source))).toEqual({
-      ok: true,
-      value: { translations: [], retryCueIds: ['cue-1'] },
+      ok: false,
+      error: {
+        code: 'invalid_response',
+        message: 'Translation provider returned an invalid response.',
+        retryable: false,
+      },
     });
     expect(validateDeepSeekPayload(request(source), {
       translations: [{ id: 'cue-1', text: source }],
