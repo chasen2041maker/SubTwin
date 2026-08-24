@@ -162,8 +162,9 @@ describe('extension translation task client', () => {
     expect(oldSink.onResult).not.toHaveBeenCalled();
   });
 
-  it('maps background provider errors without calling another provider', async () => {
+  it('keeps retryable provider errors cue-local and allows later retry', async () => {
     const providers: string[] = [];
+    const status = vi.fn();
     const sendMessage = vi.fn(async (candidate: unknown) => {
       const request = parsedRequest(candidate);
       providers.push(request.payload.provider);
@@ -185,17 +186,59 @@ describe('extension translation task client', () => {
         },
       }));
     });
-    const client = createExtensionTranslationTaskClient({ sendMessage });
+    const client = createExtensionTranslationTaskClient({
+      sendMessage,
+      onRuntimeStatus: status,
+    });
+    const sink = callbacks();
+    const scheduled = task('google-free');
+
+    client.enqueue(scheduled, sink);
+    await client.whenIdle();
+    client.enqueue(scheduled, sink);
+    await client.whenIdle();
+
+    expect(providers).toEqual(['google-free', 'google-free']);
+    expect(sink.onError).not.toHaveBeenCalled();
+    expect(status).toHaveBeenLastCalledWith({ mode: 'error', code: 'rate_limited' });
+  });
+
+  it('contains Google cue validation failures without disabling the episode', async () => {
+    const status = vi.fn();
+    const sendMessage = vi.fn(async (candidate: unknown) => {
+      const request = parsedRequest(candidate);
+      return ok(createMessage({
+        id: `${request.id}:background`,
+        source: 'background',
+        type: 'translation/result',
+        payload: {
+          taskId: request.payload.taskId,
+          sessionId: request.payload.sessionId,
+          provider: request.payload.provider,
+          episodeGeneration: request.payload.episodeGeneration,
+          providerGeneration: request.payload.providerGeneration,
+          status: 'error',
+          translations: [],
+          retryCueIds: [],
+          errorCode: 'invalid_response',
+          retryable: false,
+        },
+      }));
+    });
+    const client = createExtensionTranslationTaskClient({
+      sendMessage,
+      onRuntimeStatus: status,
+    });
     const sink = callbacks();
 
     client.enqueue(task('google-free'), sink);
     await client.whenIdle();
 
-    expect(providers).toEqual(['google-free']);
-    expect(sink.onError).toHaveBeenCalledWith(expect.objectContaining({
-      code: 'rate_limited',
-      retryable: true,
-    }));
+    expect(sink.onError).not.toHaveBeenCalled();
+    expect(status).toHaveBeenLastCalledWith({
+      mode: 'error',
+      code: 'provider_unavailable',
+    });
   });
 
   it('publishes offline after containing a transport failure', async () => {
@@ -212,9 +255,7 @@ describe('extension translation task client', () => {
     client.enqueue(task(), sink);
     await client.whenIdle();
 
-    expect(sink.onError).toHaveBeenCalledWith(expect.objectContaining({
-      code: 'provider_unavailable',
-    }));
+    expect(sink.onError).not.toHaveBeenCalled();
     expect(status).toHaveBeenLastCalledWith({ mode: 'error', code: 'offline' });
   });
 
