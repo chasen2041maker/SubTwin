@@ -22,11 +22,15 @@ function request(text: string): TranslationRequest {
   };
 }
 
+function googlePayload(text: string): unknown {
+  return [[[text, text]]];
+}
+
 describe('translation pass-through validation', () => {
-  it.each(['Netflix', 'FBI', 'NASA', '2024', '@Netflix']) (
+  it.each(['Netflix', 'FBI', 'NASA', '2024', '@Netflix'])(
     'accepts %s when a provider correctly preserves it',
     (source) => {
-      expect(validateGoogleFreePayload(source, 'cue-1', [[source]])).toEqual({
+      expect(validateGoogleFreePayload(source, 'cue-1', googlePayload(source))).toEqual({
         ok: true,
         value: {
           translations: [{ cueId: 'cue-1', text: source }],
@@ -47,7 +51,7 @@ describe('translation pass-through validation', () => {
 
   it('keeps a full unchanged English sentence as a cue-level retry instead of a provider failure', () => {
     const source = 'How are you today?';
-    expect(validateGoogleFreePayload(source, 'cue-1', [[source]])).toEqual({
+    expect(validateGoogleFreePayload(source, 'cue-1', googlePayload(source))).toEqual({
       ok: true,
       value: { translations: [], retryCueIds: ['cue-1'] },
     });
