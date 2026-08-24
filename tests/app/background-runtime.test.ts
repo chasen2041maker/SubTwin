@@ -297,6 +297,63 @@ describe('background runtime security router', () => {
 });
 
 describe('trusted Netflix session registry', () => {
+  it('quarantines a catalog that arrives before session-state and attaches only the exact matching session', () => {
+    const registry = createNetflixSessionRegistry();
+    const request = translationRequest();
+    const catalog = createMessage({
+      id: 'catalog-first',
+      source: 'content',
+      type: 'netflix/catalog-summary',
+      payload: {
+        sessionId: 'session-1',
+        generation: 1,
+        authority: 'authoritative' as const,
+        tracks: [{ id: 'en', language: 'en', kind: 'subtitle' as const }],
+      },
+    });
+
+    expect(registry.recordCatalog(CONTENT_SENDER.tab.id, catalog)).toBe(true);
+    expect(registry.authorizeTranslation(CONTENT_SENDER.tab.id, request)).toBe(false);
+
+    expect(registry.record(CONTENT_SENDER.tab.id, createMessage({
+      id: 'session-after-catalog',
+      source: 'content',
+      type: 'netflix/session-state',
+      payload: {
+        sessionId: 'session-1',
+        episodeId: 'episode_hash_1',
+        generation: 1,
+        state: 'active' as const,
+      },
+    }))).toBe(true);
+    expect(registry.authorizeTranslation(CONTENT_SENDER.tab.id, request)).toBe(true);
+
+    const officialChinese = createNetflixSessionRegistry();
+    expect(officialChinese.recordCatalog(CONTENT_SENDER.tab.id, createMessage({
+      ...catalog,
+      id: 'official-chinese-first',
+      payload: {
+        ...catalog.payload,
+        tracks: [
+          { id: 'en', language: 'en', kind: 'subtitle' as const },
+          { id: 'zh', language: 'zh-Hans', kind: 'subtitle' as const },
+        ],
+      },
+    }))).toBe(true);
+    officialChinese.record(CONTENT_SENDER.tab.id, createMessage({
+      id: 'official-chinese-session',
+      source: 'content',
+      type: 'netflix/session-state',
+      payload: {
+        sessionId: 'session-1',
+        episodeId: 'episode_hash_1',
+        generation: 1,
+        state: 'active' as const,
+      },
+    }));
+    expect(officialChinese.authorizeTranslation(CONTENT_SENDER.tab.id, request)).toBe(false);
+  });
+
   it('tracks the most recently active episode and ignores stale disposal', () => {
     const registry = createNetflixSessionRegistry();
     const state = (episodeId: string, generation: number, sessionId = 'session-1') =>
