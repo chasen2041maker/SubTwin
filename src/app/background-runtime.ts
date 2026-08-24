@@ -1,5 +1,6 @@
 import { createMessage, parseMessageEnvelope, type MessageFor, type MessageType } from '../shared/messages';
 import { err, ok } from '../shared/result';
+import { normalizeNetflixLanguageTag } from '../netflix/adapter';
 import {
   cloneSettings,
   type RuntimeSettingsState,
@@ -15,8 +16,17 @@ import type { RuntimeStatus } from './status';
 
 export interface NetflixSessionRegistry {
   record(tabId: number, message: MessageFor<'netflix/session-state'>): boolean;
+  recordCatalog(tabId: number, message: MessageFor<'netflix/catalog-summary'>): boolean;
+  authorizeTranslation(tabId: number, message: MessageFor<'translation/request'>): boolean;
   readCurrentEpisodeId(): string | undefined;
   removeTab(tabId: number): void;
+}
+
+interface RegisteredNetflixCatalog {
+  readonly authority: 'authoritative' | 'provisional';
+  readonly englishAvailable: boolean;
+  readonly simplifiedChineseAvailable: boolean;
+  readonly generation: number;
 }
 
 interface ActiveNetflixSession {
@@ -24,6 +34,7 @@ interface ActiveNetflixSession {
   readonly episodeId: string;
   readonly generation: number;
   readonly order: number;
+  readonly catalog?: RegisteredNetflixCatalog;
 }
 
 const MAX_ACTIVE_NETFLIX_TABS = 128;
@@ -59,15 +70,70 @@ export function createNetflixSessionRegistry(): NetflixSessionRegistry {
         current.sessionId === next.sessionId &&
         next.generation < current.generation
       ) return false;
+      const preserveCatalog =
+        current?.sessionId === next.sessionId &&
+        current.generation === next.generation
+          ? current.catalog
+          : undefined;
       sessions.set(tabId, {
         sessionId: next.sessionId,
         episodeId: next.episodeId,
         generation: next.generation,
         order: ++order,
+        ...(preserveCatalog === undefined ? {} : { catalog: preserveCatalog }),
       });
       prune();
       return true;
     },
+
+    recordCatalog(tabId, message) {
+      const current = sessions.get(tabId);
+      const next = message.payload;
+      if (
+        current === undefined ||
+        current.sessionId !== next.sessionId ||
+        current.generation !== next.generation
+      ) return false;
+      if (
+        current.catalog?.authority === 'authoritative' &&
+        next.authority === 'provisional'
+      ) return false;
+
+      let englishAvailable = false;
+      let simplifiedChineseAvailable = false;
+      for (const track of next.tracks) {
+        const language = normalizeNetflixLanguageTag(track.language);
+        if (language?.category === 'english') englishAvailable = true;
+        if (language?.category === 'simplified-chinese') {
+          simplifiedChineseAvailable = true;
+        }
+      }
+      sessions.set(tabId, {
+        ...current,
+        order: ++order,
+        catalog: {
+          authority: next.authority,
+          englishAvailable,
+          simplifiedChineseAvailable,
+          generation: next.generation,
+        },
+      });
+      return true;
+    },
+
+    authorizeTranslation(tabId, message) {
+      const current = sessions.get(tabId);
+      const catalog = current?.catalog;
+      return current !== undefined &&
+        catalog !== undefined &&
+        current.sessionId === message.payload.sessionId &&
+        current.episodeId === message.payload.episodeId &&
+        catalog.generation === current.generation &&
+        catalog.authority === 'authoritative' &&
+        catalog.englishAvailable &&
+        !catalog.simplifiedChineseAvailable;
+    },
+
     readCurrentEpisodeId() {
       let latest: ActiveNetflixSession | undefined;
       for (const session of sessions.values()) {
@@ -75,6 +141,7 @@ export function createNetflixSessionRegistry(): NetflixSessionRegistry {
       }
       return latest?.episodeId;
     },
+
     removeTab(tabId) {
       sessions.delete(tabId);
     },
@@ -154,10 +221,21 @@ export function createBackgroundMessageRouter(
       const tabId = trustedNetflixContentTabId(sender, options.runtimeId);
       if (tabId === null) return undefined;
 
-      if (
-        message.type === 'translation/request' ||
-        message.type === 'translation/cancel'
-      ) return options.handleTranslation(message);
+      if (message.type === 'translation/request') {
+        // This is the final policy-enforcement point before a subtitle can
+        // reach an external provider. Content-world routing remains the first
+        // line of defence, but a stale or regressed content script cannot
+        // bypass the official-subtitle privacy rule.
+        if (!options.sessionRegistry.authorizeTranslation(tabId, message)) {
+          return retryableTranslationGateRejection(message);
+        }
+        return options.handleTranslation(message);
+      }
+      if (message.type === 'translation/cancel') {
+        // Always allow cancellation so stale provider work can be torn down
+        // even after the catalog gate has closed.
+        return options.handleTranslation(message);
+      }
 
       if (message.type === 'runtime/settings-get') {
         try {
@@ -187,6 +265,8 @@ export function createBackgroundMessageRouter(
 
       if (message.type === 'netflix/session-state') {
         options.sessionRegistry.record(tabId, message);
+      } else if (message.type === 'netflix/catalog-summary') {
+        options.sessionRegistry.recordCatalog(tabId, message);
       }
       return undefined;
     }
@@ -205,6 +285,28 @@ export function createBackgroundMessageRouter(
 
     return undefined;
   };
+}
+
+function retryableTranslationGateRejection(
+  request: MessageFor<'translation/request'>,
+): ReturnType<typeof ok<MessageFor<'translation/result'>>> {
+  return ok(createMessage({
+    id: `${request.id}:background`,
+    source: 'background',
+    type: 'translation/result',
+    payload: {
+      taskId: request.payload.taskId,
+      sessionId: request.payload.sessionId,
+      provider: request.payload.provider,
+      episodeGeneration: request.payload.episodeGeneration,
+      providerGeneration: request.payload.providerGeneration,
+      status: 'error',
+      translations: [],
+      retryCueIds: [],
+      errorCode: 'provider_unavailable',
+      retryable: true,
+    },
+  }));
 }
 
 function translationConfigurationChanged(
