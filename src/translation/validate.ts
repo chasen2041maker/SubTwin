@@ -57,11 +57,12 @@ export function validateDeepSeekPayload(
       retryCueIds.push(cue.id);
       continue;
     }
-    if (
-      isUnchangedTranslation(candidate.text, cue.text) &&
-      !isLikelyPassThroughSource(cue.text)
-    ) {
-      retryCueIds.push(cue.id);
+    if (isUnchangedTranslation(candidate.text, cue.text)) {
+      if (isClearlyPassThroughSource(cue.text)) {
+        translations.push({ cueId: cue.id, text: candidate.text.trim() });
+      } else {
+        retryCueIds.push(cue.id);
+      }
       continue;
     }
     translations.push({ cueId: cue.id, text: candidate.text.trim() });
@@ -97,14 +98,16 @@ export function validateGoogleFreePayload(
   if (translatedSegments.length === 0) return invalidResponse();
   const text = translatedSegments.join('').trim();
   if (!isValidTranslatedText(text, sourceText)) return invalidResponse();
-  if (
-    isUnchangedTranslation(text, sourceText) &&
-    !isLikelyPassThroughSource(sourceText)
-  ) {
-    return ok({
-      translations: [],
-      retryCueIds: [cueId],
-    });
+  if (isUnchangedTranslation(text, sourceText)) {
+    return ok(isClearlyPassThroughSource(sourceText)
+      ? {
+          translations: [{ cueId, text }],
+          retryCueIds: [],
+        }
+      : {
+          translations: [],
+          retryCueIds: [cueId],
+        });
   }
 
   return ok({
@@ -136,20 +139,17 @@ function isUnchangedTranslation(text: string, sourceText: string): boolean {
 }
 
 /**
- * Some subtitle cues are identifiers, names, acronyms or numeric tokens that a
- * translator should legitimately preserve. Treating those as provider failures
- * can otherwise disable useful translation after a perfectly valid response.
+ * Only tokens that are very unlikely to have a meaningful Chinese rendering
+ * bypass the one-cue retry. Ordinary proper nouns get one bounded retry and
+ * then settle locally rather than becoming a provider-level failure.
  */
-function isLikelyPassThroughSource(sourceText: string): boolean {
+function isClearlyPassThroughSource(sourceText: string): boolean {
   const source = sourceText.trim();
   if (source.length === 0) return false;
   if (!/[A-Za-z]/u.test(source)) return true;
   if (/^(?:https?:\/\/|www\.|@)/iu.test(source)) return true;
-  if (/^[A-Z0-9][A-Z0-9._:/+#-]{0,31}$/u.test(source)) return true;
-  if (/^[A-Z][A-Za-z0-9.'’_-]{1,31}$/u.test(source) && !/\s/u.test(source)) {
-    return true;
-  }
-  return false;
+  if (/^[A-Z0-9][A-Z0-9._:/+#-]{1,31}$/u.test(source)) return true;
+  return source.toLocaleLowerCase('en-US') === 'netflix';
 }
 
 function normalizeComparableText(value: string): string {
