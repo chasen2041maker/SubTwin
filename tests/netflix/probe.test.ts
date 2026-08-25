@@ -13,6 +13,8 @@ import {
 
 const VTT_URL =
   'https://cdn.nflxvideo.net/timedtext/range/0-999/track.vtt?lang=en&token=secret';
+const OPAQUE_OCA_URL =
+  'https://ipv4-c001-lax001.1.oca.nflxvideo.net/?o=opaque-object&v=video-1&e=9999999999';
 
 function headers(values: Readonly<Record<string, string>>) {
   return {
@@ -148,6 +150,76 @@ describe('Netflix timed-text candidate validation', () => {
 });
 
 describe('Netflix fetch instrumentation', () => {
+  it('accepts an unbound opaque OCA TTML only when its root declares one valid language', async () => {
+    const body = '<?xml version="1.0"?><tt xml:lang="zh-Hans" xmlns="http://www.w3.org/ns/ttml"><body /></tt>';
+    const captured = vi.fn();
+    const target: FetchTargetLike = {
+      fetch: vi.fn(async () => response(body, {
+        url: OPAQUE_OCA_URL,
+        headers: headers({
+          'content-type': 'text/xml',
+          'content-length': String(new TextEncoder().encode(body).byteLength),
+        }),
+      })),
+    };
+    const handle = installFetchProbe(target, {
+      generation: 1,
+      currentGeneration: () => 1,
+      onTimedText: captured,
+    });
+
+    await target.fetch(OPAQUE_OCA_URL);
+    await settle();
+
+    expect(captured).toHaveBeenCalledWith(expect.objectContaining({
+      language: 'zh-Hans',
+      format: 'ttml',
+      body,
+    }));
+    handle.dispose();
+  });
+
+  it('captures an opaque Netflix OCA subtitle only while an authoritative track binding is active', async () => {
+    const body = 'WEBVTT\n\n00:00.000 --> 00:01.000\n你好';
+    const captured = vi.fn();
+    const target: FetchTargetLike = {
+      fetch: vi.fn(async () => response(body, { url: OPAQUE_OCA_URL })),
+    };
+    const handle = installFetchProbe(target, {
+      generation: 1,
+      currentGeneration: () => 1,
+      currentTimedTextBinding: () => ({
+        titleId: 'title-1',
+        trackId: 'zh-main',
+      }),
+      onTimedText: captured,
+    });
+
+    await target.fetch(OPAQUE_OCA_URL);
+    await settle();
+
+    expect(captured).toHaveBeenCalledWith({
+      type: 'timed-text',
+      resourceId: expect.stringMatching(/^tt_/u),
+      trackId: 'zh-main',
+      language: 'und',
+      format: 'webvtt',
+      body,
+    });
+    handle.dispose();
+
+    const rejected = vi.fn();
+    const withoutBinding = installFetchProbe(target, {
+      generation: 2,
+      currentGeneration: () => 2,
+      onTimedText: rejected,
+    });
+    await target.fetch(OPAQUE_OCA_URL);
+    await settle();
+    expect(rejected).not.toHaveBeenCalled();
+    withoutBinding.dispose();
+  });
+
   it('returns the original promise immediately, clones later, and installs only once', async () => {
     let resolveResponse!: (value: ProbeResponseLike) => void;
     const originalPromise = new Promise<ProbeResponseLike>((resolve) => {
@@ -528,6 +600,106 @@ describe('Netflix fetch instrumentation', () => {
 });
 
 describe('Netflix XHR instrumentation', () => {
+  it('sniffs a bounded opaque OCA arraybuffer response used by Cadmium subtitles', async () => {
+    class BinaryOcaXhr {
+      readonly listeners = new Set<() => void>();
+      responseType = 'arraybuffer';
+      response = new TextEncoder().encode(
+        'WEBVTT\n\n00:00.000 --> 00:01.000\n你好',
+      ).buffer;
+      responseText = '';
+      responseURL = OPAQUE_OCA_URL;
+      open(): void {}
+      send(): void {}
+      addEventListener(type: string, listener: () => void): void {
+        if (type === 'load') this.listeners.add(listener);
+      }
+      removeEventListener(type: string, listener: () => void): void {
+        if (type === 'load') this.listeners.delete(listener);
+      }
+      getResponseHeader(name: string): string | null {
+        return name.toLowerCase() === 'content-type' ? 'application/octet-stream' : null;
+      }
+      dispatchLoad(): void {
+        for (const listener of [...this.listeners]) listener();
+      }
+    }
+    const captured = vi.fn();
+    const handle = installXhrProbe(BinaryOcaXhr as unknown as XhrConstructorLike, {
+      generation: 1,
+      currentGeneration: () => 1,
+      currentTimedTextBinding: () => ({ titleId: 'title-1', trackId: 'zh-main' }),
+      onTimedText: captured,
+    });
+    const xhr = new BinaryOcaXhr();
+    (BinaryOcaXhr.prototype.open as unknown as (
+      this: BinaryOcaXhr,
+      method: string,
+      url: string,
+    ) => void).call(xhr, 'GET', OPAQUE_OCA_URL);
+    xhr.send();
+    xhr.dispatchLoad();
+    await settle();
+
+    expect(captured).toHaveBeenCalledWith(expect.objectContaining({
+      trackId: 'zh-main',
+      format: 'webvtt',
+      body: 'WEBVTT\n\n00:00.000 --> 00:01.000\n你好',
+    }));
+    handle.dispose();
+  });
+
+  it('captures an opaque OCA XHR only with the track binding snapshotted at send time', async () => {
+    class OcaXhr {
+      readonly listeners = new Set<() => void>();
+      responseType = '';
+      responseText = 'WEBVTT\n\n00:00.000 --> 00:01.000\n你好';
+      responseURL = OPAQUE_OCA_URL;
+      open(): void {}
+      send(): void {}
+      addEventListener(type: string, listener: () => void): void {
+        if (type === 'load') this.listeners.add(listener);
+      }
+      removeEventListener(type: string, listener: () => void): void {
+        if (type === 'load') this.listeners.delete(listener);
+      }
+      getResponseHeader(name: string): string | null {
+        return name.toLowerCase() === 'content-type' ? 'application/octet-stream' : null;
+      }
+      dispatchLoad(): void {
+        for (const listener of [...this.listeners]) listener();
+      }
+    }
+    let binding: { titleId: string; trackId: string } | undefined = {
+      titleId: 'title-1',
+      trackId: 'zh-main',
+    };
+    const captured = vi.fn();
+    const handle = installXhrProbe(OcaXhr as unknown as XhrConstructorLike, {
+      generation: 1,
+      currentGeneration: () => 1,
+      currentTimedTextBinding: () => binding,
+      onTimedText: captured,
+    });
+    const xhr = new OcaXhr();
+    (OcaXhr.prototype.open as unknown as (
+      this: OcaXhr,
+      method: string,
+      url: string,
+    ) => void).call(xhr, 'GET', OPAQUE_OCA_URL);
+    xhr.send();
+    binding = undefined;
+    xhr.dispatchLoad();
+    await settle();
+
+    expect(captured).toHaveBeenCalledWith(expect.objectContaining({
+      trackId: 'zh-main',
+      language: 'und',
+      format: 'webvtt',
+    }));
+    handle.dispose();
+  });
+
   it('keeps metadata off instances, observes after load callbacks, and restores owned methods', async () => {
     const order: string[] = [];
     const captured = vi.fn(() => order.push('probe'));
@@ -596,6 +768,50 @@ describe('Netflix XHR instrumentation', () => {
     handle.dispose();
     expect(FakeXhr.prototype.open).toBe(originalOpen);
     expect(FakeXhr.prototype.send).toBe(originalSend);
+  });
+
+  it('does not retain a load listener for an aborted unrelated XHR', () => {
+    class UnrelatedXhr {
+      readonly listeners = new Map<string, Set<() => void>>();
+      responseType = '';
+      responseText = '';
+      responseURL = '';
+
+      open(_method: string, url: string): void {
+        this.responseURL = url;
+      }
+      send(): void {}
+      abort(): void {
+        for (const listener of this.listeners.get('abort') ?? []) listener();
+      }
+      addEventListener(type: string, listener: () => void): void {
+        const listeners = this.listeners.get(type) ?? new Set();
+        listeners.add(listener);
+        this.listeners.set(type, listeners);
+      }
+      removeEventListener(type: string, listener: () => void): void {
+        this.listeners.get(type)?.delete(listener);
+      }
+      getResponseHeader(): string | null {
+        return null;
+      }
+    }
+
+    const handle = installXhrProbe(
+      UnrelatedXhr as unknown as XhrConstructorLike,
+      {
+        generation: 1,
+        currentGeneration: () => 1,
+        onTimedText: vi.fn(),
+      },
+    );
+    const xhr = new UnrelatedXhr();
+    xhr.open('GET', 'https://www.netflix.com/api/shakti/v1/playback/heartbeat');
+    xhr.send();
+    xhr.abort();
+
+    expect(xhr.listeners.get('load')?.size ?? 0).toBe(0);
+    handle.dispose();
   });
 
   it('updates generations and removes the stale observer when an XHR is reopened', async () => {

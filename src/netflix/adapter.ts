@@ -414,15 +414,12 @@ function deriveState(
   const hasEnglish = catalogTracks.some(
     ({ language }) => language.category === 'english',
   );
-  const hasSimplifiedChinese = catalogTracks.some(
-    ({ language }) => language.category === 'simplified-chinese',
-  );
   const activeEnglish = tracks.find(
     ({ active, language, lifecycle }) =>
       active && lifecycle !== 'disposed' && language.category === 'english',
   );
   const schedulingScope: SubtitleSchedulingScope =
-    activeEnglish === undefined || hasSimplifiedChinese
+    activeEnglish === undefined
     ? 'none'
     : authority === 'authoritative' &&
         hasEnglish &&
@@ -437,8 +434,7 @@ function deriveState(
       tracks: Object.freeze([...catalogTracks]),
     }),
     tracks: Object.freeze([...tracks]),
-    externalTranslationAllowed:
-      authority === 'authoritative' && hasEnglish && !hasSimplifiedChinese,
+    externalTranslationAllowed: authority === 'authoritative' && hasEnglish,
     schedulingScope,
   });
 }

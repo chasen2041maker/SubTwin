@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  downloadNetflixEmbeddedLanguageTimedText,
   downloadNetflixTimedText,
   extractNetflixCatalogDownloadResources,
   type NetflixCatalogDownloadError,
   type NetflixCatalogDownloadResource,
   type NetflixTimedTextFetch,
+  type NetflixTimedTextResponseLike,
 } from '../../src/netflix/catalog-download';
+import { canonicalizeNetflixTimedTextResource } from '../../src/netflix/probe';
 
 const EN_URL =
   'https://ipv4-c001-lax001.nflxvideo.net/timedtext/en/track.vtt?trackid=en-main&token=signed-secret';
@@ -14,6 +17,8 @@ const EN_ALT_URL =
   'https://assets.nflximg.net/subtitles/en/alternate.vtt?trackid=en-alt&sig=secret';
 const ZH_URL =
   'https://cdn.nflxso.net/timed-text/zh/track.ttml?trackid=zh-main&signature=signed-secret';
+const OCA_URL =
+  'https://ipv4-c001-lax001.oca.nflxvideo.net/?o=1&v=42&e=1999999999&t=signed-secret';
 
 function expectErrorCode<T>(
   result: { readonly ok: boolean; readonly error?: NetflixCatalogDownloadError },
@@ -81,7 +86,179 @@ function resource(overrides: Partial<NetflixCatalogDownloadResource> = {}) {
   return { ...first, ...overrides };
 }
 
+function ocaResource(): NetflixCatalogDownloadResource {
+  const extracted = extractNetflixCatalogDownloadResources({
+    movieId: 8_012_345,
+    timedtexttracks: [{
+      new_track_id: 'T:2:0;1;en;0;0;0;',
+      bcp47: 'en',
+      rawTrackType: 'SUBTITLES',
+      ttDownloadables: {
+        'webvtt-lssdh-ios8': { downloadUrls: { primary: OCA_URL } },
+      },
+    }],
+  });
+  if (!extracted.ok || extracted.value[0] === undefined) {
+    throw new Error('OCA fixture must be extractable');
+  }
+  return extracted.value[0];
+}
+
+function withResponseUrl<T extends NetflixTimedTextResponseLike>(
+  response: T,
+  url = EN_URL,
+): T {
+  Object.defineProperty(response, 'url', { configurable: true, value: url });
+  return response;
+}
+
 describe('Netflix catalog download resource extraction', () => {
+  it('accepts a query-only OCA subtitle URL only from verified catalog metadata', () => {
+    const result = extractNetflixCatalogDownloadResources({
+      movieId: 8_012_345,
+      timedtexttracks: [{
+        id: 'legacy-resource-object-id',
+        new_track_id: 'T:2:0;1;en;0;0;0;',
+        bcp47: 'en',
+        rawTrackType: 'SUBTITLES',
+        downloadableIds: { 'webvtt-lssdh-ios8': 1_628_761_434 },
+        ttDownloadables: {
+          'webvtt-lssdh-ios8': { downloadUrls: { primary: OCA_URL } },
+        },
+      }],
+    });
+
+    expect(canonicalizeNetflixTimedTextResource(OCA_URL).ok).toBe(false);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value).toEqual([expect.objectContaining({
+      url: OCA_URL,
+      titleId: '8012345',
+      resourceId: expect.stringMatching(/^tt_[a-f0-9]{16}$/u),
+      trackId: expect.stringMatching(/^track_[a-f0-9]{16}$/u),
+      language: 'en',
+      kind: 'subtitle',
+    })]);
+  });
+
+  it('rejects a query-only root URL outside Netflix OCA hosts', () => {
+    const result = extractNetflixCatalogDownloadResources({
+      movieId: 8_012_345,
+      timedtexttracks: [{
+        new_track_id: 'T:2:0;1;en;0;0;0;',
+        bcp47: 'en',
+        rawTrackType: 'SUBTITLES',
+        ttDownloadables: {
+          webvtt: {
+            downloadUrls: {
+              primary: 'https://ipv4-c001-lax001.nflxvideo.net/?o=1&v=42&e=1999999999&t=signed',
+            },
+          },
+        },
+      }],
+    });
+
+    expect(result).toEqual({ ok: true, value: [] });
+  });
+
+  it('rejects an OCA catalog URL with a duplicate object identity', () => {
+    const result = extractNetflixCatalogDownloadResources({
+      movieId: 8_012_345,
+      timedtexttracks: [{
+        new_track_id: 'T:2:0;1;en;0;0;0;',
+        bcp47: 'en',
+        rawTrackType: 'SUBTITLES',
+        ttDownloadables: {
+          webvtt: {
+            downloadUrls: {
+              primary: 'https://ipv4-c001-lax001.oca.nflxvideo.net/?o=1&o=1&v=42&e=1999999999&t=signed',
+            },
+          },
+        },
+      }],
+    });
+
+    expect(result).toEqual({ ok: true, value: [] });
+  });
+
+  it('keeps distinct OCA text-profile alternatives and prefers WebVTT deterministically', () => {
+    const dfxpUrl =
+      'https://ipv4-c001-lax001.oca.nflxvideo.net/?o=1&v=41&e=1999999999&t=dfxp-secret';
+    const webvttUrl =
+      'https://ipv4-c002-lax001.oca.nflxvideo.net/?o=1&v=42&e=1999999999&t=vtt-secret';
+    const result = extractNetflixCatalogDownloadResources({
+      movieId: 8_012_345,
+      timedtexttracks: [{
+        new_track_id: 'T:2:0;1;en;0;0;0;',
+        bcp47: 'en',
+        rawTrackType: 'SUBTITLES',
+        ttDownloadables: {
+          'dfxp-ls-sdh': { downloadUrls: { primary: dfxpUrl } },
+          'webvtt-lssdh-ios8': { downloadUrls: { primary: webvttUrl } },
+        },
+      }],
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.map(({ url }) => url)).toEqual([webvttUrl, dfxpUrl]);
+    expect(new Set(result.value.map(({ resourceId }) => resourceId)).size).toBe(2);
+  });
+
+  it('retains at most three text profiles per track in format priority order', () => {
+    const urls = {
+      other: 'https://ipv4-c004-lax001.oca.nflxvideo.net/?o=1&v=44&e=1999999999&t=other',
+      dfxp: 'https://ipv4-c003-lax001.oca.nflxvideo.net/?o=1&v=43&e=1999999999&t=dfxp',
+      imsc: 'https://ipv4-c002-lax001.oca.nflxvideo.net/?o=1&v=42&e=1999999999&t=imsc',
+      webvtt: 'https://ipv4-c001-lax001.oca.nflxvideo.net/?o=1&v=41&e=1999999999&t=webvtt',
+    } as const;
+    const result = extractNetflixCatalogDownloadResources({
+      movieId: 8_012_345,
+      timedtexttracks: [{
+        new_track_id: 'T:2:0;1;en;0;0;0;',
+        bcp47: 'en',
+        rawTrackType: 'SUBTITLES',
+        ttDownloadables: {
+          simple: { downloadUrls: { primary: urls.other } },
+          'dfxp-ls-sdh': { downloadUrls: { primary: urls.dfxp } },
+          'imsc1.1': { downloadUrls: { primary: urls.imsc } },
+          'webvtt-lssdh-ios8': { downloadUrls: { primary: urls.webvtt } },
+        },
+      }],
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.map(({ url }) => url)).toEqual([
+      urls.webvtt,
+      urls.imsc,
+      urls.dfxp,
+    ]);
+  });
+
+  it('rejects image subtitle profiles while retaining text profiles', () => {
+    const imageUrl =
+      'https://ipv4-c001-lax001.oca.nflxvideo.net/?o=1&v=41&e=1999999999&t=image';
+    const textUrl =
+      'https://ipv4-c002-lax001.oca.nflxvideo.net/?o=1&v=42&e=1999999999&t=text';
+    const result = extractNetflixCatalogDownloadResources({
+      movieId: 8_012_345,
+      timedtexttracks: [{
+        new_track_id: 'T:2:0;1;en;0;0;0;',
+        bcp47: 'en',
+        rawTrackType: 'SUBTITLES',
+        ttDownloadables: {
+          'nflx-cmisc-png': { downloadUrls: { primary: imageUrl } },
+          webvtt: { downloadUrls: { primary: textUrl } },
+        },
+      }],
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.map(({ url }) => url)).toEqual([textUrl]);
+  });
+
   it('finds the English and Simplified Chinese downloadable resources in the fixture', () => {
     const result = extractNetflixCatalogDownloadResources(extractFixture());
 
@@ -108,7 +285,7 @@ describe('Netflix catalog download resource extraction', () => {
     expect(JSON.stringify(result.value)).not.toContain('must-not-copy');
   });
 
-  it('preserves separate English tracks and chooses a deterministic resource per track', () => {
+  it('supports URL map keys and keeps a deterministic resource for every English track', () => {
     const metadata = {
       titleId: 'title-2',
       textTracks: [
@@ -151,6 +328,34 @@ describe('Netflix catalog download resource extraction', () => {
         language: 'en-GB',
       }),
     ]);
+  });
+
+  it('bounds retained resources to eight tracks per category independently of profiles', () => {
+    const result = extractNetflixCatalogDownloadResources({
+      titleId: 'bounded-title',
+      textTracks: Array.from({ length: 10 }, (_, index) => ({
+        trackId: `en-${index}`,
+        language: 'en-US',
+        kind: 'SUBTITLE',
+        downloadables: {
+          webvtt: {
+            urls: [
+              `https://ipv4-c001-lax001.nflxvideo.net/timedtext/en/track-${index}.vtt?trackid=en-${index}`,
+            ],
+          },
+          dfxp: {
+            urls: [
+              `https://ipv4-c001-lax001.nflxvideo.net/timedtext/en/track-${index}.ttml?trackid=en-${index}`,
+            ],
+          },
+        },
+      })),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value).toHaveLength(16);
+    expect(new Set(result.value.map(({ trackId }) => trackId)).size).toBe(8);
   });
 
   it('ignores non-Netflix URLs and never touches unrelated malicious getters', () => {
@@ -224,18 +429,130 @@ describe('Netflix catalog download resource extraction', () => {
 });
 
 describe('Netflix timed-text catalog download', () => {
+  it('re-fetches a performance-observed OCA TTML and derives only its root language', async () => {
+    const body = '<?xml version="1.0"?><tt xml:lang="zh-Hans" xmlns="http://www.w3.org/ns/ttml"><body /></tt>';
+    const fetcher = vi.fn(async () => ({
+      ok: true,
+      url: OCA_URL,
+      headers: new Headers({
+        'content-length': String(new TextEncoder().encode(body).byteLength),
+        'content-type': 'text/xml',
+      }),
+      body: null,
+      text: async () => body,
+    })) as NetflixTimedTextFetch;
+
+    const result = await downloadNetflixEmbeddedLanguageTimedText(fetcher, OCA_URL);
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        type: 'timed-text',
+        resourceId: expect.stringMatching(/^tt_[a-f0-9]{16}$/u),
+        trackId: expect.stringMatching(/^oca_[a-f0-9]{16}$/u),
+        language: 'zh-Hans',
+        format: 'ttml',
+        body,
+      },
+    });
+    expect(fetcher).toHaveBeenCalledWith(OCA_URL, expect.objectContaining({
+      credentials: 'omit',
+      method: 'GET',
+    }));
+  });
+
+  it('downloads a bounded WEBVTT body from an approved OCA catalog URL', async () => {
+    const extracted = extractNetflixCatalogDownloadResources({
+      movieId: 8_012_345,
+      timedtexttracks: [{
+        new_track_id: 'T:2:0;1;en;0;0;0;',
+        bcp47: 'en',
+        rawTrackType: 'SUBTITLES',
+        ttDownloadables: {
+          'webvtt-lssdh-ios8': { downloadUrls: { primary: OCA_URL } },
+        },
+      }],
+    });
+    expect(extracted.ok).toBe(true);
+    if (!extracted.ok || extracted.value[0] === undefined) return;
+    const body = 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello';
+    const fetcher = vi.fn(async () => ({
+      ok: true,
+      url: OCA_URL,
+      headers: new Headers({
+        'content-length': String(new TextEncoder().encode(body).byteLength),
+        'content-type': 'text/vtt',
+      }),
+      body: null,
+      text: async () => body,
+    })) as NetflixTimedTextFetch;
+
+    const result = await downloadNetflixTimedText(fetcher, extracted.value[0]);
+
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.value.body).toBe(body);
+  });
+
+  it('allows an equivalent OCA response URL with a different node and renewed signature', async () => {
+    const body = 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello';
+    const responseUrl =
+      'https://ipv4-c099-lax001.oca.nflxvideo.net/?o=1&v=42&e=2000000000&t=renewed';
+    const fetcher = vi.fn(async () => ({
+      ok: true,
+      url: responseUrl,
+      headers: new Headers({ 'content-type': 'text/vtt' }),
+      body: null,
+      text: async () => body,
+    })) as NetflixTimedTextFetch;
+
+    const result = await downloadNetflixTimedText(fetcher, ocaResource());
+
+    expect(result.ok).toBe(true);
+  });
+
+  it('allows an equivalent strict response after CDN, range, and token rotation', async () => {
+    const requestedUrl =
+      'https://ipv4-c001-lax001.nflxvideo.net/timedtext/en/range/0-100/track.vtt?trackid=en-main&token=old';
+    const finalUrl =
+      'https://ipv4-c099-lax001.nflxvideo.net/timedtext/en/range/101-200/track.vtt?trackid=en-main&token=renewed';
+    const extracted = extractNetflixCatalogDownloadResources({
+      movieId: 8_012_345,
+      timedtexttracks: [{
+        trackId: 'en-main',
+        bcp47: 'en-US',
+        rawTrackType: 'SUBTITLES',
+        ttDownloadables: {
+          webvtt: { downloadUrls: { primary: requestedUrl } },
+        },
+      }],
+    });
+    expect(extracted.ok).toBe(true);
+    if (!extracted.ok || extracted.value[0] === undefined) return;
+    const fetcher = vi.fn(async () => ({
+      ok: true,
+      url: finalUrl,
+      headers: new Headers({ 'content-type': 'text/vtt' }),
+      body: null,
+      text: async () => 'WEBVTT',
+    })) as NetflixTimedTextFetch;
+
+    const result = await downloadNetflixTimedText(fetcher, extracted.value[0]);
+
+    expect(result.ok).toBe(true);
+  });
+
   it('performs a real GET and returns a strict WEBVTT payload with catalog identity', async () => {
     const body = 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello';
     const fetcher: NetflixTimedTextFetch = vi.fn(async (_input, init) => {
       expect(init).toMatchObject({ method: 'GET', credentials: 'omit' });
       expect(init?.signal).toBeInstanceOf(AbortSignal);
-      return new Response(body, {
+      return withResponseUrl(new Response(body, {
         status: 200,
         headers: {
           'content-length': String(new TextEncoder().encode(body).byteLength),
           'content-type': 'text/vtt; charset=utf-8',
         },
-      });
+      }));
     });
     const selected = resource();
 
@@ -267,7 +584,7 @@ describe('Netflix timed-text catalog download', () => {
         const bytes = new TextEncoder().encode(body);
         return {
           ok: true,
-          url: '',
+          url: EN_URL,
           headers: new Headers({ 'content-type': 'application/ttml+xml' }),
           body: null,
           arrayBuffer: vi.fn(async () => bytes.buffer),
@@ -279,7 +596,7 @@ describe('Netflix timed-text catalog download', () => {
       response(body: string) {
         return {
           ok: true,
-          url: '',
+          url: EN_URL,
           headers: new Headers({ 'content-type': 'text/xml' }),
           body: null,
           text: vi.fn(async () => body),
@@ -298,12 +615,12 @@ describe('Netflix timed-text catalog download', () => {
 
   it('rejects oversized declared and streamed bodies and cancels the reader', async () => {
     const declared = vi.fn(async () =>
-      new Response('WEBVTT', {
+      withResponseUrl(new Response('WEBVTT', {
         headers: {
           'content-length': '100',
           'content-type': 'text/vtt',
         },
-      }),
+      })),
     );
     expectErrorCode(
       await downloadNetflixTimedText(declared, resource(), { maxBytes: 32 }),
@@ -317,7 +634,7 @@ describe('Netflix timed-text catalog download', () => {
       .mockResolvedValueOnce({ done: false, value: new Uint8Array(32) });
     const streamed = vi.fn(async () => ({
       ok: true,
-      url: '',
+      url: EN_URL,
       headers: new Headers({ 'content-type': 'text/vtt' }),
       body: { getReader: () => ({ read, cancel }) },
     })) as NetflixTimedTextFetch;
@@ -355,11 +672,78 @@ describe('Netflix timed-text catalog download', () => {
       code: 'netflix_timed_text_resource_invalid' as const,
     },
     {
+      name: 'missing final response URL',
+      selected: () => resource(),
+      fetcher: () =>
+        vi.fn(async () => ({
+          ok: true,
+          headers: new Headers({ 'content-type': 'text/vtt' }),
+          body: null,
+          text: async () => 'WEBVTT',
+        })) as NetflixTimedTextFetch,
+      code: 'netflix_timed_text_resource_invalid' as const,
+    },
+    {
+      name: 'different strict Netflix timed-text resource redirect',
+      selected: () => resource(),
+      fetcher: () =>
+        vi.fn(async () => ({
+          ok: true,
+          url: EN_ALT_URL,
+          headers: new Headers({ 'content-type': 'text/vtt' }),
+          body: null,
+          text: async () => 'WEBVTT',
+        })) as NetflixTimedTextFetch,
+      code: 'netflix_timed_text_resource_invalid' as const,
+    },
+    {
+      name: 'OCA redirect with a different video identity',
+      selected: () => ocaResource(),
+      fetcher: () =>
+        vi.fn(async () => ({
+          ok: true,
+          url: 'https://ipv4-c002-lax001.oca.nflxvideo.net/?o=1&v=99&e=2000000000&t=renewed',
+          headers: new Headers({ 'content-type': 'text/vtt' }),
+          body: null,
+          text: async () => 'WEBVTT',
+        })) as NetflixTimedTextFetch,
+      code: 'netflix_timed_text_resource_invalid' as const,
+    },
+    {
+      name: 'OCA redirect with a different object identity',
+      selected: () => ocaResource(),
+      fetcher: () =>
+        vi.fn(async () => ({
+          ok: true,
+          url: 'https://ipv4-c002-lax001.oca.nflxvideo.net/?o=99&v=42&e=2000000000&t=renewed',
+          headers: new Headers({ 'content-type': 'text/vtt' }),
+          body: null,
+          text: async () => 'WEBVTT',
+        })) as NetflixTimedTextFetch,
+      code: 'netflix_timed_text_resource_invalid' as const,
+    },
+    {
+      name: 'OCA redirect with duplicate video identity parameters',
+      selected: () => ocaResource(),
+      fetcher: () =>
+        vi.fn(async () => ({
+          ok: true,
+          url: 'https://ipv4-c002-lax001.oca.nflxvideo.net/?o=1&v=42&v=42&e=2000000000&t=renewed',
+          headers: new Headers({ 'content-type': 'text/vtt' }),
+          body: null,
+          text: async () => 'WEBVTT',
+        })) as NetflixTimedTextFetch,
+      code: 'netflix_timed_text_resource_invalid' as const,
+    },
+    {
       name: 'media content type',
       selected: () => resource(),
       fetcher: () =>
         vi.fn(async () =>
-          new Response('WEBVTT', { headers: { 'content-type': 'video/mp4' } }),
+          withResponseUrl(new Response(
+            'WEBVTT',
+            { headers: { 'content-type': 'video/mp4' } },
+          )),
         ),
       code: 'netflix_timed_text_media_response' as const,
     },
@@ -368,9 +752,9 @@ describe('Netflix timed-text catalog download', () => {
       selected: () => resource(),
       fetcher: () =>
         vi.fn(async () =>
-          new Response('<html>not subtitles</html>', {
+          withResponseUrl(new Response('<html>not subtitles</html>', {
             headers: { 'content-type': 'text/plain' },
-          }),
+          })),
         ),
       code: 'netflix_timed_text_invalid_body' as const,
     },

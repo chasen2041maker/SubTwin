@@ -1,9 +1,43 @@
 import { parseMessageEnvelope } from '../shared/messages';
-import type { RuntimeSettingsState } from '../storage/schema';
+import type {
+  RuntimeSettingsState,
+  SubtitleAppearanceSettings,
+  TranslationProviderSetting,
+} from '../storage/schema';
 
 export interface RuntimeSettingsPush {
   readonly settings: RuntimeSettingsState;
   readonly translationConfigurationChanged: boolean;
+}
+
+export interface PageSettingsUpdateResponse {
+  readonly enabled: boolean;
+  readonly provider: TranslationProviderSetting;
+  readonly appearance: SubtitleAppearanceSettings;
+}
+
+export function parsePageSettingsUpdateResponse(
+  candidate: unknown,
+  requestId: string,
+): PageSettingsUpdateResponse | null {
+  if (
+    !isRecord(candidate) ||
+    !hasExactlyKeys(candidate, ['ok', 'value']) ||
+    candidate.ok !== true
+  ) return null;
+  const parsed = parseMessageEnvelope(candidate.value);
+  if (
+    !parsed.ok ||
+    parsed.value.source !== 'background' ||
+    parsed.value.type !== 'settings/page-update-result' ||
+    parsed.value.id !== `${requestId}:background` ||
+    parsed.value.payload.status !== 'success'
+  ) return null;
+  return {
+    enabled: parsed.value.payload.enabled,
+    provider: parsed.value.payload.provider,
+    appearance: parsed.value.payload.appearance,
+  };
 }
 
 export function parseRuntimeSettingsResponse(

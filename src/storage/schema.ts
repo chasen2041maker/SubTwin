@@ -1,14 +1,21 @@
-export const SETTINGS_SCHEMA_VERSION = 1 as const;
+export const SETTINGS_SCHEMA_VERSION = 2 as const;
 export const SETTINGS_STORAGE_KEY = 'subtwinSettings' as const;
 
 export type TranslationProviderSetting = 'unset' | 'google-free' | 'deepseek';
 export type DeepSeekModelSetting = 'deepseek-v4-flash' | 'deepseek-v4-pro';
 export type SubtitleOrder = 'english-first' | 'chinese-first';
 export type SubtitleShadow = 'none' | 'soft' | 'strong';
+export type SubtitleFontFamily =
+  | 'mono'
+  | 'rounded'
+  | 'sans'
+  | 'serif'
+  | 'system';
 
 export interface SubtitleLanguageAppearance {
   visible: boolean;
   color: string;
+  fontFamily: SubtitleFontFamily;
   fontSizePx: number;
   fontWeight: number;
 }
@@ -18,6 +25,7 @@ export interface SubtitleAppearanceSettings {
   chinese: SubtitleLanguageAppearance;
   order: SubtitleOrder;
   lineSpacingPx: number;
+  maxLineWidthPercent: number;
   verticalOffsetPercent: number;
   backgroundOpacity: number;
   shadow: SubtitleShadow;
@@ -63,19 +71,22 @@ const mutableDefaults: SubTwinSettings = {
     english: {
       visible: true,
       color: '#FFFFFF',
-      fontSizePx: 28,
+      fontFamily: 'sans',
+      fontSizePx: 24,
       fontWeight: 600,
     },
     chinese: {
       visible: true,
       color: '#FFFFFF',
-      fontSizePx: 32,
+      fontFamily: 'sans',
+      fontSizePx: 26,
       fontWeight: 600,
     },
-    order: 'english-first',
-    lineSpacingPx: 8,
-    verticalOffsetPercent: 8,
-    backgroundOpacity: 0.55,
+    order: 'chinese-first',
+    lineSpacingPx: 4,
+    maxLineWidthPercent: 96,
+    verticalOffsetPercent: 7,
+    backgroundOpacity: 0.3,
     shadow: 'soft',
   },
 };
@@ -100,6 +111,7 @@ export function isExactSubtitleAppearanceSettings(
       'chinese',
       'english',
       'lineSpacingPx',
+      'maxLineWidthPercent',
       'order',
       'shadow',
       'verticalOffsetPercent',
@@ -108,7 +120,8 @@ export function isExactSubtitleAppearanceSettings(
     isExactLanguageAppearance(value.chinese) &&
     (value.order === 'english-first' || value.order === 'chinese-first') &&
     isIntegerInRange(value.lineSpacingPx, 0, 48) &&
-    isNumberInRange(value.verticalOffsetPercent, 0, 40) &&
+    isIntegerInRange(value.maxLineWidthPercent, 50, 100) &&
+    isNumberInRange(value.verticalOffsetPercent, 0, 80) &&
     isNumberInRange(value.backgroundOpacity, 0, 1) &&
     (value.shadow === 'none' || value.shadow === 'soft' || value.shadow === 'strong');
 }
@@ -211,10 +224,17 @@ function normalizeCandidate(input: unknown): SubTwinSettings {
         DEFAULT_SETTINGS.appearance.lineSpacingPx,
         true,
       ),
+      maxLineWidthPercent: finiteNumberInRange(
+        appearance?.maxLineWidthPercent,
+        50,
+        100,
+        DEFAULT_SETTINGS.appearance.maxLineWidthPercent,
+        true,
+      ),
       verticalOffsetPercent: finiteNumberInRange(
         appearance?.verticalOffsetPercent ?? appearance?.verticalOffset,
         0,
-        40,
+        80,
         DEFAULT_SETTINGS.appearance.verticalOffsetPercent,
         false,
       ),
@@ -237,6 +257,7 @@ function normalizeLanguageAppearance(
   return {
     visible: booleanOrDefault(input?.visible, defaults.visible),
     color: normalizeColor(input?.color, defaults.color),
+    fontFamily: normalizeFontFamily(input?.fontFamily, defaults.fontFamily),
     fontSizePx: finiteNumberInRange(
       input?.fontSizePx ?? input?.fontSize,
       12,
@@ -259,12 +280,31 @@ function isExactLanguageAppearance(
 ): input is SubtitleLanguageAppearance {
   const value = asRecord(input);
   return value !== null &&
-    hasExactlyKeys(value, ['color', 'fontSizePx', 'fontWeight', 'visible']) &&
+    hasExactlyKeys(value, [
+      'color',
+      'fontFamily',
+      'fontSizePx',
+      'fontWeight',
+      'visible',
+    ]) &&
     typeof value.visible === 'boolean' &&
     typeof value.color === 'string' &&
     /^#[\dA-F]{6}$/u.test(value.color) &&
+    isSubtitleFontFamily(value.fontFamily) &&
     isIntegerInRange(value.fontSizePx, 12, 72) &&
     isIntegerInRange(value.fontWeight, 100, 900);
+}
+
+function isSubtitleFontFamily(value: unknown): value is SubtitleFontFamily {
+  return value === 'mono' || value === 'rounded' || value === 'sans' ||
+    value === 'serif' || value === 'system';
+}
+
+function normalizeFontFamily(
+  value: unknown,
+  fallback: SubtitleFontFamily,
+): SubtitleFontFamily {
+  return isSubtitleFontFamily(value) ? value : fallback;
 }
 
 function isTranslationProviderSetting(
@@ -394,6 +434,7 @@ function cloneAppearance(
     chinese: { ...appearance.chinese },
     order: appearance.order,
     lineSpacingPx: appearance.lineSpacingPx,
+    maxLineWidthPercent: appearance.maxLineWidthPercent,
     verticalOffsetPercent: appearance.verticalOffsetPercent,
     backgroundOpacity: appearance.backgroundOpacity,
     shadow: appearance.shadow,

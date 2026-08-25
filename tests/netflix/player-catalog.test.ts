@@ -4,10 +4,14 @@ import {
   readNetflixPlayerCatalog,
   type NetflixPlayerCatalogError,
 } from '../../src/netflix/player-catalog';
+import { extractNetflixCatalogDownloadResources } from '../../src/netflix/catalog-download';
 
 interface PlayerFixtureOptions {
+  readonly internalManifest?: unknown;
+  readonly manifest?: unknown;
   readonly movieId?: unknown;
   readonly sessions?: unknown;
+  readonly timedTextTracks?: unknown;
   readonly tracks?: unknown;
 }
 
@@ -37,13 +41,29 @@ function playerFixture(options: PlayerFixtureOptions = {}) {
   const setTextTrack = vi.fn();
   const seek = vi.fn();
   const play = vi.fn();
-  const player = {
+  const getManifest = vi.fn(() => options.manifest);
+  const getTimedTextTrackList = vi.fn(() => options.timedTextTracks);
+  const getInternalPlayer = vi.fn(() => ({
+    playback: {
+      manifest: {
+        manifestResult: options.internalManifest,
+      },
+    },
+  }));
+  const player: Record<string, unknown> = {
     getMovieId,
     getTextTrackList,
     play,
     seek,
     setTextTrack,
   };
+  if (options.manifest !== undefined) player.getManifest = getManifest;
+  if (options.timedTextTracks !== undefined) {
+    player.getTimedTextTrackList = getTimedTextTrackList;
+  }
+  if (options.internalManifest !== undefined) {
+    player.getInternalPlayer = getInternalPlayer;
+  }
   const getVideoPlayerBySessionId = vi.fn(() => player);
   const getAPI = vi.fn(() => ({
     videoPlayer: {
@@ -65,7 +85,10 @@ function playerFixture(options: PlayerFixtureOptions = {}) {
     getAPI,
     getAllPlayerSessionIds,
     getMovieId,
+    getManifest,
+    getInternalPlayer,
     getTextTrackList,
+    getTimedTextTrackList,
     getVideoPlayerBySessionId,
     play,
     seek,
@@ -86,6 +109,39 @@ function expectErrorCode(
 }
 
 describe('authoritative Netflix player catalog reader', () => {
+  it('uses the same safe logical ID for Player trackId and manifest new_track_id', () => {
+    const logicalId = 'T:2:0;1;en;0;0;0;';
+    const player = readNetflixPlayerCatalog(playerFixture({
+      tracks: [{
+        trackId: logicalId.slice(0, -1),
+        bcp47: 'en',
+        rawTrackType: 'SUBTITLES',
+      }],
+    }).target);
+    const resources = extractNetflixCatalogDownloadResources({
+      movieId: 8_012_345,
+      timedtexttracks: [{
+        id: 'legacy-resource-object-id',
+        new_track_id: logicalId,
+        bcp47: 'en',
+        rawTrackType: 'SUBTITLES',
+        ttDownloadables: {
+          'webvtt-lssdh-ios8': {
+            downloadUrls: {
+              primary: 'https://ipv4-c001-lax001.nflxvideo.net/timedtext/en/track.vtt',
+            },
+          },
+        },
+      }],
+    });
+
+    expect(player.ok).toBe(true);
+    expect(resources.ok).toBe(true);
+    if (!player.ok || !resources.ok) return;
+    expect(player.value.tracks[0]?.id).toMatch(/^track_[a-f0-9]{16}$/u);
+    expect(resources.value[0]?.trackId).toBe(player.value.tracks[0]?.id);
+  });
+
   it('reads and sanitizes the complete MAIN-world player text-track list', () => {
     const fixture = playerFixture();
 
@@ -108,6 +164,135 @@ describe('authoritative Netflix player catalog reader', () => {
     expect(fixture.setTextTrack).not.toHaveBeenCalled();
     expect(fixture.seek).not.toHaveBeenCalled();
     expect(fixture.play).not.toHaveBeenCalled();
+  });
+
+  it('optionally exposes raw player track metadata only to a MAIN-world callback', () => {
+    const tracks = [
+      {
+        trackId: 'en-main',
+        bcp47: 'en-US',
+        rawTrackType: 'SUBTITLES',
+        downloadables: {
+          webvtt: { urls: ['https://cdn.nflximg.net/subtitle.vtt?token=secret'] },
+        },
+      },
+      {
+        trackId: 'zh-main',
+        bcp47: 'zh-Hans',
+        rawTrackType: 'SUBTITLES',
+      },
+    ];
+    const fixture = playerFixture({ tracks });
+    const onMetadata = vi.fn();
+
+    const result = readNetflixPlayerCatalog(fixture.target, onMetadata);
+
+    expect(result.ok).toBe(true);
+    expect(onMetadata).toHaveBeenCalledOnce();
+    expect(onMetadata).toHaveBeenCalledWith({
+      titleId: '8012345',
+      timedtexttracks: tracks,
+    });
+    expect(JSON.stringify(result)).not.toContain('token=secret');
+    expect(JSON.stringify(result)).not.toContain('downloadables');
+  });
+
+  it('prefers a read-only player manifest for MAIN-world metadata extraction', () => {
+    const manifest = {
+      timedtexttracks: [{
+        new_track_id: 'en-main',
+        bcp47: 'en-US',
+        rawTrackType: 'SUBTITLES',
+        ttDownloadables: {
+          'webvtt-lssdh-ios8': {
+            downloadUrls: {
+              primary: 'https://cdn.nflximg.net/subtitle.vtt?token=secret',
+            },
+          },
+        },
+      }],
+    };
+    const fixture = playerFixture({ manifest });
+    const onMetadata = vi.fn();
+
+    const result = readNetflixPlayerCatalog(fixture.target, onMetadata);
+
+    expect(result.ok).toBe(true);
+    expect(fixture.getManifest).toHaveBeenCalledOnce();
+    expect(onMetadata).toHaveBeenCalledWith({
+      titleId: '8012345',
+      metadata: manifest,
+    });
+    const extracted = extractNetflixCatalogDownloadResources(
+      onMetadata.mock.calls[0]?.[0],
+    );
+    expect(extracted.ok && extracted.value).toHaveLength(1);
+    expect(JSON.stringify(result)).not.toContain('token=secret');
+  });
+
+  it('reads the 2026 Cadmium internal manifest result for download metadata', () => {
+    const internalManifest = {
+      movieId: 8_012_345,
+      timedtexttracks: [{
+        new_track_id: 'en-main',
+        bcp47: 'en-US',
+        rawTrackType: 'SUBTITLES',
+        ttDownloadables: {
+          'webvtt-lssdh-ios8': {
+            downloadUrls: {
+              primary: 'https://cdn.nflximg.net/subtitle.vtt?token=secret',
+            },
+          },
+        },
+      }],
+    };
+    const fixture = playerFixture({ internalManifest });
+    const onMetadata = vi.fn();
+
+    const result = readNetflixPlayerCatalog(fixture.target, onMetadata);
+
+    expect(result.ok).toBe(true);
+    expect(fixture.getInternalPlayer).toHaveBeenCalledOnce();
+    expect(onMetadata).toHaveBeenCalledWith({
+      titleId: '8012345',
+      metadata: internalManifest,
+    });
+    const extracted = extractNetflixCatalogDownloadResources(
+      onMetadata.mock.calls[0]?.[0],
+    );
+    expect(extracted.ok && extracted.value).toHaveLength(1);
+    expect(JSON.stringify(result)).not.toContain('token=secret');
+  });
+
+  it('treats the 2026 Cadmium timed-text list as a shallow advisory fallback', () => {
+    const timedTextTracks = [{
+      new_track_id: 'en-main',
+      bcp47: 'en-US',
+      rawTrackType: 'SUBTITLES',
+    }];
+    const fixture = playerFixture({ timedTextTracks });
+    const onMetadata = vi.fn();
+
+    const result = readNetflixPlayerCatalog(fixture.target, onMetadata);
+
+    expect(result.ok).toBe(true);
+    expect(fixture.getTimedTextTrackList).toHaveBeenCalledOnce();
+    expect(onMetadata).toHaveBeenCalledWith({
+      titleId: '8012345',
+      timedtexttracks: timedTextTracks,
+    });
+    const extracted = extractNetflixCatalogDownloadResources(
+      onMetadata.mock.calls[0]?.[0],
+    );
+    expect(extracted.ok && extracted.value).toEqual([]);
+  });
+
+  it('keeps metadata callback failures advisory to the authoritative catalog', () => {
+    const fixture = playerFixture();
+
+    expect(() => readNetflixPlayerCatalog(fixture.target, () => {
+      throw new Error('observer failed');
+    })).not.toThrow();
   });
 
   it('uses the first valid session when no watch session exists', () => {

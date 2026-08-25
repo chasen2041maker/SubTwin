@@ -144,9 +144,22 @@ function isClearlyPassThroughSource(sourceText: string): boolean {
   const source = sourceText.trim();
   if (source.length === 0) return false;
   if (!/[A-Za-z]/u.test(source)) return true;
-  if (/^(?:https?:\/\/|www\.|@)/iu.test(source)) return true;
+  if (/^(?:https?:\/\/|www\.)\S+$/iu.test(source)) return true;
+  if (/^(?:[@#][\p{L}\p{M}\p{N}_.-]+|[\p{L}\p{M}\p{N}._%+-]+@[\p{L}\p{M}\p{N}.-]+)$/u.test(source)) {
+    return true;
+  }
   if (/^[A-Z0-9][A-Z0-9._:/+#-]{1,31}$/u.test(source)) return true;
-  return source.toLocaleLowerCase('en-US') === 'netflix';
+  const token = source.replace(
+    /^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu,
+    '',
+  );
+  return (
+    source.toLocaleLowerCase('en-US') === 'netflix' ||
+    (/\p{L}/u.test(token) &&
+      !/\s/u.test(token) &&
+      (/^[\p{Lu}\p{N}._+-]+$/u.test(token) ||
+        (token === source && /^\p{Lu}[\p{L}\p{M}\p{N}._+-]*$/u.test(token))))
+  );
 }
 
 function normalizeComparableText(value: string): string {

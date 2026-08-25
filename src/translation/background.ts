@@ -50,29 +50,57 @@ interface ActiveTranslationSession {
   cancelled: boolean;
 }
 
+interface CacheCueOwnership {
+  activeBulkLeases: number;
+  readonly decisionWaiters: Set<() => void>;
+  readonly urgentLeaseTokens: Set<number>;
+  urgentWinner: boolean;
+}
+
+interface CachePriorityLease {
+  canCommitCue(cueId: string, source: string): boolean;
+  waitForCommitCue(
+    cueId: string,
+    source: string,
+    signal: AbortSignal,
+  ): Promise<boolean>;
+  markUrgentWinner(cueIds: readonly string[]): void;
+  release(): void;
+}
+
 export function createBackgroundTranslationHandler(
   options: BackgroundTranslationHandlerOptions,
-): (candidate: unknown) => Promise<BackgroundHandlerResult | undefined> {
+): (
+  candidate: unknown,
+  tabId?: number,
+) => Promise<BackgroundHandlerResult | undefined> {
   const google = new GoogleFreeProvider({
     fetch: options.fetch,
     ...options.googleOptions,
   });
   const sessions = new Map<string, ActiveTranslationSession>();
+  const cacheOwnerships = new Map<string, CacheCueOwnership>();
+  let cacheLeaseSequence = 0;
 
-  return async (candidate) => {
+  return async (candidate, tabId = 0) => {
     const parsed = parseMessageEnvelope(candidate);
     if (!parsed.ok) return parsed;
     if (parsed.value.type === 'translation/cancel') {
       const message = parsed.value;
+      const sessionKey = scopedSessionKey(tabId, message.payload.sessionId);
       const generation = {
         episodeGeneration: message.payload.episodeGeneration,
         providerGeneration: message.payload.providerGeneration,
       };
-      let session = sessions.get(message.payload.sessionId);
+      let session = sessions.get(sessionKey);
       let accepted = false;
       if (session === undefined) {
-        session = { generation, active: new Set(), cancelled: true };
-        sessions.set(message.payload.sessionId, session);
+        session = {
+          generation,
+          active: new Set(),
+          cancelled: true,
+        };
+        sessions.set(sessionKey, session);
         accepted = true;
       } else if (!isOlderGeneration(generation, session.generation)) {
         abortSession(session);
@@ -80,17 +108,18 @@ export function createBackgroundTranslationHandler(
         session.cancelled = true;
         accepted = true;
       }
-      pruneInactiveSessions(sessions, message.payload.sessionId);
+      pruneInactiveSessions(sessions, sessionKey);
       return cancellationMessage(message, accepted);
     }
     if (parsed.value.type !== 'translation/request') return undefined;
 
     const message = parsed.value;
+    const sessionKey = scopedSessionKey(tabId, message.payload.sessionId);
     const generation = {
       episodeGeneration: message.payload.episodeGeneration,
       providerGeneration: message.payload.providerGeneration,
     };
-    let session = sessions.get(message.payload.sessionId);
+    let session = sessions.get(sessionKey);
     if (
       session !== undefined &&
       (isOlderGeneration(generation, session.generation) ||
@@ -99,34 +128,23 @@ export function createBackgroundTranslationHandler(
       return resultMessage(message, 'stale_generation', false);
     }
     if (session === undefined) {
-      session = { generation, active: new Set(), cancelled: false };
-      sessions.set(message.payload.sessionId, session);
+      session = {
+        generation,
+        active: new Set(),
+        cancelled: false,
+      };
+      sessions.set(sessionKey, session);
     } else if (!sameGeneration(generation, session.generation)) {
       abortSession(session);
       session.generation = generation;
       session.cancelled = false;
     }
-    pruneInactiveSessions(sessions, message.payload.sessionId);
+    pruneInactiveSessions(sessions, sessionKey);
 
     const isCurrent = () =>
-      sessions.get(message.payload.sessionId) === session &&
+      sessions.get(sessionKey) === session &&
       !session.cancelled &&
       sameGeneration(generation, session.generation);
-
-    let storedSettings: unknown;
-    try {
-      storedSettings = await options.readSettings();
-    } catch {
-      return resultMessage(message, 'invalid_configuration', false);
-    }
-    if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
-    const settings = parseStoredSettings(storedSettings);
-    if (!settings || settings.provider === 'unset') {
-      return resultMessage(message, 'provider_unset', false);
-    }
-    if (settings.provider !== message.payload.provider) {
-      return resultMessage(message, 'invalid_configuration', false);
-    }
 
     const request: TranslationRequest = {
       taskId: message.payload.taskId,
@@ -141,81 +159,130 @@ export function createBackgroundTranslationHandler(
       cues: message.payload.cues,
       context: message.payload.context,
     };
+    const cachePriority = acquireCachePriority(
+      cacheOwnerships,
+      request,
+      message.payload.priority,
+      ++cacheLeaseSequence,
+    );
 
-    const controller = new AbortController();
-    session.active.add(controller);
     try {
-      if (settings.provider === 'deepseek') {
-      if (!settings.deepseekApiKey?.trim()) {
+      let storedSettings: unknown;
+      try {
+        storedSettings = await options.readSettings();
+      } catch {
         return resultMessage(message, 'invalid_configuration', false);
       }
-      const model = settings.deepseekModel ?? 'deepseek-v4-flash';
-      if (model !== 'deepseek-v4-flash' && model !== 'deepseek-v4-pro') {
+      if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
+      const settings = parseStoredSettings(storedSettings);
+      if (!settings || settings.provider === 'unset') {
+        return resultMessage(message, 'provider_unset', false);
+      }
+      if (settings.provider !== message.payload.provider) {
         return resultMessage(message, 'invalid_configuration', false);
-      }
-      const cached = await readCachedCues(options.cache, request, model);
-      if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
-      if (cached.missing.length === 0) {
-        return successMessage(message, { translations: cached.translations, retryCueIds: [] });
-      }
-      const deepseek = new PersonalDeepSeekProvider({
-        fetch: options.fetch,
-        apiKey: settings.deepseekApiKey,
-        model,
-      });
-      const translated = await new TranslationProviderRouter([deepseek]).translate(
-        { ...request, cues: cached.missing },
-        controller.signal,
-      );
-      if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
-      if (!translated.ok) {
-        return resultMessage(message, translated.error.code, translated.error.retryable);
-      }
-      await cacheTranslations(
-        options.cache,
-        request,
-        translated.value.translations,
-        model,
-        controller.signal,
-        isCurrent,
-      );
-      if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
-      return successMessage(message, {
-        translations: orderTranslations(
-          request,
-          [...cached.translations, ...translated.value.translations],
-        ),
-        retryCueIds: translated.value.retryCueIds,
-      });
       }
 
-      const cached = await readCachedCues(options.cache, request);
-      if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
-      if (cached.missing.length === 0) {
-        return successMessage(message, { translations: cached.translations, retryCueIds: [] });
+      const controller = new AbortController();
+      session.active.add(controller);
+      try {
+        if (settings.provider === 'deepseek') {
+          if (!settings.deepseekApiKey?.trim()) {
+            return resultMessage(message, 'invalid_configuration', false);
+          }
+          const model = settings.deepseekModel ?? 'deepseek-v4-flash';
+          if (model !== 'deepseek-v4-flash' && model !== 'deepseek-v4-pro') {
+            return resultMessage(message, 'invalid_configuration', false);
+          }
+          const cached = await readCachedCues(options.cache, request, model);
+          if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
+          cachePriority.markUrgentWinner(
+            cached.translations.map(({ cueId }) => cueId),
+          );
+          if (cached.missing.length === 0) {
+            return successMessage(message, {
+              translations: cached.translations,
+              retryCueIds: [],
+            });
+          }
+          const deepseek = new PersonalDeepSeekProvider({
+            fetch: options.fetch,
+            apiKey: settings.deepseekApiKey,
+            model,
+          });
+          const translated = await new TranslationProviderRouter([deepseek]).translate(
+            { ...request, cues: cached.missing },
+            controller.signal,
+          );
+          if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
+          if (!translated.ok) {
+            return resultMessage(message, translated.error.code, translated.error.retryable);
+          }
+          await cacheTranslations(
+            options.cache,
+            request,
+            translated.value.translations,
+            model,
+            controller.signal,
+            isCurrent,
+            cachePriority,
+          );
+          if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
+          cachePriority.markUrgentWinner(
+            translated.value.translations.map(({ cueId }) => cueId),
+          );
+          return successMessage(message, {
+            translations: orderTranslations(
+              request,
+              [...cached.translations, ...translated.value.translations],
+            ),
+            retryCueIds: translated.value.retryCueIds,
+          });
+        }
+
+        const cached = await readCachedCues(options.cache, request);
+        if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
+        cachePriority.markUrgentWinner(
+          cached.translations.map(({ cueId }) => cueId),
+        );
+        if (cached.missing.length === 0) {
+          return successMessage(message, {
+            translations: cached.translations,
+            retryCueIds: [],
+          });
+        }
+        const translated = await new TranslationProviderRouter([google]).translate(
+          { ...request, cues: cached.missing },
+          controller.signal,
+        );
+        if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
+        if (!translated.ok) {
+          return resultMessage(message, translated.error.code, translated.error.retryable);
+        }
+        await cacheTranslations(
+          options.cache,
+          request,
+          translated.value.translations,
+          undefined,
+          controller.signal,
+          isCurrent,
+          cachePriority,
+        );
+        if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
+        cachePriority.markUrgentWinner(
+          translated.value.translations.map(({ cueId }) => cueId),
+        );
+        return successMessage(message, translated.value);
+      } finally {
+        session.active.delete(controller);
       }
-      const translated = await new TranslationProviderRouter([google]).translate(
-        { ...request, cues: cached.missing },
-        controller.signal,
-      );
-      if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
-      if (!translated.ok) {
-        return resultMessage(message, translated.error.code, translated.error.retryable);
-      }
-      await cacheTranslations(
-        options.cache,
-        request,
-        translated.value.translations,
-        undefined,
-        controller.signal,
-        isCurrent,
-      );
-      if (!isCurrent()) return resultMessage(message, 'stale_generation', false);
-      return successMessage(message, translated.value);
     } finally {
-      session.active.delete(controller);
+      cachePriority.release();
     }
   };
+}
+
+function scopedSessionKey(tabId: number, sessionId: string): string {
+  return `${tabId}\u001f${sessionId}`;
 }
 
 function abortSession(session: ActiveTranslationSession): void {
@@ -224,11 +291,11 @@ function abortSession(session: ActiveTranslationSession): void {
 
 function pruneInactiveSessions(
   sessions: Map<string, ActiveTranslationSession>,
-  currentSessionId: string,
+  currentSessionKey: string,
 ): void {
   if (sessions.size <= MAX_TRACKED_SESSIONS) return;
   for (const [sessionId, session] of sessions) {
-    if (sessionId === currentSessionId || session.active.size > 0) continue;
+    if (sessionId === currentSessionKey || session.active.size > 0) continue;
     sessions.delete(sessionId);
     if (sessions.size <= MAX_TRACKED_SESSIONS) return;
   }
@@ -268,18 +335,147 @@ async function cacheTranslations(
   model: string | undefined,
   signal: AbortSignal,
   isCurrent: () => boolean,
+  cachePriority: CachePriorityLease,
 ): Promise<void> {
   if (!cache || request.provider === 'unset') return;
   const sourceById = new Map(request.cues.map((cue) => [cue.id, cue.text]));
   await Promise.all(translations.map(async (translation) => {
     const source = sourceById.get(translation.cueId);
     if (!source) return;
+    if (!await cachePriority.waitForCommitCue(
+      translation.cueId,
+      source,
+      signal,
+    )) return;
+    const canCommit = () =>
+      isCurrent() && cachePriority.canCommitCue(translation.cueId, source);
+    if (!canCommit()) return;
     await cache.set(
       cacheKeyParts(request, translation.cueId, source, model),
       translation,
-      { signal, isCurrent },
+      { signal, isCurrent: canCommit },
     );
   }));
+}
+
+function acquireCachePriority(
+  ownerships: Map<string, CacheCueOwnership>,
+  request: TranslationRequest,
+  priority: 'bulk' | 'urgent',
+  leaseToken: number,
+): CachePriorityLease {
+  const sourceById = new Map(request.cues.map((cue) => [cue.id, cue.text]));
+  const keys = new Set(request.cues.map((cue) =>
+    cacheOwnershipIdentity(request, cue.id, cue.text)));
+  for (const key of keys) {
+    const ownership = ownerships.get(key) ?? {
+      activeBulkLeases: 0,
+      decisionWaiters: new Set<() => void>(),
+      urgentLeaseTokens: new Set<number>(),
+      urgentWinner: false,
+    };
+    if (priority === 'urgent') ownership.urgentLeaseTokens.add(leaseToken);
+    else ownership.activeBulkLeases += 1;
+    ownerships.set(key, ownership);
+  }
+
+  let released = false;
+  return {
+    canCommitCue(cueId, source) {
+      if (released) return false;
+      const ownership = ownerships.get(
+        cacheOwnershipIdentity(request, cueId, source),
+      );
+      if (ownership === undefined) return false;
+      return priority === 'urgent'
+        ? ownership.urgentLeaseTokens.has(leaseToken)
+        : ownership.urgentLeaseTokens.size === 0 && !ownership.urgentWinner;
+    },
+    waitForCommitCue(cueId, source, signal) {
+      const key = cacheOwnershipIdentity(request, cueId, source);
+      const decision = (): boolean | undefined => {
+        if (released || signal.aborted) return false;
+        const ownership = ownerships.get(key);
+        if (ownership === undefined) return false;
+        if (priority === 'urgent') {
+          return ownership.urgentLeaseTokens.has(leaseToken);
+        }
+        if (ownership.urgentWinner) return false;
+        return ownership.urgentLeaseTokens.size === 0 ? true : undefined;
+      };
+      const immediate = decision();
+      if (immediate !== undefined) return Promise.resolve(immediate);
+      const ownership = ownerships.get(key);
+      if (ownership === undefined) return Promise.resolve(false);
+      return new Promise<boolean>((resolve) => {
+        let settled = false;
+        const finish = (allowed: boolean): void => {
+          if (settled) return;
+          settled = true;
+          ownership.decisionWaiters.delete(check);
+          signal.removeEventListener('abort', abort);
+          resolve(allowed);
+        };
+        const check = (): void => {
+          const current = decision();
+          if (current !== undefined) finish(current);
+        };
+        const abort = (): void => finish(false);
+        ownership.decisionWaiters.add(check);
+        signal.addEventListener('abort', abort, { once: true });
+        check();
+      });
+    },
+    markUrgentWinner(cueIds) {
+      if (released || priority !== 'urgent') return;
+      for (const cueId of cueIds) {
+        const source = sourceById.get(cueId);
+        if (source === undefined) continue;
+        const ownership = ownerships.get(
+          cacheOwnershipIdentity(request, cueId, source),
+        );
+        if (ownership?.urgentLeaseTokens.has(leaseToken) === true) {
+          ownership.urgentWinner = true;
+          notifyCacheDecisionWaiters(ownership);
+        }
+      }
+    },
+    release() {
+      if (released) return;
+      released = true;
+      for (const key of keys) {
+        const ownership = ownerships.get(key);
+        if (ownership === undefined) continue;
+        if (priority === 'urgent') ownership.urgentLeaseTokens.delete(leaseToken);
+        else ownership.activeBulkLeases = Math.max(0, ownership.activeBulkLeases - 1);
+        notifyCacheDecisionWaiters(ownership);
+        if (
+          ownership.activeBulkLeases === 0 &&
+          ownership.urgentLeaseTokens.size === 0
+        ) ownerships.delete(key);
+      }
+    },
+  };
+}
+
+function notifyCacheDecisionWaiters(ownership: CacheCueOwnership): void {
+  for (const notify of [...ownership.decisionWaiters]) notify();
+}
+
+function cacheOwnershipIdentity(
+  request: TranslationRequest,
+  cueId: string,
+  source: string,
+): string {
+  return [
+    request.provider,
+    request.episodeId,
+    request.trackHash,
+    cueId,
+    request.sourceLanguage,
+    hashTranslationSource(source),
+    request.targetLanguage,
+  ].join('\u001f');
 }
 
 function cacheKeyParts(

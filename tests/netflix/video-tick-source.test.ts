@@ -214,7 +214,51 @@ describe('createVideoTickSource', () => {
     expect(ticks).toEqual([nativeTick]);
     harness.setNow(270);
     harness.runNextFrame();
-    expect(ticks.at(-1)).toEqual({ currentTimeMs: 4_000 });
+    expect(ticks.at(-1)).toEqual({
+      visibleText: 'Hello',
+      currentTimeMs: 4_000,
+    });
+  });
+
+  it('carries the latest native subtitle through fallback ticks until Netflix clears it', () => {
+    const harness = createHarness();
+    const ticks: SubtitleSessionTick[] = [];
+    harness.source.subscribe((tick) => ticks.push(tick));
+    harness.video!.paused = false;
+    harness.video!.currentTime = 7;
+    harness.video!.emit('play');
+    ticks.length = 0;
+
+    harness.setNow(100);
+    harness.source.emitNative({
+      sessionId: 'session-a',
+      generation: 3,
+      sequence: 10,
+      visibleText: 'Keep this line stable',
+      currentTimeMs: 7_020,
+    });
+    harness.setNow(270);
+    harness.runNextFrame();
+
+    expect(ticks.at(-1)).toEqual({
+      visibleText: 'Keep this line stable',
+      currentTimeMs: 7_000,
+    });
+
+    harness.source.emitNative({
+      sessionId: 'session-a',
+      generation: 3,
+      sequence: 11,
+      visibleText: '',
+      currentTimeMs: 7_300,
+    });
+    harness.setNow(440);
+    harness.runNextFrame();
+
+    expect(ticks.at(-1)).toEqual({
+      visibleText: '',
+      currentTimeMs: 7_000,
+    });
   });
 
   it('rebinds a replaced video exactly once without retaining old listeners', () => {

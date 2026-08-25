@@ -30,46 +30,78 @@
     )
     max(4vw, env(safe-area-inset-left, 0px));
   font-family:
-    Bahnschrift, "Avenir Next", "Microsoft YaHei", sans-serif;
+    "Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif;
   text-align: center;
   text-rendering: geometricPrecision;
 }
 
 .subtwin-overlay__cue {
+  position: relative;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
   gap: var(--subtwin-line-spacing);
-  max-width: min(92vw, 72rem);
-  padding: 0.18em 0.48em 0.24em;
-  border-radius: 0.16em;
+  width: max-content;
+  max-width: min(var(--subtwin-max-line-width), calc(100vw - 32px));
+  padding: 0.14em 0.4em 0.19em;
+  border-radius: 0.38em;
   background: rgb(0 0 0 / var(--subtwin-background-opacity));
+}
+
+.subtwin-overlay[data-drag-enabled="true"] .subtwin-overlay__cue {
+  pointer-events: auto;
+  cursor: grab;
+  touch-action: none;
+  outline: 1px dashed rgb(255 255 255 / 0.46);
+  outline-offset: 7px;
+}
+
+.subtwin-overlay[data-drag-enabled="true"] .subtwin-overlay__cue:active {
+  cursor: grabbing;
+}
+
+.subtwin-overlay[data-drag-enabled="true"] .subtwin-overlay__cue::before {
+  position: absolute;
+  bottom: calc(100% + 13px);
+  left: 50%;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: rgb(16 17 20 / 0.92);
+  color: rgb(255 255 255 / 0.82);
+  content: "拖动字幕";
+  font: 600 11px/1.2 system-ui, sans-serif;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  transform: translateX(-50%);
+  white-space: nowrap;
 }
 
 .subtwin-overlay__line {
   margin: 0;
   padding: 0;
   overflow-wrap: anywhere;
-  line-height: 1.26;
+  line-height: 1.2;
   white-space: pre-wrap;
   text-shadow: var(--subtwin-text-shadow);
 }
 
 .subtwin-overlay__line--english {
   color: var(--subtwin-en-color);
+  font-family: var(--subtwin-en-font);
   font-size: var(--subtwin-en-size);
   font-weight: var(--subtwin-en-weight);
 }
 
 .subtwin-overlay__line--chinese {
   color: var(--subtwin-zh-color);
+  font-family: var(--subtwin-zh-font);
   font-size: var(--subtwin-zh-size);
   font-weight: var(--subtwin-zh-weight);
 }
 
 @media (max-width: 700px), (max-height: 520px) {
   .subtwin-overlay__cue {
-    max-width: 96vw;
+    max-width: min(var(--subtwin-max-line-width), calc(100vw - 16px));
   }
 
   .subtwin-overlay__line--english {

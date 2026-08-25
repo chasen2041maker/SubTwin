@@ -17,7 +17,7 @@
 ## 1. 前置条件
 
 - Node.js 22.12+、pnpm 10+。
-- Chrome/Chromium，并能加载 Manifest V3 未打包扩展。
+- Chrome 111+ 或兼容的 Chromium，并能加载 Manifest V3 未打包扩展。
 - 已登录的 Netflix 账号。
 - 当前地区至少准备两部测试内容：
   - A：字幕目录同时含英文和简体中文；
@@ -67,7 +67,7 @@ $manifest.content_scripts
 1. 打开 `chrome://extensions`，启用“开发者模式”。
 2. 点击“加载已解压的扩展程序”，选择 `.output/chrome-mv3`。
 3. 确认扩展名称为 SubTwin，且没有加载错误。
-4. 打开扩展选项页，确认初始翻译方式为“暂不使用外部翻译”。
+4. 打开扩展选项页，确认初始字幕来源为“Netflix 原生双语”。
 5. 打开 Netflix 并登录。
 6. 每次重新执行 `pnpm build` 后，在扩展管理页点击“重新加载”，再刷新 Netflix 标签页，避免旧 content script 与新后台混用。
 
@@ -91,19 +91,19 @@ $manifest.content_scripts
 
 | ID | 场景与操作 | 预期网络调用 | 预期字幕/状态 | 结果 |
 | --- | --- | --- | --- | --- |
-| R01 | 影片 A；设置任选 Google 或 DeepSeek；从刷新页面开始播放 | Google 0，DeepSeek 0 | 显示官方英文+简中；状态为官方双语 | NOT RUN |
+| R01 | 影片 A；选择 Netflix 原生双语；从刷新页面开始播放 | Google 0，DeepSeek 0 | 显示官方英文+简中；状态为官方双语 | NOT RUN |
 | R02 | 刷新影片页面，观察目录尚未权威确认的发现阶段 | Google 0，DeepSeek 0 | 保留 Netflix 原生字幕，不提前翻译 | NOT RUN |
-| R03 | 影片 B；翻译方式保持“未选择” | Google 0，DeepSeek 0 | 英文/原生字幕可用；提示选择翻译方式 | NOT RUN |
-| R04 | 影片 B；显式选择 Google 免费翻译 | 只允许 Google；DeepSeek 0 | 英文先可用，中文逐条出现；状态显示 Google 实验模式 | NOT RUN |
+| R03 | 影片 B；选择 Netflix 原生双语 | Google 0，DeepSeek 0 | 缺少官方中文时保留英文/原生字幕，不调用外部服务 | NOT RUN |
+| R04 | 影片 B；显式选择 Google 翻译 | 只允许 Google；DeepSeek 0 | 英文先可用，中文逐条出现；状态显示 Google 翻译 | NOT RUN |
 | R05 | 影片 B；Google 模式下阻断 Google 域名或复现 403/429 | DeepSeek 0 | 显示 Google 不可用/限流状态；不跨服务降级；英文仍可用 | NOT RUN |
 | R06 | 影片 B；选择 DeepSeek，但 Key 为空 | Google 0，DeepSeek 0 | 提示配置错误；英文/原生字幕仍可用 | NOT RUN |
 | R07 | 影片 B；保存有效 DeepSeek Key，先在选项页测试，再播放 | 只允许 DeepSeek；Google 0 | 上下文中文逐步出现；状态显示 DeepSeek | BLOCKED（需要用户 Key） |
 | R08 | 影片 B；保存无效 DeepSeek Key 并播放 | Google 0；DeepSeek 可出现认证失败请求 | 显示认证错误；不改用 Google；英文仍可用 | NOT RUN |
 | R09 | 影片 B；外部请求在途时从 Google 切到 DeepSeek，随后反向切换 | 切换后只允许新选择服务发起新任务 | 旧代结果不再渲染或写缓存；无跨服务自动降级 | BLOCKED（DeepSeek 路径需要用户 Key） |
-| R10 | 播放过程中若能复现“稍后发现官方简中” | 发现后不再发起新的外部请求 | 取消旧代任务并切到官方双语；迟到译文不覆盖官方字幕 | BLOCKED（需可复现场景） |
+| R10 | 影片 A；分别显式选择 Google 与 DeepSeek | 每次只允许当前所选服务 | 即使有官方中文也按显式来源翻译；不会悄悄切回官方中文 | BLOCKED（DeepSeek 路径需要用户 Key） |
 | R11 | 完成一次影片 B 翻译，刷新/重开同一剧集并重播相同片段 | 已缓存 cue 不产生重复服务请求 | 命中同一服务缓存；另一服务的缓存不可串用 | NOT RUN |
 
-R01 必须分别在“设置选中 Google”和“设置选中 DeepSeek”的情况下验证一次；即使 DeepSeek 已配置 Key，官方双语也必须保持两个外部域名均为零调用。R02 的核心不是发现阶段持续多久，而是任何非权威目录都不能解锁外部请求。
+R01 用于证明 Netflix 原生双语严格零调用；R10 用于证明 Google/DeepSeek 的显式选择会覆盖官方中文。R02 的核心不是发现阶段持续多久，而是任何非权威目录都不能解锁外部请求。
 
 ## 6. 播放器生命周期与可用性矩阵
 
@@ -118,6 +118,9 @@ R01 必须分别在“设置选中 Google”和“设置选中 DeepSeek”的情
 | L07 | 断网、后台 service worker 重启或扩展重载 | Netflix 播放不被打断；自定义层失败时原生/英文字幕仍可用 | NOT RUN |
 | L08 | 当前 cue 无官方中文对齐结果 | 不调用外部翻译补洞；不显示错误对应的中文 | NOT RUN |
 | L09 | 反复切换 Netflix 原生字幕开关/轨道 | SubTwin 不永久隐藏原生字幕；失败/退出时恢复原内联可见性 | NOT RUN |
+| L10 | 拖动红色“双”悬浮按钮后刷新、换集、进入/退出全屏 | 入口保持在可视区域；当前标签页内保留位置；全屏内仍可打开 | NOT RUN |
+| L11 | 展开控制台并点击“暂停当前页”，再点击继续 | 暂停只影响当前标签页并立即恢复原生字幕；其他 Netflix 标签页和全局 enabled 不改变 | NOT RUN |
+| L12 | 在页内控制台关闭“开启双语字幕”，再重新启用 | 关闭后清空自定义字幕并恢复原生字幕；悬浮入口保留，可原地重新启用 | NOT RUN |
 
 ## 7. 设置、样式与缓存矩阵
 
@@ -129,6 +132,8 @@ R01 必须分别在“设置选中 Google”和“设置选中 DeepSeek”的情
 | S04 | 清理当前剧集缓存 | 只删除当前剧集翻译；重播时会重新请求所选服务 | NOT RUN |
 | S05 | 清理全部缓存 | 所有本地翻译删除；设置和 DeepSeek Key 不应随缓存一起删除 | NOT RUN |
 | S06 | 使用全新 Chrome 配置安装 | 默认 provider 为 `unset`，没有外部请求 | NOT RUN |
+| S07 | 在页内控制台调整两种语言字体并刷新 Netflix | 当前字幕即时改变；刷新后字体设置仍保留 | NOT RUN |
+| S08 | 快速连续拖动字号、行距、位置和透明度滑块 | 字幕实时响应；最终值自动保存；控制台不阻塞播放器快捷键或鼠标操作 | NOT RUN |
 
 ## 8. 密钥、消息与本地数据检查
 

@@ -1,8 +1,12 @@
 import {
   Component,
+  useEffect,
   useLayoutEffect,
+  useRef,
+  useState,
   type CSSProperties,
   type ErrorInfo,
+  type PointerEvent,
   type ReactNode,
 } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -26,6 +30,8 @@ export type { SubtitleLanguageAppearance };
 export interface SubtitleOverlayProps {
   readonly state: NormalizedActiveCueState;
   readonly appearance: SubtitleOverlayAppearance;
+  readonly dragEnabled?: boolean;
+  readonly onVerticalOffsetChange?: (verticalOffsetPercent: number) => void;
 }
 
 interface VisibleLine {
@@ -39,22 +45,76 @@ type OverlayCssProperties = CSSProperties &
 export function SubtitleOverlay({
   state,
   appearance,
+  dragEnabled = false,
+  onVerticalOffsetChange,
 }: SubtitleOverlayProps): ReactNode {
+  const drag = useRef<{ readonly startOffset: number; readonly startY: number } | null>(null);
+  const [previewOffset, setPreviewOffset] = useState(() =>
+    clamp(appearance.verticalOffsetPercent, 0, 80));
+  useEffect(() => {
+    if (drag.current === null) {
+      setPreviewOffset(clamp(appearance.verticalOffsetPercent, 0, 80));
+    }
+  }, [appearance.verticalOffsetPercent]);
+
   const lines = selectVisibleLines(state, appearance);
   if (lines.length === 0) return null;
 
+  const offsetAt = (clientY: number): number => verticalOffsetFromDrag(
+    drag.current?.startOffset ?? previewOffset,
+    drag.current?.startY ?? clientY,
+    clientY,
+    typeof window === 'undefined' ? 0 : window.innerHeight,
+  );
+  const onPointerDown = (event: PointerEvent<HTMLDivElement>): void => {
+    if (!dragEnabled) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    drag.current = { startOffset: previewOffset, startY: event.clientY };
+  };
+  const onPointerMove = (event: PointerEvent<HTMLDivElement>): void => {
+    if (drag.current === null) return;
+    event.preventDefault();
+    setPreviewOffset(offsetAt(event.clientY));
+  };
+  const finishDrag = (event: PointerEvent<HTMLDivElement>): void => {
+    if (drag.current === null) return;
+    event.preventDefault();
+    const next = Math.round(offsetAt(event.clientY) * 2) / 2;
+    drag.current = null;
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      // Capture can already be released when Netflix changes fullscreen roots.
+    }
+    setPreviewOffset(next);
+    onVerticalOffsetChange?.(next);
+  };
+  const cancelDrag = (): void => {
+    if (drag.current === null) return;
+    drag.current = null;
+    setPreviewOffset(clamp(appearance.verticalOffsetPercent, 0, 80));
+  };
+
   const style: OverlayCssProperties = {
     '--subtwin-en-color': safeColor(appearance.english.color, '#FFFFFF'),
+    '--subtwin-en-font': fontFamilyValue(appearance.english.fontFamily),
     '--subtwin-en-size': `${clamp(appearance.english.fontSizePx, 12, 72)}px`,
     '--subtwin-en-weight': clamp(appearance.english.fontWeight, 100, 900),
     '--subtwin-zh-color': safeColor(appearance.chinese.color, '#FFFFFF'),
+    '--subtwin-zh-font': fontFamilyValue(appearance.chinese.fontFamily),
     '--subtwin-zh-size': `${clamp(appearance.chinese.fontSizePx, 12, 72)}px`,
     '--subtwin-zh-weight': clamp(appearance.chinese.fontWeight, 100, 900),
     '--subtwin-line-spacing': `${clamp(appearance.lineSpacingPx, 0, 48)}px`,
+    '--subtwin-max-line-width': `${clamp(
+      appearance.maxLineWidthPercent,
+      50,
+      100,
+    )}vw`,
     '--subtwin-vertical-offset': clamp(
-      appearance.verticalOffsetPercent,
+      previewOffset,
       0,
-      40,
+      80,
     ),
     '--subtwin-background-opacity': clamp(
       appearance.backgroundOpacity,
@@ -68,10 +128,17 @@ export function SubtitleOverlay({
     <section
       aria-hidden="true"
       className="subtwin-overlay"
+      data-drag-enabled={dragEnabled}
       data-order={appearance.order}
       style={style}
     >
-      <div className="subtwin-overlay__cue">
+      <div
+        className="subtwin-overlay__cue"
+        onPointerCancel={cancelDrag}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={finishDrag}
+      >
         {lines.map((line) => (
           <div
             className={`subtwin-overlay__line subtwin-overlay__line--${line.language}`}
@@ -105,6 +172,14 @@ export interface SubtitleOverlayDocument {
   removeEventListener(type: 'fullscreenchange', listener: () => void): void;
 }
 
+export interface SubtitleOverlayHostObserver {
+  observe(
+    target: SubtitleOverlayNode,
+    options: { readonly childList: true; readonly subtree: true },
+  ): void;
+  disconnect(): void;
+}
+
 export interface SubtitleOverlayRenderLifecycle {
   readonly onCommit: () => void;
   readonly onError: () => void;
@@ -126,6 +201,8 @@ export interface SubtitleOverlayMount {
     state: NormalizedActiveCueState,
     appearance: SubtitleOverlayAppearance,
   ): boolean;
+  setNativeSubtitlesHidden(hidden: boolean): void;
+  setDragMode(enabled: boolean): void;
   clear(): void;
   dispose(): void;
 }
@@ -133,6 +210,10 @@ export interface SubtitleOverlayMount {
 export interface MountSubtitleOverlayOptions {
   readonly document?: SubtitleOverlayDocument;
   readonly nativeVisibility: NativeSubtitleVisibility;
+  readonly onVerticalOffsetChange?: (verticalOffsetPercent: number) => void;
+  readonly createHostObserver?: (
+    callback: () => void,
+  ) => SubtitleOverlayHostObserver;
   readonly createRenderRoot?: (
     container: SubtitleOverlayNode,
   ) => SubtitleOverlayRenderRoot;
@@ -149,12 +230,19 @@ export function mountSubtitleOverlay(
 
   let host: SubtitleOverlayNode | undefined;
   let root: SubtitleOverlayRenderRoot | undefined;
+  let hostObserver: SubtitleOverlayHostObserver | undefined;
   let listenerAttached = false;
   let disposed = false;
   let nativeHidden = false;
+  let nativeSuppressed = false;
+  let renderedBilingual = false;
   let renderGeneration = 0;
+  let dragEnabled = false;
+  let lastAppearance: SubtitleOverlayAppearance | undefined;
+  let lastState: NormalizedActiveCueState | undefined;
 
   const restoreNative = (force = false): void => {
+    if (!force && (nativeSuppressed || renderedBilingual)) return;
     if (!nativeHidden && !force) return;
     nativeHidden = false;
     try {
@@ -174,6 +262,11 @@ export function mountSubtitleOverlay(
     }
   };
 
+  const syncNativeVisibility = (): void => {
+    if (nativeSuppressed || renderedBilingual) hideNative();
+    else restoreNative();
+  };
+
   const moveHostToFullscreenRoot = (): boolean => {
     if (disposed || host === undefined) return false;
     const target = overlayDocument.fullscreenElement ?? overlayDocument.documentElement;
@@ -188,6 +281,20 @@ export function mountSubtitleOverlay(
       return false;
     }
     return true;
+  };
+
+  const recoverDetachedHost = (): void => {
+    if (disposed || host === undefined || host.isConnected) return;
+    renderedBilingual = false;
+    syncNativeVisibility();
+    renderGeneration += 1;
+    try {
+      root?.clear();
+    } catch {
+      // Never reattach an overlay whose last committed content cannot be cleared.
+      return;
+    }
+    moveHostToFullscreenRoot();
   };
 
   try {
@@ -210,12 +317,31 @@ export function mountSubtitleOverlay(
     if (!moveHostToFullscreenRoot()) {
       throw new Error('Unable to attach subtitle overlay host.');
     }
+    hostObserver = options.createHostObserver?.(recoverDetachedHost) ??
+      createBrowserHostObserver(recoverDetachedHost);
+    hostObserver?.observe(overlayDocument.documentElement, {
+      childList: true,
+      subtree: true,
+    });
     overlayDocument.addEventListener(
       'fullscreenchange',
       moveHostToFullscreenRoot,
     );
     listenerAttached = true;
   } catch (error) {
+    try {
+      hostObserver?.disconnect();
+    } catch {
+      // Continue the fail-safe mount cleanup.
+    }
+    hostObserver = undefined;
+    if (listenerAttached) {
+      overlayDocument.removeEventListener(
+        'fullscreenchange',
+        moveHostToFullscreenRoot,
+      );
+      listenerAttached = false;
+    }
     try {
       root?.unmount();
     } catch {
@@ -234,13 +360,18 @@ export function mountSubtitleOverlay(
 
   const mount: SubtitleOverlayMount = {
     render(state, appearance) {
-      if (disposed || selectVisibleLines(state, appearance).length === 0) {
+      const visibleLines = selectVisibleLines(state, appearance);
+      if (disposed || visibleLines.length === 0) {
         if (!disposed) mount.clear();
         return false;
       }
+      const shouldHideNative = visibleLines.length >= 2;
+      lastState = state;
+      lastAppearance = appearance;
 
       if (!mountedHost.isConnected) {
-        restoreNative();
+        renderedBilingual = false;
+        syncNativeVisibility();
         if (!moveHostToFullscreenRoot()) {
           try {
             mountedRoot.clear();
@@ -254,19 +385,29 @@ export function mountSubtitleOverlay(
       const generation = ++renderGeneration;
       try {
         mountedRoot.render(
-          <SubtitleOverlay state={state} appearance={appearance} />,
+          <SubtitleOverlay
+            appearance={appearance}
+            dragEnabled={dragEnabled}
+            {...(options.onVerticalOffsetChange === undefined ? {} : {
+              onVerticalOffsetChange: options.onVerticalOffsetChange,
+            })}
+            state={state}
+          />,
           {
             onCommit: () => {
               if (disposed || generation !== renderGeneration) return;
               if (!mountedHost.isConnected) {
-                restoreNative();
+                renderedBilingual = false;
+                syncNativeVisibility();
                 return;
               }
-              hideNative();
+              renderedBilingual = shouldHideNative;
+              syncNativeVisibility();
             },
             onError: () => {
               if (!disposed && generation === renderGeneration) {
-                restoreNative();
+                renderedBilingual = false;
+                syncNativeVisibility();
               }
             },
           },
@@ -278,8 +419,23 @@ export function mountSubtitleOverlay(
         } catch {
           // A failed render is already being downgraded to native subtitles.
         }
-        restoreNative();
+        renderedBilingual = false;
+        syncNativeVisibility();
         return false;
+      }
+    },
+
+    setNativeSubtitlesHidden(hidden) {
+      if (disposed || nativeSuppressed === hidden) return;
+      nativeSuppressed = hidden;
+      syncNativeVisibility();
+    },
+
+    setDragMode(enabled) {
+      if (disposed || dragEnabled === enabled) return;
+      dragEnabled = enabled;
+      if (lastState !== undefined && lastAppearance !== undefined) {
+        mount.render(lastState, lastAppearance);
       }
     },
 
@@ -291,14 +447,25 @@ export function mountSubtitleOverlay(
       } catch {
         // Native subtitles remain the safe fallback when React cannot clear.
       } finally {
-        restoreNative();
+        renderedBilingual = false;
+        syncNativeVisibility();
+        lastState = undefined;
+        lastAppearance = undefined;
       }
     },
 
     dispose() {
       if (disposed) return;
       disposed = true;
+      nativeSuppressed = false;
+      renderedBilingual = false;
       renderGeneration += 1;
+      try {
+        hostObserver?.disconnect();
+      } catch {
+        // Teardown continues even when an observer implementation fails.
+      }
+      hostObserver = undefined;
       if (listenerAttached) {
         overlayDocument.removeEventListener(
           'fullscreenchange',
@@ -327,6 +494,13 @@ export function mountSubtitleOverlay(
   return mount;
 }
 
+function createBrowserHostObserver(
+  callback: () => void,
+): SubtitleOverlayHostObserver | undefined {
+  if (typeof MutationObserver === 'undefined') return undefined;
+  return new MutationObserver(callback) as unknown as SubtitleOverlayHostObserver;
+}
+
 function selectVisibleLines(
   state: NormalizedActiveCueState,
   appearance: SubtitleOverlayAppearance,
@@ -348,7 +522,7 @@ function selectVisibleLines(
 
 function normalizeLine(text: string | null): string | null {
   if (text === null) return null;
-  const trimmed = text.trim();
+  const trimmed = text.replace(/\s+/gu, ' ').trim();
   return trimmed.length === 0 ? null : trimmed;
 }
 
@@ -361,12 +535,47 @@ function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+export function verticalOffsetFromDrag(
+  startOffset: number,
+  startY: number,
+  currentY: number,
+  viewportHeight: number,
+): number {
+  const safeStart = clamp(startOffset, 0, 80);
+  if (!Number.isFinite(startY) || !Number.isFinite(currentY) ||
+      !Number.isFinite(viewportHeight) || viewportHeight <= 0) {
+    return safeStart;
+  }
+  return clamp(
+    safeStart - ((currentY - startY) / viewportHeight) * 100,
+    0,
+    80,
+  );
+}
+
 function shadowValue(value: SubtitleOverlayAppearance['shadow']): string {
   if (value === 'none') return 'none';
   if (value === 'strong') {
     return '0 2px 5px rgb(0 0 0 / 1), 0 0 2px rgb(0 0 0 / 1)';
   }
   return '0 1px 2px rgb(0 0 0 / 0.9)';
+}
+
+function fontFamilyValue(
+  value: SubtitleLanguageAppearance['fontFamily'],
+): string {
+  switch (value) {
+    case 'mono':
+      return 'ui-monospace, "Cascadia Mono", monospace';
+    case 'rounded':
+      return 'ui-rounded, "Arial Rounded MT Bold", "Microsoft YaHei", sans-serif';
+    case 'serif':
+      return 'Georgia, "Noto Serif CJK SC", "Songti SC", serif';
+    case 'system':
+      return 'system-ui, -apple-system, "Segoe UI", sans-serif';
+    case 'sans':
+      return '"Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif';
+  }
 }
 
 function resolveDocument(
@@ -384,13 +593,20 @@ function createBrowserRenderRoot(
 ): SubtitleOverlayRenderRoot {
   const reactRoot = createRoot(container as unknown as Element);
   let revision = 0;
+  let failed = false;
   return {
     render(node, lifecycle) {
-      revision += 1;
+      if (failed) {
+        revision += 1;
+        failed = false;
+      }
       reactRoot.render(
         <OverlayErrorBoundary
           key={revision}
-          onError={lifecycle.onError}
+          onError={() => {
+            failed = true;
+            lifecycle.onError();
+          }}
         >
           <OverlayCommitSignal onCommit={lifecycle.onCommit}>
             {node}

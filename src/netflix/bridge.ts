@@ -34,7 +34,24 @@ export interface NetflixTimedTextPayload {
 
 export type NetflixDiagnosticCode =
   | 'candidate_rejected'
+  | 'download_candidate_approved'
+  | 'download_candidate_unmatched'
+  | 'download_started'
+  | 'download_succeeded'
   | 'display_unavailable'
+  | 'metadata_candidate_observed'
+  | 'metadata_body_read_failed'
+  | 'metadata_body_timeout'
+  | 'metadata_body_too_large'
+  | 'metadata_body_unsupported'
+  | 'metadata_catalog_recognized'
+  | 'metadata_catalog_unrecognized'
+  | 'metadata_json_parsed'
+  | 'metadata_json_invalid'
+  | 'metadata_resource_extract_failed'
+  | 'metadata_resources_extracted'
+  | 'metadata_response_accepted'
+  | 'metadata_xhr_json_unsupported'
   | 'probe_disposed'
   | 'unsupported_payload';
 
@@ -211,7 +228,16 @@ export function createEarlyBridgeQueue(options: {
       if (listener !== undefined) {
         listener(message.value);
       } else {
-        if (pending.length === capacity) pending.shift();
+        if (pending.length === capacity) {
+          const diagnosticIndex = pending.findIndex(
+            ({ payload: candidate }) => candidate.type === 'diagnostic',
+          );
+          if (message.value.payload.type === 'diagnostic' && diagnosticIndex < 0) {
+            return false;
+          }
+          if (diagnosticIndex >= 0) pending.splice(diagnosticIndex, 1);
+          else pending.shift();
+        }
         pending.push(message.value);
       }
       return true;
@@ -329,7 +355,24 @@ function isCatalogTrack(value: unknown): value is NetflixCatalogTrackDescriptor 
 function isDiagnosticCode(value: unknown): value is NetflixDiagnosticCode {
   return (
     value === 'candidate_rejected' ||
+    value === 'download_candidate_approved' ||
+    value === 'download_candidate_unmatched' ||
+    value === 'download_started' ||
+    value === 'download_succeeded' ||
     value === 'display_unavailable' ||
+    value === 'metadata_candidate_observed' ||
+    value === 'metadata_body_read_failed' ||
+    value === 'metadata_body_timeout' ||
+    value === 'metadata_body_too_large' ||
+    value === 'metadata_body_unsupported' ||
+    value === 'metadata_catalog_recognized' ||
+    value === 'metadata_catalog_unrecognized' ||
+    value === 'metadata_json_parsed' ||
+    value === 'metadata_json_invalid' ||
+    value === 'metadata_resource_extract_failed' ||
+    value === 'metadata_resources_extracted' ||
+    value === 'metadata_response_accepted' ||
+    value === 'metadata_xhr_json_unsupported' ||
     value === 'probe_disposed' ||
     value === 'unsupported_payload'
   );

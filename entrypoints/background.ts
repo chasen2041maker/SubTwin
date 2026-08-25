@@ -10,6 +10,8 @@ import { createSettingsActionHandler } from '../src/storage/background-actions';
 import { restrictStorageToTrustedContexts } from '../src/storage/access';
 import { SettingsStore } from '../src/storage/settings';
 
+const NETFLIX_SESSION_REGISTRY_STORAGE_KEY = 'netflixSessionRegistryV1';
+
 export default defineBackground({
   type: 'module',
   main() {
@@ -17,9 +19,28 @@ export default defineBackground({
     const settingsStore = new SettingsStore();
     const sessions = createNetflixSessionRegistry();
     let pushSequence = 0;
+    let sessionPersistence = Promise.resolve();
+    const persistSessionRegistry = async (): Promise<void> => {
+      const snapshot = sessions.snapshot();
+      const write = sessionPersistence.then(async () => {
+        await browser.storage.session.set({
+          [NETFLIX_SESSION_REGISTRY_STORAGE_KEY]: snapshot,
+        });
+      });
+      sessionPersistence = write.catch(() => undefined);
+      await write;
+    };
     const ready = (async () => {
       await restrictStorageToTrustedContexts(browser.storage.local);
       await settingsStore.load();
+      try {
+        const stored = await browser.storage.session.get(
+          NETFLIX_SESSION_REGISTRY_STORAGE_KEY,
+        );
+        sessions.restore(stored[NETFLIX_SESSION_REGISTRY_STORAGE_KEY]);
+      } catch {
+        // A fresh registry safely fails closed until content reports its state.
+      }
     })();
     const readSettings = async () => {
       const stored = await settingsStore.load();
@@ -76,11 +97,21 @@ export default defineBackground({
           }
         }));
       },
+      persistSessionRegistry,
     });
     browser.runtime.onMessage.addListener(async (candidate: unknown, sender) => {
       await ready;
       return routeMessage(candidate, sender);
     });
-    browser.tabs.onRemoved.addListener((tabId) => sessions.removeTab(tabId));
+    browser.tabs.onRemoved.addListener((tabId) => {
+      void ready.then(async () => {
+        sessions.removeTab(tabId);
+        try {
+          await persistSessionRegistry();
+        } catch {
+          // The closed tab is already removed from the in-memory policy state.
+        }
+      });
+    });
   },
 });

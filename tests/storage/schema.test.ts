@@ -9,6 +9,29 @@ import {
 } from '../../src/storage/schema';
 
 describe('strict public settings schema', () => {
+  it('ships a restrained bilingual subtitle preset', () => {
+    expect(DEFAULT_SETTINGS.appearance).toMatchObject({
+      order: 'chinese-first',
+      lineSpacingPx: 4,
+      maxLineWidthPercent: 96,
+      verticalOffsetPercent: 7,
+      backgroundOpacity: 0.3,
+      shadow: 'soft',
+      english: {
+        color: '#FFFFFF',
+        fontFamily: 'sans',
+        fontSizePx: 24,
+        fontWeight: 600,
+      },
+      chinese: {
+        color: '#FFFFFF',
+        fontFamily: 'sans',
+        fontSizePx: 26,
+        fontWeight: 600,
+      },
+    });
+  });
+
   it('accepts the canonical public appearance and rejects extra or malformed fields', () => {
     expect(isExactSubtitleAppearanceSettings(DEFAULT_SETTINGS.appearance)).toBe(true);
     expect(isExactSubtitleAppearanceSettings({
@@ -25,6 +48,30 @@ describe('strict public settings schema', () => {
     expect(isExactSubtitleAppearanceSettings({
       ...DEFAULT_SETTINGS.appearance,
       backgroundOpacity: 2,
+    })).toBe(false);
+    expect(isExactSubtitleAppearanceSettings({
+      ...DEFAULT_SETTINGS.appearance,
+      verticalOffsetPercent: 80,
+    })).toBe(true);
+    expect(isExactSubtitleAppearanceSettings({
+      ...DEFAULT_SETTINGS.appearance,
+      verticalOffsetPercent: 81,
+    })).toBe(false);
+    expect(isExactSubtitleAppearanceSettings({
+      ...DEFAULT_SETTINGS.appearance,
+      maxLineWidthPercent: 50,
+    })).toBe(true);
+    expect(isExactSubtitleAppearanceSettings({
+      ...DEFAULT_SETTINGS.appearance,
+      maxLineWidthPercent: 100,
+    })).toBe(true);
+    expect(isExactSubtitleAppearanceSettings({
+      ...DEFAULT_SETTINGS.appearance,
+      maxLineWidthPercent: 49,
+    })).toBe(false);
+    expect(isExactSubtitleAppearanceSettings({
+      ...DEFAULT_SETTINGS.appearance,
+      maxLineWidthPercent: 101,
     })).toBe(false);
   });
 

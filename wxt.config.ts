@@ -7,6 +7,7 @@ export default defineConfig({
     name: 'SubTwin',
     description:
       'Official-first English and Simplified Chinese subtitles for Netflix.',
+    minimum_chrome_version: '111',
     permissions: ['storage'],
     host_permissions: [
       'https://www.netflix.com/*',

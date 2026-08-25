@@ -1,10 +1,23 @@
 import {
   bufferEarlyCatalogPayload,
+  bufferNetflixTimedTextPayload,
   createNetflixContentSession,
   type NetflixContentSession,
 } from '../../src/app/netflix-content-session';
 import { createExtensionTranslationTaskClient } from '../../src/app/extension-task-client';
 import {
+  createPageControlCoordinator,
+  type PageControlCoordinator,
+  type PageControlPersistenceResult,
+  type PageControlSettingsMutation,
+} from '../../src/app/page-control-coordinator';
+import {
+  advancePageSubtitlePipeline,
+  createPageSubtitlePipeline,
+  type PageSubtitlePipelineStage,
+} from '../../src/app/page-subtitle-pipeline';
+import {
+  parsePageSettingsUpdateResponse,
   parseRuntimeSettingsPush,
   parseRuntimeSettingsResponse,
   type RuntimeSettingsPush,
@@ -13,6 +26,10 @@ import type { RuntimeStatus } from '../../src/app/status';
 import type { NetflixBridgePayload } from '../../src/netflix/bridge';
 import { createNativeSubtitleClock } from '../../src/netflix/native-subtitle-clock';
 import { createNativeSubtitleVisibility } from '../../src/netflix/native-subtitle-visibility';
+import {
+  readNetflixPageMetadata,
+  summarizeNetflixCatalog,
+} from '../../src/netflix/page-metadata';
 import {
   createIsolatedNetflixBridge,
   type IsolatedNetflixBridge,
@@ -23,6 +40,11 @@ import {
   mountSubtitleOverlay,
   type SubtitleOverlayMount,
 } from '../../src/renderer/SubtitleOverlay';
+import {
+  mountPageControlSurface,
+  type PageControlSurfaceModel,
+  type PageControlSurfaceMount,
+} from '../../src/renderer/PageControlSurface';
 import { createMessage } from '../../src/shared/messages';
 import {
   DEFAULT_SETTINGS,
@@ -30,7 +52,6 @@ import {
 } from '../../src/storage/schema';
 
 const MAX_EARLY_CATALOGS = 2;
-const MAX_EARLY_TIMED_TEXTS = 2;
 const SETTINGS_TIMEOUT_MS = 4_000;
 
 export default defineContentScript({
@@ -46,8 +67,13 @@ export default defineContentScript({
     let clock: ReturnType<typeof createNativeSubtitleClock> | undefined;
     let contentSession: NetflixContentSession | undefined;
     let overlay: SubtitleOverlayMount | undefined;
+    let pageControlMount: PageControlSurfaceMount | undefined;
+    let pageControlCoordinator: PageControlCoordinator | undefined;
+    let latestPageControlModel: PageControlSurfaceModel | undefined;
+    let metadataTimer: number | undefined;
     let latestSettingsPush: RuntimeSettingsPush | undefined;
     let earlyPayloads: NetflixBridgePayload[] = [];
+    let latestSubtitlePipeline = createPageSubtitlePipeline(bridgeGeneration);
     let disposeRuntimeSettingsListener: (() => void) | undefined;
     let disposeResources: (() => void) | undefined;
     let startNativeClock: () => void = () => undefined;
@@ -64,12 +90,29 @@ export default defineContentScript({
     };
 
     const publishStatus = (status: RuntimeStatus): void => {
+      pageControlCoordinator?.updateStatus(status);
       safeSend(createMessage({
         id: nextMessageId('runtime-status'),
         source: 'content',
         type: 'runtime/status-set',
         payload: status,
       }));
+    };
+
+    const updateSubtitlePipeline = (
+      stage: PageSubtitlePipelineStage,
+      message: string,
+      episodeGeneration = latestSubtitlePipeline.episodeGeneration,
+    ): void => {
+      const next = advancePageSubtitlePipeline(latestSubtitlePipeline, {
+        bridgeGeneration,
+        episodeGeneration,
+        stage,
+        message,
+      });
+      if (next === latestSubtitlePipeline) return;
+      latestSubtitlePipeline = next;
+      pageControlCoordinator?.updatePipeline(next.message);
     };
 
     const publishProbeStatus = (
@@ -89,6 +132,45 @@ export default defineContentScript({
 
     const handleBridgePayload = (payload: NetflixBridgePayload): void => {
       if (invalidated) return;
+      if (payload.type === 'diagnostic') {
+        if (payload.code === 'metadata_candidate_observed') {
+          updateSubtitlePipeline('metadata', '已捕获 Netflix 播放元数据响应');
+        } else if (payload.code === 'metadata_response_accepted') {
+          updateSubtitlePipeline('metadata', '正在读取 Netflix 播放元数据');
+        } else if (payload.code === 'metadata_json_parsed') {
+          updateSubtitlePipeline('metadata', 'Netflix 播放元数据 JSON 已解析');
+        } else if (payload.code === 'metadata_json_invalid') {
+          updateSubtitlePipeline('metadata', 'Netflix 播放元数据不是有效 JSON');
+        } else if (payload.code === 'metadata_body_timeout') {
+          updateSubtitlePipeline('metadata', 'Netflix 播放元数据读取超时');
+        } else if (payload.code === 'metadata_body_too_large') {
+          updateSubtitlePipeline('metadata', 'Netflix 播放元数据超过安全上限');
+        } else if (payload.code === 'metadata_body_read_failed') {
+          updateSubtitlePipeline('metadata', 'Netflix 播放元数据读取失败');
+        } else if (payload.code === 'metadata_body_unsupported') {
+          updateSubtitlePipeline('metadata', 'Netflix 播放元数据响应不可读');
+        } else if (payload.code === 'metadata_catalog_recognized') {
+          updateSubtitlePipeline('metadata', 'Netflix 字幕元数据已识别');
+        } else if (payload.code === 'metadata_catalog_unrecognized') {
+          updateSubtitlePipeline('metadata', 'Netflix 元数据中未识别字幕目录');
+        } else if (payload.code === 'metadata_xhr_json_unsupported') {
+          updateSubtitlePipeline('metadata', 'Netflix 元数据使用 JSON XHR');
+        } else if (payload.code === 'metadata_resources_extracted') {
+          updateSubtitlePipeline('resources', '已提取 Netflix 字幕下载资源');
+        } else if (payload.code === 'metadata_resource_extract_failed') {
+          updateSubtitlePipeline('metadata', 'Netflix 字幕下载资源提取失败');
+        } else if (payload.code === 'download_candidate_approved') {
+          updateSubtitlePipeline('approved', 'Netflix 字幕下载资源已匹配');
+        } else if (payload.code === 'download_candidate_unmatched') {
+          updateSubtitlePipeline('resources', 'Netflix 字幕资源与当前目录不匹配');
+        } else if (payload.code === 'download_started') {
+          updateSubtitlePipeline('downloading', '正在下载 Netflix 字幕');
+        } else if (payload.code === 'download_succeeded') {
+          updateSubtitlePipeline('downloaded', '字幕已下载，等待解析');
+        } else if (payload.code === 'display_unavailable') {
+          updateSubtitlePipeline('failed', 'Netflix 字幕下载失败');
+        }
+      }
       if (contentSession !== undefined) {
         contentSession.handlePayload(payload);
         return;
@@ -104,12 +186,12 @@ export default defineContentScript({
       if (payload.type === 'timed-text') {
         const catalogs = earlyPayloads.filter(({ type }) => type === 'catalog');
         const timedText = earlyPayloads
-          .filter(({ type }) => type === 'timed-text')
-          .filter((candidate) =>
-            candidate.type === 'timed-text' &&
-            candidate.resourceId !== payload.resourceId);
+          .filter((candidate): candidate is Extract<
+            NetflixBridgePayload,
+            { type: 'timed-text' }
+          > => candidate.type === 'timed-text');
         earlyPayloads = catalogs.concat(
-          [...timedText, payload].slice(-MAX_EARLY_TIMED_TEXTS),
+          bufferNetflixTimedTextPayload(timedText, payload),
         );
       }
     };
@@ -133,6 +215,7 @@ export default defineContentScript({
       bridge?.dispose();
       bridgeGeneration += 1;
       bridgeNonce = createSessionNonce();
+      updateSubtitlePipeline('waiting', '等待字幕数据');
       startBridge();
       startNativeClock();
     };
@@ -142,10 +225,17 @@ export default defineContentScript({
       const push = parseRuntimeSettingsPush(candidate);
       if (push === null) return;
       latestSettingsPush = push;
-      contentSession?.updateSettings(push.settings, {
-        translationConfigurationChanged:
-          push.translationConfigurationChanged,
-      });
+      if (pageControlCoordinator !== undefined) {
+        pageControlCoordinator.updateSettings(push.settings, {
+          translationConfigurationChanged:
+            push.translationConfigurationChanged,
+        });
+      } else {
+        contentSession?.updateSettings(push.settings, {
+          translationConfigurationChanged:
+            push.translationConfigurationChanged,
+        });
+      }
     };
 
     try {
@@ -206,6 +296,14 @@ export default defineContentScript({
       overlay = mountSubtitleOverlay({
         document: document as never,
         nativeVisibility,
+        onVerticalOffsetChange: (verticalOffsetPercent) => {
+          const appearance = latestPageControlModel?.settings.appearance;
+          if (appearance === undefined) return;
+          pageControlCoordinator?.setAppearance({
+            ...appearance,
+            verticalOffsetPercent,
+          });
+        },
       });
     } catch {
       nativeVisibility.restore();
@@ -213,8 +311,55 @@ export default defineContentScript({
     }
     const overlaySink = overlay ?? {
       render: () => false,
+      setNativeSubtitlesHidden: () => undefined,
+      setDragMode: () => undefined,
       clear: () => nativeVisibility.restore(),
+      dispose: () => undefined,
     };
+    pageControlCoordinator = createPageControlCoordinator({
+      initialSettings: runtimeSettings,
+      applySettings: (settings, updateOptions) => {
+        contentSession?.updateSettings(settings, updateOptions);
+      },
+      persistSettings: persistPageSettings,
+      render: (model) => {
+        latestPageControlModel = model;
+        overlay?.setNativeSubtitlesHidden(
+          model.settings.enabled && !model.paused,
+        );
+        pageControlMount?.update(model);
+      },
+      schedule: (callback) => window.setTimeout(callback, 140),
+      cancel: (handle) => window.clearTimeout(handle),
+    });
+    pageControlCoordinator.updatePipeline(latestSubtitlePipeline.message);
+    try {
+      pageControlMount = mountPageControlSurface({
+        model: latestPageControlModel as PageControlSurfaceModel,
+        onAppearanceChange: (appearance) =>
+          pageControlCoordinator?.setAppearance(appearance),
+        onEnabledChange: (enabled) =>
+          pageControlCoordinator?.setEnabled(enabled),
+        onExpandedChange: (expanded) => overlay?.setDragMode(expanded),
+        onPausedChange: (paused) =>
+          pageControlCoordinator?.setPaused(paused),
+        onProviderChange: (provider) =>
+          pageControlCoordinator?.setProvider(provider),
+      });
+    } catch {
+      pageControlMount = undefined;
+    }
+    const refreshPageMetadata = (): void => {
+      try {
+        pageControlCoordinator?.updateMetadata(
+          readNetflixPageMetadata(document as never),
+        );
+      } catch {
+        // Page metadata is diagnostic-only and never affects subtitles.
+      }
+    };
+    refreshPageMetadata();
+    metadataTimer = window.setInterval(refreshPageMetadata, 1_000);
     const videoTicks = createVideoTickSource({
       document: documentFacade as never,
       createObserver,
@@ -222,7 +367,11 @@ export default defineContentScript({
       cancelAnimationFrame: (handle) =>
         window.cancelAnimationFrame(handle as number),
       now: () => performance.now(),
-      onVideoRemount: () => contentSession?.playerRemounted(),
+      onVideoRemount: () => {
+        const watchTitleId = /^\/watch\/([A-Za-z0-9._:-]{1,128})(?:[/?#]|$)/u
+          .exec(window.location.pathname)?.[1] ?? null;
+        contentSession?.playerRemounted(watchTitleId);
+      },
     });
     const taskClient = createExtensionTranslationTaskClient({
       sendMessage: (message) => browser.runtime.sendMessage(message),
@@ -258,6 +407,9 @@ export default defineContentScript({
       overlay: overlaySink,
       status: { publish: publishStatus },
       onSessionState: (state) => {
+        if (state.state === 'active') {
+          updateSubtitlePipeline('waiting', '等待字幕数据', state.generation);
+        }
         safeSend(createMessage({
           id: nextMessageId('netflix-session'),
           source: 'content',
@@ -266,6 +418,12 @@ export default defineContentScript({
         }));
       },
       onCatalogSummary: (summary) => {
+        updateSubtitlePipeline(
+          'catalog',
+          '已读取 Netflix 字幕目录',
+          summary.generation,
+        );
+        pageControlCoordinator?.updateCatalog(summarizeNetflixCatalog(summary));
         safeSend(createMessage({
           id: nextMessageId('netflix-catalog'),
           source: 'content',
@@ -274,7 +432,31 @@ export default defineContentScript({
         }));
       },
       onBridgeRestart: restartBridge,
+      onDiagnostic: (diagnostic) => {
+        if (diagnostic.code === 'timed_text_received') {
+          updateSubtitlePipeline('received', '字幕正文已到达');
+        } else if (diagnostic.code === 'timed_text_accepted') {
+          if (diagnostic.detail === 'dual') {
+            updateSubtitlePipeline('accepted', '字幕已解析，可显示双语');
+          } else {
+            updateSubtitlePipeline('partial', '已解析一条字幕轨，等待另一条');
+          }
+        } else if (diagnostic.code === 'timed_text_descriptor_missing') {
+          updateSubtitlePipeline('failed', '字幕轨匹配失败');
+        } else if (diagnostic.code === 'timed_text_parse_failed') {
+          updateSubtitlePipeline(
+            'failed',
+            `字幕解析失败：${diagnostic.detail ?? 'unknown'}`,
+          );
+        }
+        console.info(
+          '[SubTwin] Netflix timed-text ingest:',
+          diagnostic.code,
+          diagnostic.detail ?? '',
+        );
+      },
     });
+    pageControlCoordinator.updateSettings(runtimeSettings);
     startClockForCurrentBridge();
     const buffered = earlyPayloads;
     earlyPayloads = [];
@@ -283,13 +465,21 @@ export default defineContentScript({
       latestSettingsPush !== undefined &&
       latestSettingsPush !== initialSettingsPush
     ) {
-      contentSession.updateSettings(latestSettingsPush.settings, {
+      pageControlCoordinator.updateSettings(latestSettingsPush.settings, {
         translationConfigurationChanged:
           latestSettingsPush.translationConfigurationChanged,
       });
     }
 
     disposeResources = () => {
+      if (metadataTimer !== undefined) {
+        window.clearInterval(metadataTimer);
+        metadataTimer = undefined;
+      }
+      pageControlCoordinator?.dispose();
+      pageControlCoordinator = undefined;
+      pageControlMount?.dispose();
+      pageControlMount = undefined;
       taskClient.dispose();
       videoTicks.dispose();
       try {
@@ -299,6 +489,29 @@ export default defineContentScript({
       }
       overlay = undefined;
     };
+
+    async function persistPageSettings(
+      mutation: PageControlSettingsMutation,
+    ): Promise<PageControlPersistenceResult> {
+      const requestId = nextMessageId('settings-page-update');
+      const request = createMessage({
+        id: requestId,
+        source: 'content',
+        type: 'settings/page-update',
+        payload: mutation,
+      });
+      try {
+        const response = await withTimeout(
+          browser.runtime.sendMessage(request),
+          SETTINGS_TIMEOUT_MS,
+        );
+        return parsePageSettingsUpdateResponse(response, requestId) === null
+          ? { ok: false }
+          : { ok: true };
+      } catch {
+        return { ok: false };
+      }
+    }
 
     async function requestRuntimeSettings(
       requestId: string,

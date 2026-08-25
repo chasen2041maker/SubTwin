@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  parsePageSettingsUpdateResponse,
   parseRuntimeSettingsPush,
   parseRuntimeSettingsResponse,
 } from '../../src/app/runtime-settings-client';
@@ -55,5 +56,40 @@ describe('runtime settings content client', () => {
       ...push('config'),
       source: 'content',
     }))).toBeNull();
+  });
+
+  it('accepts only the correlated page settings mutation result', () => {
+    const appearance = {
+      ...DEFAULT_SETTINGS.appearance,
+      order: 'chinese-first' as const,
+    };
+    const envelope = createMessage({
+      id: 'page-update-1:background',
+      source: 'background',
+      type: 'settings/page-update-result',
+      payload: {
+        status: 'success',
+        errorCode: null,
+        enabled: false,
+        provider: 'google-free',
+        appearance,
+      },
+    });
+    const response = ok(envelope);
+
+    expect(parsePageSettingsUpdateResponse(response, 'page-update-1')).toEqual({
+      enabled: false,
+      provider: 'google-free',
+      appearance,
+    });
+    expect(parsePageSettingsUpdateResponse(response, 'other-request')).toBeNull();
+    expect(parsePageSettingsUpdateResponse(ok(createMessage({
+      ...envelope,
+      payload: {
+        ...envelope.payload,
+        status: 'error',
+        errorCode: 'settings_unavailable',
+      },
+    })), 'page-update-1')).toBeNull();
   });
 });

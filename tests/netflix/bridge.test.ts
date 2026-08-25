@@ -143,18 +143,26 @@ describe('Netflix MAIN-world bridge', () => {
       generation: 2,
       capacity: 2,
     });
-    const diagnostic = (code: 'candidate_rejected' | 'display_unavailable') =>
+    const diagnostic = (code:
+      | 'candidate_rejected'
+      | 'display_unavailable'
+      | 'download_started'
+      | 'download_succeeded'
+      | 'metadata_candidate_observed') =>
       ({ type: 'diagnostic', code }) as const;
 
-    expect(queue.publish(diagnostic('candidate_rejected'), 2)).toBe(true);
-    expect(queue.publish(diagnostic('display_unavailable'), 2)).toBe(true);
+    expect(queue.publish(diagnostic('download_started'), 2)).toBe(true);
+    expect(queue.publish(diagnostic('metadata_candidate_observed'), 2)).toBe(true);
     expect(queue.publish(timedText, 2)).toBe(true);
     expect(queue.publish({ type: 'timed-text', rawUrl: 'secret' }, 2)).toBe(false);
     expect(queue.size).toBe(2);
 
     const received: NetflixBridgePayload[] = [];
     queue.attach((message) => received.push(message.payload));
-    expect(received).toEqual([diagnostic('display_unavailable'), timedText]);
+    expect(received).toEqual([
+      diagnostic('metadata_candidate_observed'),
+      timedText,
+    ]);
 
     queue.nextGeneration(3, 'session-nonce-9876543210');
     expect(queue.publish(timedText, 2)).toBe(false);
@@ -183,5 +191,30 @@ describe('Netflix MAIN-world bridge', () => {
     expect(received).toEqual([
       { type: 'diagnostic', code: 'candidate_rejected' },
     ]);
+  });
+
+  it('never lets diagnostics evict catalog or timed-text payloads from the early queue', () => {
+    const queue = createEarlyBridgeQueue({
+      nonce: NONCE,
+      generation: 1,
+      capacity: 2,
+    });
+    const catalog = {
+      type: 'catalog',
+      titleId: 'title-1',
+      authority: 'authoritative',
+      tracks: [{ id: 'en-main', language: 'en', kind: 'subtitle' }],
+    } as const;
+
+    expect(queue.publish(catalog)).toBe(true);
+    expect(queue.publish(timedText)).toBe(true);
+    expect(queue.publish({
+      type: 'diagnostic',
+      code: 'download_started',
+    })).toBe(false);
+
+    const received: NetflixBridgePayload[] = [];
+    queue.attach((message) => received.push(message.payload));
+    expect(received).toEqual([catalog, timedText]);
   });
 });

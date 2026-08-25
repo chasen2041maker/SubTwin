@@ -172,9 +172,7 @@ describe('background settings actions', () => {
       source: 'options',
       type: 'settings/options-update',
       payload: {
-        updateEnabled: false,
-        settings: {
-          ...DEFAULT_SETTINGS,
+        patch: {
           deepseek: { apiKey: 'new-private-key', model: 'deepseek-v4-pro' },
           provider: 'deepseek',
         },
@@ -243,11 +241,7 @@ describe('background settings actions', () => {
       source: 'options',
       type: 'settings/options-update',
       payload: {
-        updateEnabled: true,
-        settings: {
-          ...state.current(),
-          enabled: false,
-        },
+        patch: { enabled: false },
       },
     }));
 
@@ -257,6 +251,184 @@ describe('background settings actions', () => {
       deepseek: { apiKey: 'keep-this-key', model: 'deepseek-v4-pro' },
     });
   });
+
+  it('persists a Netflix page appearance patch without exposing or replacing private settings', async () => {
+    const state = createStore({
+      ...DEFAULT_SETTINGS,
+      provider: 'deepseek',
+      deepseek: { apiKey: 'keep-page-secret', model: 'deepseek-v4-pro' },
+    });
+    const handler = createSettingsActionHandler({
+      fetch: vi.fn(),
+      settingsStore: state.store,
+      cache: { clearAll: vi.fn(), clearEpisode: vi.fn() },
+      readCurrentEpisodeId: vi.fn(),
+    });
+    const appearance = {
+      ...DEFAULT_SETTINGS.appearance,
+      order: 'chinese-first' as const,
+      chinese: {
+        ...DEFAULT_SETTINGS.appearance.chinese,
+        fontFamily: 'rounded' as const,
+        color: '#33AAFF',
+      },
+    };
+
+    const result = await handler(createMessage({
+      id: 'settings-page-update',
+      source: 'content',
+      type: 'settings/page-update',
+      payload: {
+        enabled: false,
+        provider: 'google-free',
+        appearance,
+        updateEnabled: true,
+        updateAppearance: true,
+        updateProvider: true,
+      },
+    }));
+
+    expect(state.current()).toMatchObject({
+      enabled: false,
+      provider: 'google-free',
+      deepseek: { apiKey: 'keep-page-secret', model: 'deepseek-v4-pro' },
+      appearance,
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        source: 'background',
+        type: 'settings/page-update-result',
+        payload: {
+          status: 'success',
+          errorCode: null,
+          enabled: false,
+          provider: 'google-free',
+          appearance,
+        },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain('keep-page-secret');
+    expect(JSON.stringify(result)).not.toContain('deepseek-v4-pro');
+  });
+
+  it('applies only the page fields explicitly marked dirty after other settings mutations', async () => {
+    const state = createStore();
+    const handler = createSettingsActionHandler({
+      fetch: vi.fn(),
+      settingsStore: state.store,
+      cache: { clearAll: vi.fn(), clearEpisode: vi.fn() },
+      readCurrentEpisodeId: vi.fn(),
+    });
+    const appearance = {
+      ...DEFAULT_SETTINGS.appearance,
+      lineSpacingPx: 19,
+    };
+    const optionsUpdate = createMessage({
+      id: 'settings-options-before-page',
+      source: 'options',
+      type: 'settings/options-update',
+      payload: {
+        patch: {
+          provider: 'deepseek',
+          deepseek: { apiKey: 'new-private-key', model: 'deepseek-v4-pro' },
+        },
+      },
+    });
+    const enabledSet = createMessage({
+      id: 'settings-disabled-before-page',
+      source: 'popup',
+      type: 'settings/enabled-set',
+      payload: { enabled: false },
+    });
+    const pageUpdate = createMessage({
+      id: 'settings-stale-page-appearance',
+      source: 'content',
+      type: 'settings/page-update',
+      payload: {
+        enabled: true,
+        provider: 'unset',
+        appearance,
+        updateEnabled: false,
+        updateAppearance: true,
+        updateProvider: false,
+      },
+    });
+
+    await Promise.all([
+      handler(optionsUpdate),
+      handler(enabledSet),
+      handler(pageUpdate),
+    ]);
+
+    expect(state.current()).toMatchObject({
+      enabled: false,
+      provider: 'deepseek',
+      deepseek: { apiKey: 'new-private-key', model: 'deepseek-v4-pro' },
+      appearance,
+    });
+  });
+
+  it.each(['page-first', 'options-first'] as const)(
+    'preserves page appearance and options credentials in %s commit order',
+    async (order) => {
+      const state = createStore();
+      const handler = createSettingsActionHandler({
+        fetch: vi.fn(),
+        settingsStore: state.store,
+        cache: { clearAll: vi.fn(), clearEpisode: vi.fn() },
+        readCurrentEpisodeId: vi.fn(),
+      });
+      const appearance = {
+        ...DEFAULT_SETTINGS.appearance,
+        verticalOffsetPercent: 17,
+      };
+      const disable = createMessage({
+        id: `disable-${order}`,
+        source: 'popup',
+        type: 'settings/enabled-set',
+        payload: { enabled: false },
+      });
+      const pageUpdate = createMessage({
+        id: `page-${order}`,
+        source: 'content',
+        type: 'settings/page-update',
+        payload: {
+          enabled: true,
+          provider: 'unset',
+          appearance,
+          updateEnabled: false,
+          updateAppearance: true,
+          updateProvider: false,
+        },
+      });
+      const optionsUpdate = createMessage({
+        id: `options-${order}`,
+        source: 'options',
+        type: 'settings/options-update',
+        payload: {
+          patch: {
+            provider: 'deepseek',
+            deepseek: { apiKey: 'kept-private-key', model: 'deepseek-v4-pro' },
+          },
+        },
+      });
+
+      await handler(disable);
+      for (const mutation of order === 'page-first'
+        ? [pageUpdate, optionsUpdate]
+        : [optionsUpdate, pageUpdate]) {
+        await handler(mutation);
+      }
+
+      expect(state.current()).toMatchObject({
+        enabled: false,
+        provider: 'deepseek',
+        deepseek: { apiKey: 'kept-private-key', model: 'deepseek-v4-pro' },
+        appearance,
+      });
+    },
+  );
 });
 
 function createStore(initial: SubTwinSettings = DEFAULT_SETTINGS) {

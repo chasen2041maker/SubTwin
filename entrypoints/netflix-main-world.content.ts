@@ -21,6 +21,53 @@ export default defineContentScript({
   main() {
     const runtime = installMainWorldNetflixRuntime({
       window: window as unknown as NetflixRuntimeWindow,
+      onDownloadDiagnostic: (code) => {
+        console.warn('[SubTwin] Netflix timed-text download failed:', code);
+      },
+      onDownloadEvent: (event) => {
+        console.info(
+          '[SubTwin] Netflix timed-text download:',
+          event.state,
+          event.language,
+          event.code ?? '',
+        );
+      },
+      onCatalogMatchDiagnostic: (diagnostic) => {
+        console.info(
+          '[SubTwin] Netflix catalog match:',
+          JSON.stringify(diagnostic),
+        );
+      },
+      onTrackCaptureEvent: (event) => {
+        console.info(
+          '[SubTwin] Netflix controlled track capture:',
+          event.state,
+          event.language,
+        );
+      },
+      onTimedTextCandidate: (event) => {
+        console.info(
+          '[SubTwin] Netflix timed-text candidate:',
+          event.transport,
+          event.responseType,
+          event.bound ? 'bound' : 'unbound',
+          event.stage,
+          event.outcome,
+        );
+      },
+      onTimedTextObservation: (event) => {
+        console.info(
+          '[SubTwin] Netflix timed-text body:',
+          event.format,
+          event.language,
+        );
+      },
+      onPerformanceTimedTextEvent: (event) => {
+        console.info(
+          '[SubTwin] Netflix performance timed-text:',
+          JSON.stringify(event),
+        );
+      },
     });
     const previous = readEntrySentinel(window);
     if (previous?.runtime === runtime) return;

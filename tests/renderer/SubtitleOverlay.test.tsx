@@ -6,9 +6,11 @@ import { describe, expect, it } from 'vitest';
 import {
   SubtitleOverlay,
   mountSubtitleOverlay,
+  verticalOffsetFromDrag,
   type NormalizedActiveCueState,
   type SubtitleOverlayAppearance,
   type SubtitleOverlayDocument,
+  type SubtitleOverlayHostObserver,
   type SubtitleOverlayNode,
   type SubtitleOverlayRenderLifecycle,
   type SubtitleOverlayRenderRoot,
@@ -23,17 +25,20 @@ const appearance: SubtitleOverlayAppearance = {
   english: {
     visible: true,
     color: '#F7F4EC',
+    fontFamily: 'sans',
     fontSizePx: 28,
     fontWeight: 600,
   },
   chinese: {
     visible: true,
     color: '#FFFFFF',
+    fontFamily: 'rounded',
     fontSizePx: 32,
     fontWeight: 600,
   },
   order: 'english-first',
   lineSpacingPx: 8,
+  maxLineWidthPercent: 96,
   verticalOffsetPercent: 8,
   backgroundOpacity: 0.55,
   shadow: 'soft',
@@ -64,6 +69,7 @@ describe('SubtitleOverlay', () => {
     expect(first).toContain('--subtwin-en-size:28px');
     expect(first).toContain('--subtwin-zh-size:32px');
     expect(first).toContain('--subtwin-line-spacing:8px');
+    expect(first).toContain('--subtwin-max-line-width:96vw');
     expect(first).toContain('--subtwin-vertical-offset:8');
     expect(first).toContain('--subtwin-background-opacity:0.55');
     expect(first).toContain('--subtwin-text-shadow:0 1px 2px rgb(0 0 0 / 0.9)');
@@ -105,12 +111,59 @@ describe('SubtitleOverlay', () => {
     ).toBe('');
   });
 
+  it('lets the line-width setting control source captions with embedded line breaks', () => {
+    const markup = renderToStaticMarkup(
+      <SubtitleOverlay
+        state={{
+          english: 'You saw the guys\nthat shot at us, right?',
+          chinese: '你们看到了\n朝我们开枪的人 对吗？',
+        }}
+        appearance={{ ...appearance, maxLineWidthPercent: 100 }}
+      />,
+    );
+
+    expect(markup).toContain('You saw the guys that shot at us, right?');
+    expect(markup).toContain('你们看到了 朝我们开枪的人 对吗？');
+    expect(markup).not.toContain('guys\nthat');
+    expect(markup).not.toContain('看到了\n朝');
+  });
+
   it('keeps the full-screen layer pointer-transparent and safe-area aware', () => {
     expect(overlayCss).toContain('pointer-events: none');
     expect(overlayCss).toContain('env(safe-area-inset-bottom');
     expect(overlayCss).toContain('position: fixed');
     expect(overlayCss).toContain('z-index: 2147483000');
     expect(overlayCss).not.toMatch(/gradient|animation|glow/iu);
+  });
+
+  it('uses a compact Lingosive-like subtitle surface instead of poster styling', () => {
+    expect(overlayCss).toContain('max-width: min(var(--subtwin-max-line-width), calc(100vw - 32px))');
+    expect(overlayCss).toContain('width: max-content');
+    expect(overlayCss).toContain('border-radius: 0.38em');
+    expect(overlayCss).toContain('line-height: 1.2');
+    expect(overlayCss).toContain('"Noto Sans SC"');
+  });
+
+  it('previews direct subtitle dragging only while edit mode is enabled', () => {
+    const markup = renderToStaticMarkup(
+      <SubtitleOverlay
+        appearance={appearance}
+        dragEnabled
+        onVerticalOffsetChange={() => undefined}
+        state={activeState}
+      />,
+    );
+
+    expect(markup).toContain('data-drag-enabled="true"');
+    expect(overlayCss).toContain('content: "拖动字幕"');
+    expect(overlayCss).toMatch(/data-drag-enabled="true"[\s\S]*pointer-events:\s*auto/iu);
+  });
+
+  it('maps direct vertical dragging to a live 0–80 percent offset', () => {
+    expect(verticalOffsetFromDrag(20, 500, 400, 1_000)).toBe(30);
+    expect(verticalOffsetFromDrag(20, 500, 900, 1_000)).toBe(0);
+    expect(verticalOffsetFromDrag(70, 500, -500, 1_000)).toBe(80);
+    expect(verticalOffsetFromDrag(20, 500, 400, 0)).toBe(20);
   });
 });
 
@@ -136,7 +189,7 @@ describe('subtitle overlay mount lifecycle', () => {
     expect(document.documentElement.children).toHaveLength(0);
   });
 
-  it('hides native subtitles only after a non-empty React commit', () => {
+  it('hides native subtitles only after a committed bilingual cue', () => {
     const document = new FakeDocument();
     const root = new FakeRenderRoot();
     const visibility: string[] = [];
@@ -154,9 +207,36 @@ describe('subtitle overlay mount lifecycle', () => {
     root.commit();
     expect(visibility).toEqual(['hide']);
 
+    mount.render({ english: 'English only', chinese: null }, appearance);
+    root.commit();
+    expect(visibility).toEqual(['hide', 'restore']);
+
     mount.render({ english: null, chinese: '   ' }, appearance);
     expect(visibility).toEqual(['hide', 'restore']);
     root.commitStale();
+    expect(visibility).toEqual(['hide', 'restore']);
+  });
+
+  it('suppresses native subtitles immediately while SubTwin is enabled', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+
+    mount.setNativeSubtitlesHidden(true);
+    expect(visibility).toEqual(['hide']);
+
+    mount.clear();
+    expect(visibility).toEqual(['hide']);
+
+    mount.setNativeSubtitlesHidden(false);
     expect(visibility).toEqual(['hide', 'restore']);
   });
 
@@ -267,6 +347,42 @@ describe('subtitle overlay mount lifecycle', () => {
 
     mount.dispose();
   });
+
+  it('restores native subtitles immediately when a committed host is removed', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const hostObserver = new FakeHostObserver();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createHostObserver: (callback) => hostObserver.bind(callback),
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+
+    mount.render(activeState, appearance);
+    root.commit();
+    const host = document.documentElement.children[0];
+    expect(host).toBeDefined();
+    host?.remove();
+    hostObserver.notify();
+
+    expect(visibility).toEqual(['hide', 'restore']);
+    expect(document.documentElement.children).toEqual([host]);
+    expect(root.rendered.at(-1)).toBeNull();
+
+    mount.render(activeState, appearance);
+    root.commit();
+    expect(visibility).toEqual(['hide', 'restore', 'hide']);
+
+    mount.dispose();
+    expect(hostObserver.disconnectCount).toBe(1);
+    hostObserver.notify();
+    expect(visibility).toEqual(['hide', 'restore', 'hide', 'restore']);
+  });
 });
 
 class FakeRenderRoot implements SubtitleOverlayRenderRoot {
@@ -301,6 +417,27 @@ class FakeRenderRoot implements SubtitleOverlayRenderRoot {
 
   fail(): void {
     this.currentLifecycle?.onError();
+  }
+}
+
+class FakeHostObserver implements SubtitleOverlayHostObserver {
+  disconnectCount = 0;
+  private callback: (() => void) | undefined;
+
+  bind(callback: () => void): FakeHostObserver {
+    this.callback = callback;
+    return this;
+  }
+
+  observe(): void {}
+
+  disconnect(): void {
+    this.disconnectCount += 1;
+    this.callback = undefined;
+  }
+
+  notify(): void {
+    this.callback?.();
   }
 }
 

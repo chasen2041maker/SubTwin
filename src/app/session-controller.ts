@@ -25,6 +25,7 @@ import type {
 const URGENT_NEIGHBOR_RADIUS = 2;
 const CONTEXT_RADIUS = 3;
 const DEEPSEEK_BULK_BATCH_SIZE = 20;
+const RATE_LIMIT_COOLDOWN_MS = 30_000;
 
 export interface SubtitleSessionTick {
   readonly visibleText?: string;
@@ -107,8 +108,10 @@ export interface SessionEpisodeChange {
 export interface SubtitleSessionController {
   tick(tick: SubtitleSessionTick): void;
   seek(currentTimeMs: number): void;
+  appendEnglishCue(trackId: string, cue: SubtitleCue): void;
   updateRoute(route: LanguageRoute): void;
   updateTracks(update: SessionTrackUpdate): void;
+  updateRouteAndTracks(route: LanguageRoute, update: SessionTrackUpdate): void;
   updateAppearance(appearance: SubtitleOverlayAppearance): void;
   refreshProviderConfiguration(): void;
   setEnabled(enabled: boolean): void;
@@ -151,6 +154,7 @@ export function createSubtitleSessionController(
   let providerTranslations = new Map<string, string>();
   let promotedCueIds = new Set<string>();
   let blockedProvider: TranslationProviderId | null = null;
+  const providerCooldownUntil = new Map<TranslationProviderId, number>();
 
   const currentGeneration = (): SchedulerGeneration => ({
     episodeGeneration,
@@ -177,14 +181,16 @@ export function createSubtitleSessionController(
   const isSessionEnabled = (): boolean => enabled && route.mode !== 'disabled';
 
   const effectiveOfficial = (): boolean =>
-    isSessionEnabled() && englishTrack !== null && officialChineseTrack !== null;
+    isSessionEnabled() &&
+    route.sourceMode === 'official-alignment' &&
+    englishTrack !== null &&
+    officialChineseTrack !== null;
 
   const effectiveProvider = (): TranslationProviderId | null => {
     if (
       disposed ||
       !isSessionEnabled() ||
       englishTrack === null ||
-      officialChineseTrack !== null ||
       (blockedProvider !== null && route.provider === blockedProvider) ||
       !route.externalCallsAllowed ||
       route.sourceMode !== 'external-translation' ||
@@ -195,6 +201,15 @@ export function createSubtitleSessionController(
       return null;
     }
     return route.provider;
+  };
+
+  const schedulableProvider = (): TranslationProviderId | null => {
+    const provider = effectiveProvider();
+    if (provider === null) return null;
+    const cooldownUntil = providerCooldownUntil.get(provider) ?? 0;
+    if (Date.now() < cooldownUntil) return null;
+    if (cooldownUntil > 0) providerCooldownUntil.delete(provider);
+    return provider;
   };
 
   const publishRouteStatus = (): void => {
@@ -254,6 +269,7 @@ export function createSubtitleSessionController(
     };
     if (
       (effectiveOfficial() && state.chinese === null) ||
+      (effectiveProvider() !== null && state.chinese === null) ||
       (route.sourceMode === 'official-alignment' && !effectiveOfficial())
     ) {
       if (force || lastRenderSignature !== null) safeClearOverlay();
@@ -315,8 +331,18 @@ export function createSubtitleSessionController(
       return;
     }
     publish({ mode: 'error', code: runtimeErrorForTranslation(error) });
-    invalidate('provider-change', false);
-    blockedProvider = task.provider;
+    if (isTerminalProviderError(error)) {
+      invalidate('provider-change', false);
+      blockedProvider = task.provider;
+      return;
+    }
+    for (const cue of task.cues) promotedCueIds.delete(cue.id);
+    if (error.code === 'rate_limited') {
+      providerCooldownUntil.set(task.provider, Math.max(
+        providerCooldownUntil.get(task.provider) ?? 0,
+        Date.now() + RATE_LIMIT_COOLDOWN_MS,
+      ));
+    }
   };
 
   const enqueueTask = (task: ScheduledTranslationTask): boolean => {
@@ -375,7 +401,7 @@ export function createSubtitleSessionController(
     priority: ScheduledTranslationTask['priority'],
   ): boolean => {
     for (const task of createTasks(provider, cues, priority)) {
-      if (!isTaskCurrent(task)) return false;
+      if (!isTaskCurrent(task) || schedulableProvider() !== provider) return false;
       if (!enqueueTask(task)) return false;
     }
     return true;
@@ -392,7 +418,7 @@ export function createSubtitleSessionController(
   };
 
   const promoteNeighborhood = (index: number): void => {
-    const provider = effectiveProvider();
+    const provider = schedulableProvider();
     if (provider === null) return;
     const urgent = urgentCuesAt(index).filter(
       ({ id }) => !promotedCueIds.has(id),
@@ -403,7 +429,7 @@ export function createSubtitleSessionController(
   };
 
   const scheduleInitialWork = (): void => {
-    const provider = effectiveProvider();
+    const provider = schedulableProvider();
     if (provider === null || sortedEnglishCues.length === 0) return;
     const initialIndex = activeCueIndex ?? 0;
     const urgent = urgentCuesAt(initialIndex);
@@ -477,7 +503,10 @@ export function createSubtitleSessionController(
     }
     providerTranslations = new Map();
     promotedCueIds = new Set();
-    if (clearBlockedProvider) blockedProvider = null;
+    if (clearBlockedProvider) {
+      blockedProvider = null;
+      providerCooldownUntil.clear();
+    }
     activeCueIndex = null;
     safeClearOverlay();
   };
@@ -506,6 +535,26 @@ export function createSubtitleSessionController(
       if (nextIndex !== null) promoteNeighborhood(nextIndex);
     },
 
+    appendEnglishCue(trackId, cue) {
+      if (disposed || trackId.length === 0) return;
+      const existingCues = englishTrack?.id === trackId
+        ? englishTrack.cues
+        : [];
+      if (existingCues.some(({ id }) => id === cue.id)) return;
+      englishTrack = {
+        id: trackId,
+        format: 'webvtt',
+        language: { tag: 'en', kind: 'subtitles' },
+        cues: [...existingCues, cue],
+      };
+      sortedEnglishCues = sortCues(englishTrack.cues);
+      officialTranslations = createOfficialTranslations(
+        englishTrack,
+        officialChineseTrack,
+      );
+      publishRouteStatus();
+    },
+
     updateRoute(nextRoute) {
       if (disposed || sameRoute(route, nextRoute)) return;
       invalidate(
@@ -530,6 +579,30 @@ export function createSubtitleSessionController(
           : 'official-track',
         false,
       );
+      englishTrack = update.englishTrack;
+      officialChineseTrack = update.officialChineseTrack;
+      if (update.trackHash !== undefined) trackHash = update.trackHash;
+      restartCurrentState();
+    },
+
+    updateRouteAndTracks(nextRoute, update) {
+      const routeChanged = !sameRoute(route, nextRoute);
+      const tracksChanged = !(
+        englishTrack === update.englishTrack &&
+        officialChineseTrack === update.officialChineseTrack &&
+        (update.trackHash === undefined || update.trackHash === trackHash)
+      );
+      if (disposed || (!routeChanged && !tracksChanged)) return;
+      invalidate(
+        routeChanged
+          ? cancellationReasonForRoute(nextRoute)
+          : update.officialChineseTrack === null
+            ? 'provider-change'
+            : 'official-track',
+        false,
+        routeChanged && routeChangeClearsProviderBlock(route, nextRoute, blockedProvider),
+      );
+      route = nextRoute;
       englishTrack = update.englishTrack;
       officialChineseTrack = update.officialChineseTrack;
       if (update.trackHash !== undefined) trackHash = update.trackHash;
@@ -703,6 +776,25 @@ function chunk<T>(values: readonly T[], size: number): readonly (readonly T[])[]
     batches.push(values.slice(offset, offset + size));
   }
   return batches;
+}
+
+function isTerminalProviderError(error: TranslationError): boolean {
+  switch (error.code) {
+    case 'authentication_failed':
+    case 'insufficient_balance':
+    case 'invalid_configuration':
+    case 'provider_forbidden':
+    case 'provider_unset':
+      return true;
+    case 'aborted':
+    case 'invalid_request':
+    case 'invalid_response':
+    case 'provider_unavailable':
+    case 'rate_limited':
+    case 'stale_generation':
+    case 'timeout':
+      return false;
+  }
 }
 
 function runtimeErrorForTranslation(error: TranslationError): RuntimeErrorCode {

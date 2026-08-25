@@ -455,6 +455,374 @@ describe('background translation boundary', () => {
     });
   });
 
+  it('scopes identical session IDs by Netflix tab before cancellation', async () => {
+    let resolveFirst = (_response: Response): void => undefined;
+    let resolveSecond = (_response: Response): void => undefined;
+    const firstResponse = new Promise<Response>((resolve) => { resolveFirst = resolve; });
+    const secondResponse = new Promise<Response>((resolve) => { resolveSecond = resolve; });
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockReturnValueOnce(firstResponse)
+      .mockReturnValueOnce(secondResponse);
+    const handler = createBackgroundTranslationHandler({
+      fetch,
+      readSettings: vi.fn().mockResolvedValue({ provider: 'google-free' }),
+      googleOptions: { minStartIntervalMs: 0, maxAttempts: 1 },
+    });
+    const otherTabRequest = {
+      ...request,
+      id: 'same-session-other-tab',
+      payload: {
+        ...request.payload,
+        taskId: 'same-session-task-other-tab',
+        cues: [{ id: 'cue-2', startMs: 0, endMs: 1_000, text: 'Second' }],
+      },
+    };
+
+    const first = handler(request, 17);
+    const second = handler(otherTabRequest, 18);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    await handler(createMessage({
+      id: 'cancel-tab-17',
+      source: 'content',
+      type: 'translation/cancel',
+      payload: {
+        sessionId: 'session-1',
+        episodeGeneration: 1,
+        providerGeneration: 1,
+        reason: 'official-track',
+      },
+    }), 17);
+    resolveFirst(response([[['过期', 'Hello.']]]));
+    resolveSecond(response([[['第二个', 'Second']]]));
+
+    await expect(first).resolves.toMatchObject({
+      ok: true,
+      value: { payload: { errorCode: 'stale_generation' } },
+    });
+    await expect(second).resolves.toMatchObject({
+      ok: true,
+      value: {
+        payload: {
+          status: 'success',
+          translations: [{ cueId: 'cue-2', text: '第二个' }],
+        },
+      },
+    });
+  });
+
+  it('keeps urgent cache ownership when an overlapping bulk response arrives later', async () => {
+    let resolveBulk = (_response: Response): void => undefined;
+    let resolveUrgent = (_response: Response): void => undefined;
+    const bulkResponse = new Promise<Response>((resolve) => { resolveBulk = resolve; });
+    const urgentResponse = new Promise<Response>((resolve) => { resolveUrgent = resolve; });
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockReturnValueOnce(bulkResponse)
+      .mockReturnValueOnce(urgentResponse);
+    const store = new MemoryTranslationCacheStore();
+    const cache = new TranslationCache({ store, debounceMs: 0 });
+    const handler = createBackgroundTranslationHandler({
+      fetch,
+      readSettings: vi.fn().mockResolvedValue({ provider: 'google-free' }),
+      googleOptions: { minStartIntervalMs: 0, maxAttempts: 1 },
+      cache,
+    });
+    const bulkRequest = {
+      ...request,
+      id: 'overlap-bulk',
+      payload: {
+        ...request.payload,
+        taskId: 'overlap-bulk-task',
+        priority: 'bulk' as const,
+      },
+    };
+    const urgentRequest = {
+      ...request,
+      id: 'overlap-urgent',
+      payload: {
+        ...request.payload,
+        taskId: 'overlap-urgent-task',
+        priority: 'urgent' as const,
+      },
+    };
+
+    const bulk = handler(bulkRequest, 17);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    const urgent = handler(urgentRequest, 17);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    resolveUrgent(response([[['紧急翻译', 'Hello.']]]));
+    await expect(urgent).resolves.toMatchObject({
+      ok: true,
+      value: {
+        payload: {
+          status: 'success',
+          translations: [{ cueId: 'cue-1', text: '紧急翻译' }],
+        },
+      },
+    });
+    resolveBulk(response([[['批量翻译', 'Hello.']]]));
+    await bulk;
+    await cache.flush();
+
+    expect(store.records).toHaveLength(1);
+    expect(store.records[0]?.text).toBe('紧急翻译');
+
+    const cached = await handler({
+      ...request,
+      id: 'overlap-cache-read',
+      payload: { ...request.payload, taskId: 'overlap-cache-read-task' },
+    }, 17);
+    expect(cached).toMatchObject({
+      ok: true,
+      value: {
+        payload: {
+          status: 'success',
+          translations: [{ cueId: 'cue-1', text: '紧急翻译' }],
+        },
+      },
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps an urgent provider winner even when its cache write fails', async () => {
+    let resolveBulk = (_response: Response): void => undefined;
+    let resolveUrgent = (_response: Response): void => undefined;
+    const bulkResponse = new Promise<Response>((resolve) => { resolveBulk = resolve; });
+    const urgentResponse = new Promise<Response>((resolve) => { resolveUrgent = resolve; });
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockReturnValueOnce(bulkResponse)
+      .mockReturnValueOnce(urgentResponse);
+    const records = new Map<string, Parameters<TranslationCacheStore['put']>[0]>();
+    let putCount = 0;
+    const store: TranslationCacheStore = {
+      get: async (key) => records.get(key) ?? null,
+      put: async (record) => {
+        putCount += 1;
+        if (putCount === 1) throw new Error('urgent cache failure');
+        records.set(record.key, record);
+      },
+      deleteEpisode: async () => undefined,
+      clear: async () => records.clear(),
+    };
+    const cache = new TranslationCache({ store, debounceMs: 0 });
+    const handler = createBackgroundTranslationHandler({
+      fetch,
+      readSettings: vi.fn().mockResolvedValue({ provider: 'google-free' }),
+      googleOptions: { minStartIntervalMs: 0, maxAttempts: 1 },
+      cache,
+    });
+
+    const bulk = handler({
+      ...request,
+      id: 'cache-failure-bulk',
+      payload: {
+        ...request.payload,
+        taskId: 'cache-failure-bulk-task',
+        priority: 'bulk' as const,
+      },
+    }, 17);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    const urgent = handler({
+      ...request,
+      id: 'cache-failure-urgent',
+      payload: { ...request.payload, taskId: 'cache-failure-urgent-task' },
+    }, 17);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+
+    resolveUrgent(response([[['紧急翻译', 'Hello.']]]));
+    await expect(urgent).resolves.toMatchObject({
+      ok: true,
+      value: { payload: { status: 'success', translations: [{ text: '紧急翻译' }] } },
+    });
+    resolveBulk(response([[['批量翻译', 'Hello.']]]));
+    await expect(bulk).resolves.toMatchObject({
+      ok: true,
+      value: { payload: { status: 'success' } },
+    });
+    await cache.flush();
+
+    expect(putCount).toBe(1);
+    expect(records.size).toBe(0);
+  });
+
+  it('keeps urgent cache ownership across Netflix tabs sharing the same cache key', async () => {
+    let resolveBulk = (_response: Response): void => undefined;
+    let resolveUrgent = (_response: Response): void => undefined;
+    const bulkResponse = new Promise<Response>((resolve) => { resolveBulk = resolve; });
+    const urgentResponse = new Promise<Response>((resolve) => { resolveUrgent = resolve; });
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockReturnValueOnce(bulkResponse)
+      .mockReturnValueOnce(urgentResponse);
+    const store = new MemoryTranslationCacheStore();
+    const cache = new TranslationCache({ store, debounceMs: 0 });
+    const handler = createBackgroundTranslationHandler({
+      fetch,
+      readSettings: vi.fn().mockResolvedValue({ provider: 'google-free' }),
+      googleOptions: { minStartIntervalMs: 0, maxAttempts: 1 },
+      cache,
+    });
+    const bulk = handler({
+      ...request,
+      id: 'cross-tab-bulk',
+      payload: { ...request.payload, taskId: 'cross-tab-bulk-task', priority: 'bulk' },
+    }, 17);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    const urgent = handler({
+      ...request,
+      id: 'cross-tab-urgent',
+      payload: { ...request.payload, taskId: 'cross-tab-urgent-task' },
+    }, 18);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+
+    resolveUrgent(response([[['跨标签紧急翻译', 'Hello.']]]));
+    await urgent;
+    resolveBulk(response([[['跨标签批量翻译', 'Hello.']]]));
+    await bulk;
+    await cache.flush();
+
+    expect(store.records).toHaveLength(1);
+    expect(store.records[0]?.text).toBe('跨标签紧急翻译');
+  });
+
+  it('releases an urgent cache claim when the urgent provider request fails', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(response({}, 503))
+      .mockResolvedValueOnce(response([[['批量恢复翻译', 'Hello.']]]));
+    const store = new MemoryTranslationCacheStore();
+    const cache = new TranslationCache({ store, debounceMs: 0 });
+    const handler = createBackgroundTranslationHandler({
+      fetch,
+      readSettings: vi.fn().mockResolvedValue({ provider: 'google-free' }),
+      googleOptions: { minStartIntervalMs: 0, maxAttempts: 1 },
+      cache,
+    });
+
+    await expect(handler({
+      ...request,
+      id: 'failed-urgent',
+      payload: { ...request.payload, taskId: 'failed-urgent-task' },
+    }, 17)).resolves.toMatchObject({
+      ok: true,
+      value: { payload: { status: 'error', errorCode: 'provider_unavailable' } },
+    });
+    await expect(handler({
+      ...request,
+      id: 'recovery-bulk',
+      payload: { ...request.payload, taskId: 'recovery-bulk-task', priority: 'bulk' },
+    }, 17)).resolves.toMatchObject({
+      ok: true,
+      value: { payload: { status: 'success' } },
+    });
+    await cache.flush();
+
+    expect(store.records).toHaveLength(1);
+    expect(store.records[0]?.text).toBe('批量恢复翻译');
+  });
+
+  it('commits an earlier bulk result after overlapping urgent work later fails', async () => {
+    let resolveBulk = (_response: Response): void => undefined;
+    let resolveUrgent = (_response: Response): void => undefined;
+    const bulkResponse = new Promise<Response>((resolve) => { resolveBulk = resolve; });
+    const urgentResponse = new Promise<Response>((resolve) => { resolveUrgent = resolve; });
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockReturnValueOnce(bulkResponse)
+      .mockReturnValueOnce(urgentResponse);
+    const store = new MemoryTranslationCacheStore();
+    const cache = new TranslationCache({ store, debounceMs: 0 });
+    const handler = createBackgroundTranslationHandler({
+      fetch,
+      readSettings: vi.fn().mockResolvedValue({ provider: 'google-free' }),
+      googleOptions: { minStartIntervalMs: 0, maxAttempts: 1 },
+      cache,
+    });
+    let bulkSettled = false;
+    const bulk = handler({
+      ...request,
+      id: 'bulk-before-urgent-failure',
+      payload: {
+        ...request.payload,
+        taskId: 'bulk-before-urgent-failure-task',
+        priority: 'bulk' as const,
+      },
+    }, 17).then((result) => {
+      bulkSettled = true;
+      return result;
+    });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    const urgent = handler({
+      ...request,
+      id: 'later-urgent-failure',
+      payload: { ...request.payload, taskId: 'later-urgent-failure-task' },
+    }, 17);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+
+    resolveBulk(response([[['可回退的批量翻译', 'Hello.']]]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(bulkSettled).toBe(false);
+
+    resolveUrgent(response({}, 503));
+    await expect(urgent).resolves.toMatchObject({
+      ok: true,
+      value: { payload: { status: 'error', errorCode: 'provider_unavailable' } },
+    });
+    await expect(bulk).resolves.toMatchObject({
+      ok: true,
+      value: { payload: { status: 'success' } },
+    });
+    await cache.flush();
+
+    expect(store.records).toHaveLength(1);
+    expect(store.records[0]?.text).toBe('可回退的批量翻译');
+  });
+
+  it('discards an earlier bulk result after overlapping urgent work later succeeds', async () => {
+    let resolveBulk = (_response: Response): void => undefined;
+    let resolveUrgent = (_response: Response): void => undefined;
+    const bulkResponse = new Promise<Response>((resolve) => { resolveBulk = resolve; });
+    const urgentResponse = new Promise<Response>((resolve) => { resolveUrgent = resolve; });
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockReturnValueOnce(bulkResponse)
+      .mockReturnValueOnce(urgentResponse);
+    const store = new MemoryTranslationCacheStore();
+    const cache = new TranslationCache({ store, debounceMs: 0 });
+    const handler = createBackgroundTranslationHandler({
+      fetch,
+      readSettings: vi.fn().mockResolvedValue({ provider: 'google-free' }),
+      googleOptions: { minStartIntervalMs: 0, maxAttempts: 1 },
+      cache,
+    });
+    let bulkSettled = false;
+    const bulk = handler({
+      ...request,
+      id: 'bulk-before-urgent-success',
+      payload: {
+        ...request.payload,
+        taskId: 'bulk-before-urgent-success-task',
+        priority: 'bulk' as const,
+      },
+    }, 17).then((result) => {
+      bulkSettled = true;
+      return result;
+    });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    const urgent = handler({
+      ...request,
+      id: 'later-urgent-success',
+      payload: { ...request.payload, taskId: 'later-urgent-success-task' },
+    }, 17);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+
+    resolveBulk(response([[['应被丢弃的批量翻译', 'Hello.']]]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(bulkSettled).toBe(false);
+
+    resolveUrgent(response([[['最终紧急翻译', 'Hello.']]]));
+    await Promise.all([bulk, urgent]);
+    await cache.flush();
+
+    expect(store.records).toHaveLength(1);
+    expect(store.records[0]?.text).toBe('最终紧急翻译');
+  });
+
   it('treats a cache read failure as a miss and still returns a valid translation', async () => {
     const failingStore: TranslationCacheStore = {
       get: vi.fn().mockRejectedValue(new Error('private cache failure')),

@@ -109,25 +109,35 @@ describe('Netflix catalog policy', () => {
     expect(state.catalog.tracks.map(({ trackId }) => trackId)).toContain('zh-main');
   });
 
-  it('never unlocks when an authoritative catalog includes Simplified Chinese or lacks English', () => {
-    for (const tracks of [
-      [{ trackId: 'zh', languageTag: 'zh-Hans' }],
-      [
+  it('unlocks an authoritative English catalog even when Simplified Chinese is available', () => {
+    const initial = createNetflixAdapterState({
+      contentId: 'episode-1',
+      mountId: 'player-a',
+    });
+    const state = apply(initial, currentEvent(initial, {
+      type: 'catalog-observed',
+      authority: 'authoritative',
+      tracks: [
         { trackId: 'en', languageTag: 'en' },
         { trackId: 'zh', languageTag: 'zh-SG' },
       ],
-    ]) {
-      const initial = createNetflixAdapterState({
-        contentId: 'episode-1',
-        mountId: 'player-a',
-      });
-      const state = apply(initial, currentEvent(initial, {
-        type: 'catalog-observed',
-        authority: 'authoritative',
-        tracks,
-      }));
-      expect(state.externalTranslationAllowed).toBe(false);
-    }
+    }));
+
+    expect(state.externalTranslationAllowed).toBe(true);
+  });
+
+  it('never unlocks an authoritative catalog that lacks English', () => {
+    const initial = createNetflixAdapterState({
+      contentId: 'episode-1',
+      mountId: 'player-a',
+    });
+    const state = apply(initial, currentEvent(initial, {
+      type: 'catalog-observed',
+      authority: 'authoritative',
+      tracks: [{ trackId: 'zh', languageTag: 'zh-Hans' }],
+    }));
+
+    expect(state.externalTranslationAllowed).toBe(false);
   });
 });
 
@@ -164,7 +174,7 @@ describe('Netflix track lifecycle and scheduling scope', () => {
       type: 'track-observed',
       track: { trackId: 'zh-main', languageTag: 'zh-CN' },
     }));
-    expect(state.schedulingScope).toBe('none');
+    expect(state.schedulingScope).toBe('urgent-window');
 
     state = apply(state, currentEvent(state, {
       type: 'track-activity-changed',

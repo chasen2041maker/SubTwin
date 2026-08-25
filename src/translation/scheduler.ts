@@ -43,6 +43,7 @@ export interface TranslationSchedulerOptions {
   readonly maxUrgentQueue?: number;
   readonly maxBulkQueue?: number;
   readonly retryLimit?: number;
+  readonly rateLimitCooldownMs?: number;
 }
 
 export type SchedulerEnqueueResult =
@@ -71,14 +72,20 @@ export class TranslationScheduler {
   readonly #maxUrgentQueue: number;
   readonly #maxBulkQueue: number;
   readonly #retryLimit: number;
+  readonly #rateLimitCooldownMs: number;
   #generation: SchedulerGeneration;
   #urgentQueue: InternalTask[] = [];
   #bulkQueue: InternalTask[] = [];
   readonly #pending = new Map<string, InternalTask>();
   readonly #inFlight = new Map<number, InFlightTask>();
+  readonly #parkedBulk = new Map<number, InFlightTask>();
   readonly #completed = new Set<string>();
+  readonly #supersededBulkCues = new Set<string>();
+  readonly #urgentDecisionWaiters = new Map<string, Set<() => void>>();
   #nextRunId = 0;
   #pumpScheduled = false;
+  #cooldownUntil = 0;
+  #cooldownTimer: ReturnType<typeof setTimeout> | undefined;
   #disposed = false;
   #idleWaiters: Array<() => void> = [];
 
@@ -96,6 +103,11 @@ export class TranslationScheduler {
     this.#maxUrgentQueue = clamp(options.maxUrgentQueue ?? 100, 1, 1_000);
     this.#maxBulkQueue = clamp(options.maxBulkQueue ?? 500, 1, 5_000);
     this.#retryLimit = clamp(options.retryLimit ?? 1, 0, 3);
+    this.#rateLimitCooldownMs = clamp(
+      options.rateLimitCooldownMs ?? 30_000,
+      1,
+      5 * 60_000,
+    );
   }
 
   enqueue(task: ScheduledTranslationTask): SchedulerEnqueueResult {
@@ -108,12 +120,9 @@ export class TranslationScheduler {
       if (this.#completed.has(key)) return false;
       if (this.#isQueued(key, 'urgent')) return false;
       if (this.#isInFlight(key, 'urgent')) return false;
-      // Urgent work can still promote a cue out of a queued bulk task, but an
-      // already in-flight bulk request owns that cue until it settles. Sending
-      // the same subtitle twice creates duplicate provider charges and lets a
-      // late bulk response overwrite the urgent result/cache.
-      if (this.#isInFlight(key, 'bulk')) return false;
-      return task.priority === 'urgent' || !this.#isQueued(key, 'bulk');
+      return task.priority === 'urgent' || (
+        !this.#isQueued(key, 'bulk') && !this.#isInFlight(key, 'bulk')
+      );
     });
     if (cues.length === 0) return 'deduplicated';
 
@@ -124,6 +133,12 @@ export class TranslationScheduler {
     if (queue.length >= limit) return 'rejected';
 
     const effectiveTask = cues.length === task.cues.length ? task : { ...task, cues };
+    if (task.priority === 'urgent') {
+      for (const cue of cues) {
+        const key = cueIdentity(effectiveTask, cue);
+        if (this.#isInFlight(key, 'bulk')) this.#supersededBulkCues.add(key);
+      }
+    }
     const promoted = task.priority === 'urgent'
       ? this.#removeQueuedBulkCues(effectiveTask, cues)
       : false;
@@ -146,7 +161,12 @@ export class TranslationScheduler {
     this.#bulkQueue = [];
     this.#pending.clear();
     this.#completed.clear();
+    this.#supersededBulkCues.clear();
+    this.#resolveAllUrgentDecisionWaiters();
+    this.#clearCooldown();
     for (const inFlight of this.#inFlight.values()) inFlight.controller.abort();
+    for (const parked of this.#parkedBulk.values()) parked.controller.abort();
+    this.#parkedBulk.clear();
     this.#resolveIdleIfNeeded();
   }
 
@@ -157,7 +177,12 @@ export class TranslationScheduler {
     this.#bulkQueue = [];
     this.#pending.clear();
     this.#completed.clear();
+    this.#supersededBulkCues.clear();
+    this.#resolveAllUrgentDecisionWaiters();
+    this.#clearCooldown();
     for (const inFlight of this.#inFlight.values()) inFlight.controller.abort();
+    for (const parked of this.#parkedBulk.values()) parked.controller.abort();
+    this.#parkedBulk.clear();
     this.#resolveIdleIfNeeded();
   }
 
@@ -168,7 +193,7 @@ export class TranslationScheduler {
   } {
     return {
       bulkQueued: this.#bulkQueue.length,
-      inFlight: this.#inFlight.size,
+      inFlight: this.#inFlight.size + this.#parkedBulk.size,
       urgentQueued: this.#urgentQueue.length,
     };
   }
@@ -188,7 +213,16 @@ export class TranslationScheduler {
   }
 
   #pump(): void {
-    if (this.#disposed) return;
+    if (this.#disposed) {
+      this.#resolveIdleIfNeeded();
+      return;
+    }
+    if (Date.now() < this.#cooldownUntil) {
+      this.#scheduleCooldownWake();
+      this.#resolveIdleIfNeeded();
+      return;
+    }
+    this.#cooldownUntil = 0;
     while (this.#inFlight.size < this.#maxConcurrent) {
       const next = this.#takeNext();
       if (!next) break;
@@ -221,58 +255,149 @@ export class TranslationScheduler {
       if (!this.#isCurrent(inFlight)) return;
 
       if (!result.ok) {
+        this.#releaseFailedUrgentCues(inFlight.task, inFlight.task.cues);
+        if (result.error.code === 'rate_limited') {
+          this.#cooldownUntil = Math.max(
+            this.#cooldownUntil,
+            Date.now() + this.#rateLimitCooldownMs,
+          );
+        }
         if (!result.error.retryable) {
-          this.#markCompleted(inFlight.task, inFlight.task.cues);
+          this.#markCompleted(inFlight.task, this.#ownedCues(inFlight.task));
         }
         return;
       }
 
       if (!isRelevantBatch(inFlight.task, result.value)) {
-        this.#markCompleted(inFlight.task, inFlight.task.cues);
+        this.#releaseFailedUrgentCues(inFlight.task, inFlight.task.cues);
+        this.#markCompleted(inFlight.task, this.#ownedCues(inFlight.task));
         return;
       }
 
-      const accepted: TranslationBatch = {
-        translations: result.value.translations,
-        retryCueIds: [],
-      };
-      if (accepted.translations.length > 0) {
-        try {
-          await this.#writeCache(inFlight.task, accepted, {
-            signal: inFlight.controller.signal,
-            isCurrent: () => this.#isCurrent(inFlight),
-          });
-        } catch {
-          // Persistence is best-effort; a current valid result still renders.
-        }
-        if (!this.#isCurrent(inFlight)) return;
-        this.#render(inFlight.task, accepted);
-      }
+      const initiallyOwned = this.#ownedCues(inFlight.task, inFlight.task.cues);
+      const initiallyOwnedIds = new Set(initiallyOwned.map(({ id }) => id));
+      let deferredCues: readonly TranslationCueInput[] = inFlight.task.cues.filter(
+        ({ id }) => !initiallyOwnedIds.has(id),
+      );
+      deferredCues = uniqueCueList([
+        ...deferredCues,
+        ...await this.#settleBatchCues(inFlight, result.value, initiallyOwned),
+      ]);
 
-      const retryCues = selectRetryCues(
-        inFlight.task.cues,
-        result.value.retryCueIds,
-      );
-      const retryIds = new Set(retryCues.map(({ id }) => id));
-      this.#markCompleted(
-        inFlight.task,
-        inFlight.task.cues.filter(({ id }) => !retryIds.has(id)),
-      );
-      if (retryCues.length > 0 && inFlight.attempt < this.#retryLimit) {
-        this.#queuePartialRetry(inFlight, retryCues);
-      } else {
-        this.#markCompleted(inFlight.task, retryCues);
+      while (inFlight.task.priority === 'bulk' && deferredCues.length > 0) {
+        const waiting = deferredCues.filter((cue) =>
+          this.#hasPendingUrgentDecision(inFlight.task, cue));
+        if (waiting.length > 0) {
+          this.#parkBulkRun(inFlight);
+          await this.#waitForUrgentDecisions(inFlight, waiting);
+          if (!this.#isCurrent(inFlight)) return;
+        }
+
+        const released = this.#ownedCues(inFlight.task, deferredCues);
+        if (released.length === 0) break;
+        deferredCues = uniqueCueList(
+          await this.#settleBatchCues(inFlight, result.value, released),
+        );
       }
     } catch {
+      this.#releaseFailedUrgentCues(inFlight.task, inFlight.task.cues);
       // Provider and cache failures are contained. The scheduler never owns an
       // additional provider-level retry; only validated partial cues requeue.
     } finally {
       if (this.#inFlight.get(inFlight.runId) === inFlight) {
         this.#inFlight.delete(inFlight.runId);
       }
+      if (this.#parkedBulk.get(inFlight.runId) === inFlight) {
+        this.#parkedBulk.delete(inFlight.runId);
+      }
+      if (inFlight.task.priority === 'urgent') {
+        for (const cue of inFlight.task.cues) {
+          const key = cueIdentity(inFlight.task, cue);
+          if (!this.#isQueued(key, 'urgent') && !this.#isInFlight(key, 'urgent')) {
+            this.#notifyUrgentDecision(inFlight.task, [cue]);
+          }
+        }
+      }
+      if (inFlight.task.priority === 'bulk') {
+        for (const cue of inFlight.task.cues) {
+          this.#supersededBulkCues.delete(cueIdentity(inFlight.task, cue));
+        }
+      }
       this.#schedulePump();
       this.#resolveIdleIfNeeded();
     }
+  }
+
+  async #settleBatchCues(
+    inFlight: InFlightTask,
+    batch: TranslationBatch,
+    candidates: readonly TranslationCueInput[],
+  ): Promise<readonly TranslationCueInput[]> {
+    if (candidates.length === 0 || !this.#isCurrent(inFlight)) return [];
+    const ownedCues = this.#ownedCues(inFlight.task, candidates);
+    const ownedIds = new Set(ownedCues.map(({ id }) => id));
+    const accepted: TranslationBatch = {
+      translations: batch.translations.filter(({ cueId }) => ownedIds.has(cueId)),
+      retryCueIds: [],
+    };
+
+    if (accepted.translations.length > 0) {
+      try {
+        await this.#writeCache(inFlight.task, accepted, {
+          signal: inFlight.controller.signal,
+          isCurrent: () => {
+            if (!this.#isCurrent(inFlight)) return false;
+            const currentOwnedIds = new Set(
+              this.#ownedCues(inFlight.task, ownedCues).map(({ id }) => id),
+            );
+            return accepted.translations.every(
+              ({ cueId }) => currentOwnedIds.has(cueId),
+            );
+          },
+        });
+      } catch {
+        // Persistence is best-effort; a current valid result still renders.
+      }
+      if (!this.#isCurrent(inFlight)) return [];
+      const currentOwnedIds = new Set(
+        this.#ownedCues(inFlight.task, ownedCues).map(({ id }) => id),
+      );
+      const currentAccepted: TranslationBatch = {
+        translations: accepted.translations.filter(
+          ({ cueId }) => currentOwnedIds.has(cueId),
+        ),
+        retryCueIds: [],
+      };
+      if (currentAccepted.translations.length > 0) {
+        this.#render(inFlight.task, currentAccepted);
+        if (inFlight.task.priority === 'urgent') {
+          const successfulIds = new Set(
+            currentAccepted.translations.map(({ cueId }) => cueId),
+          );
+          this.#notifyUrgentDecision(
+            inFlight.task,
+            ownedCues.filter(({ id }) => successfulIds.has(id)),
+          );
+        }
+      }
+    }
+
+    const settledOwnedCues = this.#ownedCues(inFlight.task, ownedCues);
+    const retryCues = selectRetryCues(settledOwnedCues, batch.retryCueIds);
+    const retryIds = new Set(retryCues.map(({ id }) => id));
+    this.#markCompleted(
+      inFlight.task,
+      settledOwnedCues.filter(({ id }) => !retryIds.has(id)),
+    );
+    if (retryCues.length > 0 && inFlight.attempt < this.#retryLimit) {
+      this.#queuePartialRetry(inFlight, retryCues);
+    } else {
+      this.#releaseFailedUrgentCues(inFlight.task, retryCues);
+      this.#markCompleted(inFlight.task, retryCues);
+    }
+
+    const settledIds = new Set(settledOwnedCues.map(({ id }) => id));
+    return candidates.filter(({ id }) => !settledIds.has(id));
   }
 
   #queuePartialRetry(
@@ -295,6 +420,25 @@ export class TranslationScheduler {
     this.#pending.set(retry.baseKey, retry);
   }
 
+  #scheduleCooldownWake(): void {
+    if (
+      this.#cooldownTimer !== undefined ||
+      (this.#urgentQueue.length === 0 && this.#bulkQueue.length === 0)
+    ) return;
+    const delay = Math.max(0, this.#cooldownUntil - Date.now());
+    this.#cooldownTimer = setTimeout(() => {
+      this.#cooldownTimer = undefined;
+      this.#schedulePump();
+    }, delay);
+  }
+
+  #clearCooldown(): void {
+    this.#cooldownUntil = 0;
+    if (this.#cooldownTimer === undefined) return;
+    clearTimeout(this.#cooldownTimer);
+    this.#cooldownTimer = undefined;
+  }
+
   #isQueued(cueKey: string, priority: TranslationPriority): boolean {
     const queue = priority === 'urgent' ? this.#urgentQueue : this.#bulkQueue;
     return queue.some(({ task }) => task.cues.some(
@@ -303,7 +447,10 @@ export class TranslationScheduler {
   }
 
   #isInFlight(cueKey: string, priority: TranslationPriority): boolean {
-    return [...this.#inFlight.values()].some(({ task }) => (
+    return [
+      ...this.#inFlight.values(),
+      ...this.#parkedBulk.values(),
+    ].some(({ task }) => (
       task.priority === priority && task.cues.some(
         (cue) => cueIdentity(task, cue) === cueKey,
       )
@@ -365,6 +512,82 @@ export class TranslationScheduler {
     for (const cue of cues) this.#completed.add(cueIdentity(task, cue));
   }
 
+  #ownedCues(
+    task: ScheduledTranslationTask,
+    cues: readonly TranslationCueInput[] = task.cues,
+  ): readonly TranslationCueInput[] {
+    if (task.priority !== 'bulk') return cues;
+    return cues.filter(
+      (cue) => !this.#supersededBulkCues.has(cueIdentity(task, cue)),
+    );
+  }
+
+  #releaseFailedUrgentCues(
+    task: ScheduledTranslationTask,
+    cues: readonly TranslationCueInput[],
+  ): void {
+    if (task.priority !== 'urgent') return;
+    for (const cue of cues) {
+      this.#supersededBulkCues.delete(cueIdentity(task, cue));
+    }
+    this.#notifyUrgentDecision(task, cues);
+  }
+
+  #hasPendingUrgentDecision(
+    task: ScheduledTranslationTask,
+    cue: TranslationCueInput,
+  ): boolean {
+    const key = cueIdentity(task, cue);
+    return this.#supersededBulkCues.has(key) && (
+      this.#isQueued(key, 'urgent') || this.#isInFlight(key, 'urgent')
+    );
+  }
+
+  #parkBulkRun(inFlight: InFlightTask): void {
+    if (this.#inFlight.get(inFlight.runId) !== inFlight) return;
+    this.#inFlight.delete(inFlight.runId);
+    this.#parkedBulk.set(inFlight.runId, inFlight);
+    this.#schedulePump();
+  }
+
+  async #waitForUrgentDecisions(
+    inFlight: InFlightTask,
+    cues: readonly TranslationCueInput[],
+  ): Promise<void> {
+    const waits: Promise<void>[] = [];
+    for (const cue of cues) {
+      const key = cueIdentity(inFlight.task, cue);
+      if (!this.#hasPendingUrgentDecision(inFlight.task, cue)) continue;
+      waits.push(new Promise<void>((resolve) => {
+        const waiters = this.#urgentDecisionWaiters.get(key) ?? new Set();
+        waiters.add(resolve);
+        this.#urgentDecisionWaiters.set(key, waiters);
+      }));
+    }
+    if (waits.length > 0) await Promise.all(waits);
+  }
+
+  #notifyUrgentDecision(
+    task: ScheduledTranslationTask,
+    cues: readonly TranslationCueInput[],
+  ): void {
+    for (const cue of cues) {
+      const key = cueIdentity(task, cue);
+      const waiters = this.#urgentDecisionWaiters.get(key);
+      if (waiters === undefined) continue;
+      this.#urgentDecisionWaiters.delete(key);
+      for (const resolve of waiters) resolve();
+    }
+  }
+
+  #resolveAllUrgentDecisionWaiters(): void {
+    const waiting = [...this.#urgentDecisionWaiters.values()];
+    this.#urgentDecisionWaiters.clear();
+    for (const waiters of waiting) {
+      for (const resolve of waiters) resolve();
+    }
+  }
+
   #matchesGeneration(task: ScheduledTranslationTask): boolean {
     return (
       task.episodeGeneration === this.#generation.episodeGeneration &&
@@ -377,7 +600,10 @@ export class TranslationScheduler {
       !this.#disposed &&
       !inFlight.controller.signal.aborted &&
       this.#matchesGeneration(inFlight.task) &&
-      this.#inFlight.get(inFlight.runId) === inFlight
+      (
+        this.#inFlight.get(inFlight.runId) === inFlight ||
+        this.#parkedBulk.get(inFlight.runId) === inFlight
+      )
     );
   }
 
@@ -386,6 +612,7 @@ export class TranslationScheduler {
       this.#urgentQueue.length === 0 &&
       this.#bulkQueue.length === 0 &&
       this.#inFlight.size === 0 &&
+      this.#parkedBulk.size === 0 &&
       !this.#pumpScheduled
     );
   }
@@ -472,6 +699,17 @@ function uniqueCues(
     const key = cueIdentity(task, cue);
     if (seen.has(key)) return false;
     seen.add(key);
+    return true;
+  });
+}
+
+function uniqueCueList(
+  cues: readonly TranslationCueInput[],
+): readonly TranslationCueInput[] {
+  const seen = new Set<string>();
+  return cues.filter(({ id }) => {
+    if (seen.has(id)) return false;
+    seen.add(id);
     return true;
   });
 }

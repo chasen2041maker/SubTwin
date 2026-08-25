@@ -4,10 +4,16 @@ import type {
   NetflixTimedTextPayload,
 } from './bridge';
 import {
+  areEquivalentNetflixCatalogTimedTextResources,
+  canonicalizeNetflixCatalogTimedTextResource,
   canonicalizeNetflixTimedTextResource,
+  canonicalizeNetflixUnboundOcaTimedTextResource,
+  extractNetflixTimedTextEmbeddedLanguage,
   sniffTimedText,
+  type NetflixObservedTimedTextPayload,
 } from './probe';
 import { err, ok, type AppError, type Result } from '../shared/result';
+import { canonicalizeNetflixLogicalTrackId } from './track-identity';
 
 export const MAX_NETFLIX_CATALOG_TRACKS = 256;
 export const MAX_NETFLIX_TIMED_TEXT_DOWNLOAD_BYTES = 10 * 1024 * 1024;
@@ -18,6 +24,8 @@ const MAX_CONTAINER_ENTRIES = 512;
 const MAX_DOWNLOAD_NODES = 256;
 const MAX_DOWNLOAD_DEPTH = 6;
 const MAX_URL_CANDIDATES = 64;
+const MAX_RETAINED_TRACKS_PER_CATEGORY = 8;
+const MAX_RETAINED_RESOURCES_PER_TRACK = 3;
 
 const TRACK_ARRAY_KEYS = new Set([
   'timedtexttracks',
@@ -31,9 +39,9 @@ const LANGUAGE_FIELDS = [
   'bcp47Tag',
 ] as const;
 const TRACK_ID_FIELDS = [
+  'new_track_id',
   'trackId',
   'id',
-  'new_track_id',
   'downloadableId',
 ] as const;
 const KIND_FIELDS = ['kind', 'trackType', 'rawTrackType', 'type'] as const;
@@ -61,6 +69,29 @@ export interface NetflixCatalogDownloadResource {
   readonly trackId: string;
   readonly language: string;
   readonly kind: NetflixCatalogTrackDescriptor['kind'];
+  /** Hashed MAIN-world profile discriminator for opaque OCA root URLs. */
+  readonly variantId?: string;
+}
+
+export function bindNetflixCatalogDownloadResource(
+  resource: NetflixCatalogDownloadResource,
+  track: NetflixCatalogTrackDescriptor,
+): NetflixCatalogDownloadResource | null {
+  const identity = canonicalizeNetflixCatalogTimedTextResource(resource.url, {
+    titleId: resource.titleId,
+    trackId: track.id,
+    ...(resource.variantId === undefined
+      ? {}
+      : { variantId: resource.variantId }),
+  });
+  if (!identity.ok) return null;
+  return {
+    ...resource,
+    resourceId: identity.value.resourceId,
+    trackId: track.id,
+    language: track.language,
+    kind: track.kind,
+  };
 }
 
 export type NetflixCatalogDownloadErrorCode =
@@ -116,6 +147,19 @@ type ResourceCategory = 'english' | 'simplified-chinese';
 interface ResourceCandidate extends NetflixCatalogDownloadResource {
   readonly category: ResourceCategory;
   readonly order: number;
+  readonly profileRank: number;
+  readonly profileVariantId: string;
+}
+
+interface DownloadUrlCandidate {
+  readonly url: string;
+  readonly profileRank: number;
+  readonly profileVariantId: string;
+}
+
+interface DownloadProfile {
+  readonly rank: number;
+  readonly variantId: string;
 }
 
 type CandidateResult =
@@ -158,12 +202,23 @@ export function extractNetflixCatalogDownloadResources(
 
   candidates.sort(compareResourceCandidates);
   const selected = new Map<string, NetflixCatalogDownloadResource>();
+  const selectedTrackKeys = new Set<string>();
+  const selectedCategoryTrackCounts = new Map<string, number>();
+  const selectedResourceCounts = new Map<string, number>();
   for (const candidate of candidates) {
-    // Keep one deterministic downloadable resource for every Netflix track.
-    // English subtitles and English CC are separate tracks and must both reach
-    // the isolated world so the native on-screen text can identify which one
-    // the viewer actually selected.
-    const key = `${candidate.titleId}\u001f${candidate.trackId}`;
+    // Track cardinality remains bounded independently of the bounded profile
+    // alternatives retained for a selected track.
+    const trackKey = `${candidate.titleId}\u001f${candidate.category}\u001f${candidate.trackId}`;
+    const categoryKey = `${candidate.titleId}\u001f${candidate.category}`;
+    if (!selectedTrackKeys.has(trackKey)) {
+      const selectedTrackCount = selectedCategoryTrackCounts.get(categoryKey) ?? 0;
+      if (selectedTrackCount >= MAX_RETAINED_TRACKS_PER_CATEGORY) continue;
+      selectedTrackKeys.add(trackKey);
+      selectedCategoryTrackCounts.set(categoryKey, selectedTrackCount + 1);
+    }
+    const selectedResourceCount = selectedResourceCounts.get(trackKey) ?? 0;
+    if (selectedResourceCount >= MAX_RETAINED_RESOURCES_PER_TRACK) continue;
+    const key = `${trackKey}\u001f${candidate.profileVariantId}`;
     if (selected.has(key)) continue;
     selected.set(key, {
       url: candidate.url,
@@ -172,7 +227,11 @@ export function extractNetflixCatalogDownloadResources(
       trackId: candidate.trackId,
       language: candidate.language,
       kind: candidate.kind,
+      ...(candidate.variantId === undefined
+        ? {}
+        : { variantId: candidate.variantId }),
     });
+    selectedResourceCounts.set(trackKey, selectedResourceCount + 1);
   }
 
   return ok([...selected.values()]);
@@ -218,7 +277,7 @@ export async function downloadNetflixTimedText(
     return catalogDownloadError('netflix_timed_text_aborted');
   }
 
-  const prepared = prepareResponse(response, maxBytes);
+  const prepared = prepareResponse(response, resource, maxBytes);
   if (!prepared.ok) return prepared;
 
   const bytes = await readBoundedResponse(response, maxBytes, signal);
@@ -371,13 +430,18 @@ function extractTrackResources(
   const urls = findDownloadUrls(value);
   if (!urls.ok) return { kind: 'invalid' };
   const resources: ResourceCandidate[] = [];
-  const seen = new Set<string>();
-  for (const url of urls.value) {
-    const identity = canonicalizeNetflixTimedTextResource(url);
-    if (!identity.ok || seen.has(identity.value.resourceId)) continue;
-    seen.add(identity.value.resourceId);
+  const seenProfiles = new Set<string>();
+  for (const candidate of urls.value) {
+    const identity = canonicalizeNetflixCatalogTimedTextResource(candidate.url, {
+      titleId,
+      trackId,
+      variantId: candidate.profileVariantId,
+    });
+    if (!identity.ok || seenProfiles.has(candidate.profileVariantId)) continue;
+    seenProfiles.add(candidate.profileVariantId);
+    const strictIdentity = canonicalizeNetflixTimedTextResource(candidate.url);
     resources.push({
-      url,
+      url: candidate.url,
       titleId,
       resourceId: identity.value.resourceId,
       trackId,
@@ -385,6 +449,11 @@ function extractTrackResources(
       kind,
       category: language.category,
       order,
+      profileRank: candidate.profileRank,
+      profileVariantId: candidate.profileVariantId,
+      ...(strictIdentity.ok
+        ? {}
+        : { variantId: candidate.profileVariantId }),
     });
   }
   return resources.length === 0
@@ -472,32 +541,72 @@ function readTrackKind(
 function readSafeTrackId(value: Readonly<Record<string, unknown>>): string | null {
   for (const field of TRACK_ID_FIELDS) {
     if (!Object.hasOwn(value, field)) continue;
-    const raw = value[field];
-    if (typeof raw === 'string') {
-      const candidate = raw.trim();
-      if (isOpaqueId(candidate)) return candidate;
-    } else if (
-      typeof raw === 'number' &&
-      Number.isSafeInteger(raw) &&
-      raw >= 0
-    ) {
-      return String(raw);
-    }
+    const candidate = canonicalizeNetflixLogicalTrackId(value[field]);
+    if (candidate !== null) return candidate;
   }
   return null;
 }
 
+/** Re-fetches an OCA root resource discovered in MAIN-world performance
+ * entries. It is accepted only when the body is bounded TTML with one root
+ * xml:lang marker; the signed URL never leaves this call path. */
+export async function downloadNetflixEmbeddedLanguageTimedText(
+  fetcher: NetflixTimedTextFetch,
+  url: string,
+  options: NetflixTimedTextDownloadOptions = {},
+): Promise<Result<NetflixObservedTimedTextPayload, NetflixCatalogDownloadError>> {
+  const identity = canonicalizeNetflixUnboundOcaTimedTextResource(url);
+  if (!identity.ok) {
+    return catalogDownloadError('netflix_timed_text_resource_invalid');
+  }
+  const boundIdentity = canonicalizeNetflixCatalogTimedTextResource(url, {
+    titleId: 'performance',
+    trackId: 'performance',
+  });
+  if (!boundIdentity.ok) {
+    return catalogDownloadError('netflix_timed_text_resource_invalid');
+  }
+  const downloaded = await downloadNetflixTimedText(fetcher, {
+    url,
+    titleId: 'performance',
+    resourceId: boundIdentity.value.resourceId,
+    trackId: 'performance',
+    language: 'en',
+    kind: 'subtitle',
+  }, options);
+  if (!downloaded.ok) return downloaded;
+  const language = extractNetflixTimedTextEmbeddedLanguage(
+    downloaded.value.body,
+    downloaded.value.format,
+  );
+  if (language === null) {
+    return catalogDownloadError('netflix_timed_text_invalid_body');
+  }
+  return ok({
+    type: 'timed-text',
+    resourceId: identity.value.resourceId,
+    trackId: identity.value.trackId,
+    language,
+    format: downloaded.value.format,
+    body: downloaded.value.body,
+  });
+}
+
 function findDownloadUrls(
   track: Readonly<Record<string, unknown>>,
-): Result<readonly string[], NetflixCatalogDownloadError> {
-  const pending: Array<{ readonly value: unknown; readonly depth: number }> = [];
+): Result<readonly DownloadUrlCandidate[], NetflixCatalogDownloadError> {
+  const pending: Array<{
+    readonly value: unknown;
+    readonly depth: number;
+    readonly profile: DownloadProfile | null;
+  }> = [];
   for (const field of DOWNLOAD_ROOT_FIELDS) {
     const root = ownDataValue(track, field);
-    if (root !== undefined) pending.push({ value: root, depth: 0 });
+    if (root !== undefined) pending.push({ value: root, depth: 0, profile: null });
   }
 
-  const urls: string[] = [];
-  const visited = new Set<object>();
+  const urls: DownloadUrlCandidate[] = [];
+  const visited = new WeakMap<object, Set<string>>();
   let inspected = 0;
   while (pending.length > 0) {
     const current = pending.shift();
@@ -505,15 +614,26 @@ function findDownloadUrls(
     if (++inspected > MAX_DOWNLOAD_NODES) {
       return catalogDownloadError('netflix_catalog_metadata_too_large');
     }
-    if (!isObject(current.value) || visited.has(current.value)) continue;
-    visited.add(current.value);
+    if (!isObject(current.value)) continue;
+    const visitKey = current.profile?.variantId ?? 'profile_default';
+    const priorVisits = visited.get(current.value);
+    if (priorVisits?.has(visitKey)) continue;
+    if (priorVisits === undefined) {
+      visited.set(current.value, new Set([visitKey]));
+    } else {
+      priorVisits.add(visitKey);
+    }
 
     if (Array.isArray(current.value)) {
       if (current.value.length > MAX_CONTAINER_ENTRIES) {
         return catalogDownloadError('netflix_catalog_metadata_too_large');
       }
       for (let index = 0; index < current.value.length; index += 1) {
-        pending.push({ value: current.value[index], depth: current.depth + 1 });
+        pending.push({
+          value: current.value[index],
+          depth: current.depth + 1,
+          profile: current.profile,
+        });
       }
       continue;
     }
@@ -527,42 +647,114 @@ function findDownloadUrls(
       if (descriptor === undefined || !('value' in descriptor)) continue;
       const child = descriptor.value as unknown;
       if (DOWNLOAD_URL_KEYS.has(normalizeKey(key))) {
-        collectUrlStrings(child, urls, 0);
+        collectUrlStrings(
+          child,
+          urls,
+          0,
+          current.profile ?? defaultDownloadProfile(),
+        );
         if (urls.length > MAX_URL_CANDIDATES) {
           return catalogDownloadError('netflix_catalog_metadata_too_large');
         }
       } else {
-        pending.push({ value: child, depth: current.depth + 1 });
+        const profile = resolveDownloadProfile(current.profile, key, current.depth);
+        if (profile === 'image') continue;
+        pending.push({
+          value: child,
+          depth: current.depth + 1,
+          profile,
+        });
       }
     }
   }
   return ok(urls);
 }
 
-function collectUrlStrings(value: unknown, output: string[], depth: number): void {
+function collectUrlStrings(
+  value: unknown,
+  output: DownloadUrlCandidate[],
+  depth: number,
+  profile: DownloadProfile,
+): void {
   if (output.length > MAX_URL_CANDIDATES || depth > 3) return;
   if (typeof value === 'string') {
-    output.push(value);
+    output.push({
+      url: value,
+      profileRank: profile.rank,
+      profileVariantId: profile.variantId,
+    });
     return;
   }
   if (!isObject(value)) return;
   if (Array.isArray(value)) {
     for (const child of value.slice(0, MAX_URL_CANDIDATES + 1)) {
-      collectUrlStrings(child, output, depth + 1);
+      collectUrlStrings(child, output, depth + 1, profile);
     }
     return;
   }
   for (const key of Object.keys(value).slice(0, MAX_URL_CANDIDATES + 1)) {
-    if (key.startsWith('https://')) output.push(key);
+    if (key.startsWith('https://')) {
+      output.push({
+        url: key,
+        profileRank: profile.rank,
+        profileVariantId: profile.variantId,
+      });
+    }
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (descriptor !== undefined && 'value' in descriptor) {
-      collectUrlStrings(descriptor.value, output, depth + 1);
+      collectUrlStrings(descriptor.value, output, depth + 1, profile);
     }
   }
 }
 
+function resolveDownloadProfile(
+  current: DownloadProfile | null,
+  key: string,
+  depth: number,
+): DownloadProfile | null | 'image' {
+  const classified = classifyDownloadProfile(key);
+  if (classified === 'image') return classified;
+  if (classified !== null) return classified;
+  return current ?? (depth === 0 ? otherDownloadProfile(key) : null);
+}
+
+function classifyDownloadProfile(key: string): DownloadProfile | null | 'image' {
+  if (key.length === 0 || key.length > 128) return null;
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]+/gu, '-');
+  if (/(?:^|-)(?:cmisc|image|png|jpe?g|webp|bitmap)(?:-|$)/u.test(normalized)) {
+    return 'image';
+  }
+  if (normalized.includes('webvtt') || /(?:^|-)vtt(?:-|$)/u.test(normalized)) {
+    return makeDownloadProfile(normalized, 0);
+  }
+  if (normalized.includes('imsc')) return makeDownloadProfile(normalized, 1);
+  if (normalized.includes('dfxp') || normalized.includes('ttml')) {
+    return makeDownloadProfile(normalized, 2);
+  }
+  return null;
+}
+
+function otherDownloadProfile(key: string): DownloadProfile {
+  const normalized = key.length > 0 && key.length <= 128
+    ? key.toLowerCase().replace(/[^a-z0-9]+/gu, '-')
+    : 'other';
+  return makeDownloadProfile(normalized || 'other', 3);
+}
+
+function defaultDownloadProfile(): DownloadProfile {
+  return makeDownloadProfile('default', 3);
+}
+
+function makeDownloadProfile(normalized: string, rank: number): DownloadProfile {
+  return {
+    rank,
+    variantId: `profile_${hash64(normalized)}`,
+  };
+}
+
 function prepareResponse(
   response: NetflixTimedTextResponseLike,
+  resource: NetflixCatalogDownloadResource,
   maxBytes: number,
 ): Result<
   { readonly contentLength: number | null; readonly contentType: string | null },
@@ -579,10 +771,21 @@ function prepareResponse(
     if (typeof response.headers.get !== 'function') {
       return catalogDownloadError('netflix_timed_text_response_invalid');
     }
+    if (typeof response.url !== 'string' || response.url.length === 0) {
+      return catalogDownloadError('netflix_timed_text_resource_invalid');
+    }
     if (
-      typeof response.url === 'string' &&
-      response.url.length > 0 &&
-      !canonicalizeNetflixTimedTextResource(response.url).ok
+      !areEquivalentNetflixCatalogTimedTextResources(
+        resource.url,
+        response.url,
+        {
+          titleId: resource.titleId,
+          trackId: resource.trackId,
+          ...(resource.variantId === undefined
+            ? {}
+            : { variantId: resource.variantId }),
+        },
+      )
     ) {
       return catalogDownloadError('netflix_timed_text_resource_invalid');
     }
@@ -707,7 +910,13 @@ function isValidDownloadResource(resource: NetflixCatalogDownloadResource): bool
       language.category !== 'simplified-chinese')
   ) return false;
   if (!/^tt_[a-f0-9]{16}$/u.test(resource.resourceId)) return false;
-  const identity = canonicalizeNetflixTimedTextResource(resource.url);
+  const identity = canonicalizeNetflixCatalogTimedTextResource(resource.url, {
+    titleId: resource.titleId,
+    trackId: resource.trackId,
+    ...(resource.variantId === undefined
+      ? {}
+      : { variantId: resource.variantId }),
+  });
   return identity.ok && identity.value.resourceId === resource.resourceId;
 }
 
@@ -721,6 +930,8 @@ function compareResourceCandidates(
   if (category !== 0) return category;
   return (
     compareCodeUnits(left.trackId, right.trackId) ||
+    left.profileRank - right.profileRank ||
+    compareCodeUnits(left.profileVariantId, right.profileVariantId) ||
     compareCodeUnits(left.resourceId, right.resourceId) ||
     compareCodeUnits(left.language, right.language) ||
     compareCodeUnits(left.kind, right.kind) ||

@@ -350,7 +350,12 @@ describe('cross-context message envelopes', () => {
       id: 'settings-update-1',
       source: 'options',
       type: 'settings/options-update',
-      payload: { settings: DEFAULT_SETTINGS, updateEnabled: false },
+      payload: {
+        patch: {
+          provider: 'deepseek',
+          deepseek: { apiKey: 'local-key', model: 'deepseek-v4-pro' },
+        },
+      },
     });
     const publicGet = createMessage({
       id: 'settings-public-1',
@@ -399,13 +404,94 @@ describe('cross-context message envelopes', () => {
     expect(parseMessageEnvelope({
       ...optionsUpdate,
       payload: {
-        settings: { ...DEFAULT_SETTINGS, apiKey: 'unexpected-extra-field' },
+        settings: DEFAULT_SETTINGS,
+        updateEnabled: false,
+      },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({
+      ...optionsUpdate,
+      payload: { patch: {} },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({
+      ...optionsUpdate,
+      payload: {
+        patch: {
+          ...optionsUpdate.payload.patch,
+          apiKey: 'unexpected-extra-field',
+        },
       },
     }).ok).toBe(false);
     expect(parseMessageEnvelope({
       ...safeResult,
       payload: { ...safeResult.payload, apiKey: 'must-not-reach-popup' },
     }).ok).toBe(false);
+  });
+
+  it('accepts only credential-free Netflix page appearance updates', () => {
+    const update = createMessage({
+      id: 'settings-page-update-1',
+      source: 'content',
+      type: 'settings/page-update',
+      payload: {
+        enabled: false,
+        provider: 'deepseek',
+        updateEnabled: true,
+        updateAppearance: true,
+        updateProvider: true,
+        appearance: {
+          ...DEFAULT_SETTINGS.appearance,
+          order: 'chinese-first',
+          english: {
+            ...DEFAULT_SETTINGS.appearance.english,
+            fontFamily: 'serif',
+          },
+        },
+      },
+    });
+    const result = createMessage({
+      id: 'settings-page-update-1:background',
+      source: 'background',
+      type: 'settings/page-update-result',
+      payload: {
+        status: 'success',
+        errorCode: null,
+        enabled: false,
+        provider: 'deepseek',
+        appearance: update.payload.appearance,
+      },
+    });
+
+    expect(parseMessageEnvelope(update)).toEqual({ ok: true, value: update });
+    expect(parseMessageEnvelope(result)).toEqual({ ok: true, value: result });
+    expect(parseMessageEnvelope({
+      ...update,
+      payload: {
+        enabled: update.payload.enabled,
+        appearance: update.payload.appearance,
+      },
+    }).ok).toBe(false);
+    expect(parseMessageEnvelope({
+      ...update,
+      payload: {
+        ...update.payload,
+        updateEnabled: false,
+        updateAppearance: false,
+        updateProvider: false,
+      },
+    }).ok).toBe(false);
+    for (const forbidden of [
+      { provider: 'surprise-provider' },
+      { apiKey: 'secret' },
+      { deepseek: { apiKey: 'secret' } },
+      { model: 'deepseek-v4-pro' },
+    ]) {
+      expect(parseMessageEnvelope({
+        ...update,
+        payload: { ...update.payload, ...forbidden },
+      }).ok).toBe(false);
+    }
+    expect(parseMessageEnvelope({ ...update, source: 'page' }).ok).toBe(false);
+    expect(parseMessageEnvelope({ ...result, source: 'content' }).ok).toBe(false);
   });
 
   it('snapshots translation fields before any asynchronous background work', () => {

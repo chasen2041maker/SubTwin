@@ -67,16 +67,13 @@ export function createExtensionTranslationTaskClient(
     const callbacks = callbacksFor(task);
     if (!callbacks?.isCurrent()) return;
 
-    // Network/rate-limit failures and Google cue-shape failures are deliberately
-    // NOT forwarded to the session controller. The controller treats onError as
-    // terminal and invalidates the whole generation. Google Free is an
-    // experimental, single-cue provider, so one unchanged/odd response must not
-    // disable translation for the remaining episode.
+    // Recoverable and cue-local failures still reach the controller so it can
+    // release promoted cue ownership and apply provider-specific cooldowns.
+    // The controller classifies these errors without invalidating the episode.
     const cueLocal = error.retryable ||
       (task.provider === 'google-free' && error.code === 'invalid_response');
     if (cueLocal) {
       publishRuntimeStatus(runtimeStatusForRecoverableError(error, offline));
-      return;
     }
 
     try {
@@ -84,7 +81,7 @@ export function createExtensionTranslationTaskClient(
     } catch {
       // A controller callback cannot break queue cleanup.
     }
-    if (offline) publishRuntimeStatus({ mode: 'error', code: 'offline' });
+    if (offline && !cueLocal) publishRuntimeStatus({ mode: 'error', code: 'offline' });
   };
 
   const execute = async (

@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 
-import { createMessage } from '../../src/shared/messages';
+import {
+  createMessage,
+  type OptionsSettingsPatch,
+} from '../../src/shared/messages';
 import {
   parseCacheClearActionResponse,
   parseDeepSeekTestActionResponse,
@@ -63,7 +66,10 @@ export default function App() {
     return () => { active = false; };
   }, []);
 
-  const persist = (next: SubTwinSettings) => {
+  const persist = (
+    next: SubTwinSettings,
+    field: keyof OptionsSettingsPatch,
+  ) => {
     const previous = settingsRef.current;
     const normalized = normalizeSettings(next);
     const credentialsChanged = previous !== null && (
@@ -83,7 +89,7 @@ export default function App() {
       .catch(() => false)
       .then(() => saveOptionsSettings(
         normalized,
-        confirmedEnabled.current !== normalized.enabled,
+        selectOptionsSettingsPatch(normalized, field),
       ))
       .then(
         (saved) => {
@@ -102,9 +108,12 @@ export default function App() {
         },
       );
   };
-  const updateSettings = (update: (current: SubTwinSettings) => SubTwinSettings) => {
+  const updateSettings = (
+    field: keyof OptionsSettingsPatch,
+    update: (current: SubTwinSettings) => SubTwinSettings,
+  ) => {
     const current = settingsRef.current;
-    if (current) persist(update(current));
+    if (current) persist(update(current), field);
   };
 
   if (!settings) {
@@ -121,7 +130,7 @@ export default function App() {
   const updateAppearance = <Key extends keyof SubTwinSettings['appearance']>(
     key: Key,
     value: SubTwinSettings['appearance'][Key],
-  ) => updateSettings((current) => ({
+  ) => updateSettings('appearance', (current) => ({
     ...current,
     appearance: { ...current.appearance, [key]: value },
   }));
@@ -226,7 +235,7 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={settings.enabled}
-                onChange={(event) => updateSettings((current) => ({
+                onChange={(event) => updateSettings('enabled', (current) => ({
                   ...current,
                   enabled: event.currentTarget.checked,
                 }))}
@@ -234,21 +243,21 @@ export default function App() {
             </label>
 
             <fieldset className="provider-fieldset">
-              <legend>选择外部翻译方式</legend>
+              <legend>选择字幕来源</legend>
               <label className={`provider-card ${settings.provider === 'unset' ? 'is-selected' : ''}`}>
                 <input
                   type="radio"
                   name="provider"
                   value="unset"
                   checked={settings.provider === 'unset'}
-                  onChange={() => updateSettings((current) => ({
+                  onChange={() => updateSettings('provider', (current) => ({
                     ...current,
                     provider: 'unset',
                   }))}
                 />
                 <span>
-                  <strong>暂不使用外部翻译</strong>
-                  <small>字幕不会发送给 DeepSeek 或 Google。</small>
+                  <strong>Netflix 原生双语</strong>
+                  <small>只使用 Netflix 官方英文与简体中文字幕，不发送给外部翻译。</small>
                 </span>
               </label>
               <label className={`provider-card ${settings.provider === 'google-free' ? 'is-selected' : ''}`}>
@@ -257,13 +266,13 @@ export default function App() {
                   name="provider"
                   value="google-free"
                   checked={settings.provider === 'google-free'}
-                  onChange={() => updateSettings((current) => ({
+                  onChange={() => updateSettings('provider', (current) => ({
                     ...current,
                     provider: 'google-free',
                   }))}
                 />
                 <span>
-                  <strong>Google 免费翻译 <em>实验性 · 免 Key</em></strong>
+                  <strong>Google 翻译 <em>实验性 · 免 Key</em></strong>
                   <small>逐句响应快，但属于非保证接口，可能随时限流或失效。</small>
                 </span>
               </label>
@@ -277,7 +286,7 @@ export default function App() {
                   name="provider"
                   value="deepseek"
                   checked={settings.provider === 'deepseek'}
-                  onChange={() => updateSettings((current) => ({
+                  onChange={() => updateSettings('provider', (current) => ({
                     ...current,
                     provider: 'deepseek',
                   }))}
@@ -298,7 +307,7 @@ export default function App() {
                   autoComplete="off"
                   spellCheck={false}
                   value={settings.deepseek.apiKey}
-                  onChange={(event) => updateSettings((current) => ({
+                  onChange={(event) => updateSettings('deepseek', (current) => ({
                     ...current,
                     deepseek: {
                       ...current.deepseek,
@@ -316,7 +325,7 @@ export default function App() {
               <select
                 id="deepseek-model"
                 value={settings.deepseek.model}
-                onChange={(event) => updateSettings((current) => ({
+                onChange={(event) => updateSettings('deepseek', (current) => ({
                   ...current,
                   deepseek: {
                     ...current.deepseek,
@@ -404,10 +413,18 @@ export default function App() {
               onChange={(value) => updateAppearance('lineSpacingPx', value)}
             />
             <RangeControl
+              label="单行长度"
+              value={settings.appearance.maxLineWidthPercent}
+              min={50}
+              max={100}
+              suffix="%"
+              onChange={(value) => updateAppearance('maxLineWidthPercent', value)}
+            />
+            <RangeControl
               label="距画面底部"
               value={settings.appearance.verticalOffsetPercent}
-              min={4}
-              max={32}
+              min={0}
+              max={80}
               suffix="%"
               onChange={(value) => updateAppearance('verticalOffsetPercent', value)}
             />
@@ -584,6 +601,7 @@ function SubtitlePreview({ settings }: { readonly settings: SubTwinSettings }) {
         style={{
           bottom: `${appearance.verticalOffsetPercent}%`,
           gap: `${appearance.lineSpacingPx}px`,
+          maxWidth: `${appearance.maxLineWidthPercent}%`,
           background: `rgb(0 0 0 / ${appearance.backgroundOpacity})`,
           textShadow: shadow,
         }}
@@ -624,15 +642,22 @@ function createCacheClearMessage(scope: CacheScope) {
   });
 }
 
-function createOptionsUpdateMessage(
+function selectOptionsSettingsPatch(
   settings: SubTwinSettings,
-  updateEnabled: boolean,
-) {
+  field: keyof OptionsSettingsPatch,
+): OptionsSettingsPatch {
+  if (field === 'enabled') return { enabled: settings.enabled };
+  if (field === 'provider') return { provider: settings.provider };
+  if (field === 'deepseek') return { deepseek: { ...settings.deepseek } };
+  return { appearance: normalizeSettings(settings).appearance };
+}
+
+function createOptionsUpdateMessage(patch: OptionsSettingsPatch) {
   return createMessage({
     id: `options-${Date.now()}-${crypto.randomUUID()}`,
     source: 'options',
     type: 'settings/options-update',
-    payload: { settings: normalizeSettings(settings), updateEnabled },
+    payload: { patch },
   });
 }
 
@@ -647,10 +672,10 @@ function createPrivateSettingsRequest() {
 
 async function saveOptionsSettings(
   settings: SubTwinSettings,
-  updateEnabled: boolean,
+  patch: OptionsSettingsPatch,
 ): Promise<SubTwinSettings> {
   const normalized = normalizeSettings(settings);
-  const request = createOptionsUpdateMessage(normalized, updateEnabled);
+  const request = createOptionsUpdateMessage(patch);
   const response = await browser.runtime.sendMessage(request);
   const parsed = parseOptionsUpdateActionResponse(response, request.id);
   if (parsed?.payload.status !== 'success') {

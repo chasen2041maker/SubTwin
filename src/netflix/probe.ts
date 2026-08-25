@@ -8,6 +8,9 @@ import {
 export const MAX_TIMED_TEXT_BYTES = MAX_NETFLIX_BRIDGE_BYTES;
 const MAX_TIMED_TEXT_SNIFF_PREFIX_BYTES = 4096;
 const MAX_TIMED_TEXT_SNIFF_CHUNKS = 32;
+const DEFAULT_METADATA_READ_TIMEOUT_MS = 5_000;
+const MAX_METADATA_READ_TIMEOUT_MS = 30_000;
+const READ_TIMEOUT = Symbol('subtwin-metadata-read-timeout');
 
 const NETFLIX_HOST_SUFFIXES = [
   'netflix.com',
@@ -27,6 +30,7 @@ const STABLE_RESOURCE_QUERY_KEYS = new Set([
 
 export type NetflixProbeError = AppError<
   | 'body_too_large'
+  | 'body_read_timeout'
   | 'candidate_not_netflix'
   | 'candidate_not_timed_text'
   | 'media_response'
@@ -39,6 +43,14 @@ export interface TimedTextResourceIdentity {
   readonly resourceId: string;
   readonly trackId: string;
   readonly language: string;
+}
+
+export interface NetflixCatalogTimedTextBinding {
+  readonly titleId: string;
+  readonly trackId: string;
+  /** MAIN-world-only opaque profile discriminator. Never bridge the raw
+   * Netflix text-profile name or a signed URL. */
+  readonly variantId?: string;
 }
 
 /** A page-observed body is not bridge-ready until runtime binds it to an
@@ -121,6 +133,182 @@ export function canonicalizeNetflixTimedTextResource(
   return ok({ resourceId, trackId, language });
 }
 
+/** Accepts Netflix's opaque OCA root URL only after a validated text-track
+ * catalog has bound it to a title and logical track. Direct network probing
+ * intentionally continues to use the stricter path-based function above. */
+export function canonicalizeNetflixCatalogTimedTextResource(
+  input: string,
+  binding: NetflixCatalogTimedTextBinding,
+): Result<TimedTextResourceIdentity, NetflixProbeError> {
+  if (
+    !isOpaqueId(binding.titleId) ||
+    !isOpaqueId(binding.trackId) ||
+    (binding.variantId !== undefined && !isOpaqueId(binding.variantId))
+  ) {
+    return probeError('candidate_not_timed_text');
+  }
+  const strict = canonicalizeNetflixTimedTextResource(input);
+  if (strict.ok) return strict;
+  const oca = parseNetflixOcaTimedTextResource(input);
+  if (oca === null) {
+    return probeError('candidate_not_timed_text');
+  }
+
+  const resourceId = `tt_${hash64(
+    `oca\u001f${binding.titleId}\u001f${binding.trackId}\u001f${
+      binding.variantId ?? 'profile_default'
+    }`,
+  )}`;
+  return ok({ resourceId, trackId: binding.trackId, language: 'und' });
+}
+
+/** Verifies that a response URL is still the approved resource without
+ * retaining or exposing its signed URL. Strict path resources compare their
+ * canonical IDs. OCA redirects may renew node/signature/expiry, but o/v are
+ * the immutable media identity and must remain unique and equal. */
+export function areEquivalentNetflixCatalogTimedTextResources(
+  requested: string,
+  final: string,
+  binding: NetflixCatalogTimedTextBinding,
+): boolean {
+  if (
+    !isOpaqueId(binding.titleId) ||
+    !isOpaqueId(binding.trackId) ||
+    (binding.variantId !== undefined && !isOpaqueId(binding.variantId))
+  ) return false;
+
+  const requestedStrict = canonicalizeNetflixTimedTextResource(requested);
+  const finalStrict = canonicalizeNetflixTimedTextResource(final);
+  if (requestedStrict.ok || finalStrict.ok) {
+    return requestedStrict.ok &&
+      finalStrict.ok &&
+      requestedStrict.value.resourceId === finalStrict.value.resourceId;
+  }
+
+  const requestedOca = parseNetflixOcaTimedTextResource(requested);
+  const finalOca = parseNetflixOcaTimedTextResource(final);
+  return requestedOca !== null &&
+    finalOca !== null &&
+    requestedOca.objectId === finalOca.objectId &&
+    requestedOca.videoId === finalOca.videoId;
+}
+
+function resolveObservedTimedTextIdentity(
+  requested: string,
+  final: string | undefined | null,
+  binding?: NetflixCatalogTimedTextBinding,
+): TimedTextResourceIdentity | null {
+  if (binding === undefined) {
+    const requestedIdentity = canonicalizeNetflixTimedTextResource(requested);
+    if (requestedIdentity.ok) {
+      if (final === undefined || final === null || final.length === 0) {
+        return requestedIdentity.value;
+      }
+      const finalIdentity = canonicalizeNetflixTimedTextResource(final);
+      return finalIdentity.ok ? finalIdentity.value : null;
+    }
+    const requestedOca = parseNetflixOcaTimedTextResource(requested);
+    if (requestedOca === null) return null;
+    if (final !== undefined && final !== null && final.length > 0) {
+      const finalOca = parseNetflixOcaTimedTextResource(final);
+      if (
+        finalOca === null ||
+        finalOca.objectId !== requestedOca.objectId ||
+        finalOca.videoId !== requestedOca.videoId
+      ) return null;
+    }
+    const identity = canonicalizeNetflixUnboundOcaTimedTextResource(requested);
+    return identity.ok ? identity.value : null;
+  }
+
+  const requestedIdentity = canonicalizeNetflixCatalogTimedTextResource(
+    requested,
+    binding,
+  );
+  if (!requestedIdentity.ok) return null;
+  if (
+    final !== undefined &&
+    final !== null &&
+    final.length > 0 &&
+    !areEquivalentNetflixCatalogTimedTextResources(requested, final, binding)
+  ) return null;
+  return {
+    resourceId: requestedIdentity.value.resourceId,
+    trackId: binding.trackId,
+    language: 'und',
+  };
+}
+
+interface NetflixOcaTimedTextIdentity {
+  readonly objectId: string;
+  readonly videoId: string;
+}
+
+function parseNetflixOcaTimedTextResource(
+  input: string,
+): NetflixOcaTimedTextIdentity | null {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    return null;
+  }
+  const normalizedHost = url.hostname.toLowerCase().replace(/\.$/u, '');
+  if (
+    input.length > 8_192 ||
+    url.protocol !== 'https:' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    (url.port !== '' && url.port !== '443') ||
+    (normalizedHost !== 'oca.nflxvideo.net' &&
+      !normalizedHost.endsWith('.oca.nflxvideo.net')) ||
+    url.pathname !== '/' ||
+    url.hash !== '' ||
+    [...url.searchParams].length > 16
+  ) return null;
+
+  const objectId = uniqueBoundedQueryValue(url, 'o');
+  const videoId = uniqueBoundedQueryValue(url, 'v');
+  const expiry = boundedQueryValue(url, 'e');
+  return objectId === null || videoId === null || expiry === null
+    ? null
+    : { objectId, videoId };
+}
+
+export function canonicalizeNetflixUnboundOcaTimedTextResource(
+  input: string,
+): Result<TimedTextResourceIdentity, NetflixProbeError> {
+  const identity = parseNetflixOcaTimedTextResource(input);
+  if (identity === null) return probeError('candidate_not_timed_text');
+  const digest = hash64(
+    `oca-unbound\u001f${identity.objectId}\u001f${identity.videoId}`,
+  );
+  return ok({
+    resourceId: `tt_${digest}`,
+    trackId: `oca_${digest}`,
+    language: 'und',
+  });
+}
+
+function uniqueBoundedQueryValue(url: URL, key: string): string | null {
+  const values = url.searchParams.getAll(key);
+  return values.length === 1 && isBoundedQueryValue(values[0])
+    ? values[0] ?? null
+    : null;
+}
+
+function boundedQueryValue(url: URL, key: string): string | null {
+  const value = url.searchParams.get(key);
+  return isBoundedQueryValue(value) ? value : null;
+}
+
+function isBoundedQueryValue(value: string | null | undefined): value is string {
+  return value !== null &&
+    value !== undefined &&
+    value.length > 0 &&
+    value.length <= 2_048;
+}
+
 export function sniffTimedText(input: {
   readonly contentType: string | null;
   readonly contentLength: number | null;
@@ -185,17 +373,46 @@ export interface FetchTargetLike {
   fetch(this: FetchTargetLike, ...args: unknown[]): Promise<ProbeResponseLike>;
 }
 
+export interface JsonParseTargetLike {
+  parse: JSON['parse'];
+}
+
 export interface ProbeInstallation {
   dispose(): void;
 }
+
+export type NetflixCatalogProbeDiagnosticCode =
+  | 'metadata_candidate_observed'
+  | 'metadata_body_read_failed'
+  | 'metadata_body_timeout'
+  | 'metadata_body_too_large'
+  | 'metadata_body_unsupported'
+  | 'metadata_catalog_recognized'
+  | 'metadata_catalog_unrecognized'
+  | 'metadata_json_parsed'
+  | 'metadata_json_invalid'
+  | 'metadata_response_accepted'
+  | 'metadata_xhr_json_unsupported';
 
 export interface NetworkProbeOptions {
   readonly generation: number;
   readonly currentGeneration: () => number;
   readonly onTimedText: (payload: NetflixObservedTimedTextPayload) => void;
+  /** Snapshotted when a request starts. Only supplied while runtime is
+   * intentionally switching to an authoritative Player text track. */
+  readonly currentTimedTextBinding?: () => NetflixCatalogTimedTextBinding | undefined;
+  readonly onTimedTextCandidate?: (event: {
+    readonly bound: boolean;
+    readonly outcome: string;
+    readonly responseType: string;
+    readonly stage: 'loaded' | 'request';
+    readonly transport: 'fetch' | 'xhr';
+  }) => void;
   readonly onCatalog?: (payload: NetflixCatalogPayload) => void;
   /** MAIN-world only. Raw metadata must never be bridged, logged, or persisted. */
   readonly onCatalogMetadata?: (metadata: unknown) => void;
+  readonly onDiagnostic?: (code: NetflixCatalogProbeDiagnosticCode) => void;
+  readonly metadataReadTimeoutMs?: number;
   readonly maxBytes?: number;
   readonly schedule?: (task: () => void) => void;
 }
@@ -204,8 +421,18 @@ interface ResolvedNetworkProbeOptions {
   readonly generation: number;
   readonly currentGeneration: () => number;
   readonly onTimedText: (payload: NetflixObservedTimedTextPayload) => void;
+  readonly currentTimedTextBinding: () => NetflixCatalogTimedTextBinding | undefined;
+  readonly onTimedTextCandidate: (event: {
+    readonly bound: boolean;
+    readonly outcome: string;
+    readonly responseType: string;
+    readonly stage: 'loaded' | 'request';
+    readonly transport: 'fetch' | 'xhr';
+  }) => void;
   readonly onCatalog: (payload: NetflixCatalogPayload) => void;
   readonly onCatalogMetadata: (metadata: unknown) => void;
+  readonly onDiagnostic: (code: NetflixCatalogProbeDiagnosticCode) => void;
+  readonly metadataReadTimeoutMs: number;
   readonly maxBytes: number;
   readonly schedule: (task: () => void) => void;
 }
@@ -217,11 +444,27 @@ function snapshotProbeOptions(
     generation: options.generation,
     currentGeneration: options.currentGeneration,
     onTimedText: options.onTimedText,
+    currentTimedTextBinding: options.currentTimedTextBinding ?? (() => undefined),
+    onTimedTextCandidate: options.onTimedTextCandidate ?? (() => undefined),
     onCatalog: options.onCatalog ?? (() => undefined),
     onCatalogMetadata: options.onCatalogMetadata ?? (() => undefined),
+    onDiagnostic: options.onDiagnostic ?? (() => undefined),
+    metadataReadTimeoutMs: normalizeMetadataReadTimeout(
+      options.metadataReadTimeoutMs,
+    ),
     maxBytes: options.maxBytes ?? MAX_TIMED_TEXT_BYTES,
     schedule: options.schedule ?? queueMicrotask,
   };
+}
+
+function readCurrentTimedTextBinding(
+  options: ResolvedNetworkProbeOptions,
+): NetflixCatalogTimedTextBinding | undefined {
+  try {
+    return options.currentTimedTextBinding();
+  } catch {
+    return undefined;
+  }
 }
 
 interface FetchPatch {
@@ -231,6 +474,93 @@ interface FetchPatch {
 }
 
 const FETCH_PATCHES = new WeakMap<object, FetchPatch>();
+
+interface JsonParsePatch {
+  readonly handle: ProbeInstallation;
+  readonly wrapped: JSON['parse'];
+  update(options: NetworkProbeOptions): void;
+}
+
+const JSON_PARSE_PATCHES = new WeakMap<object, JsonParsePatch>();
+
+/** Observes only Netflix's decrypted, manifest-shaped JSON result. */
+export function installJsonParseProbe(
+  target: JsonParseTargetLike,
+  options: NetworkProbeOptions,
+): ProbeInstallation {
+  const existing = JSON_PARSE_PATCHES.get(target);
+  if (existing !== undefined && target.parse === existing.wrapped) {
+    existing.update(options);
+    return existing.handle;
+  }
+
+  const originalParse = target.parse;
+  let currentOptions = snapshotProbeOptions(options);
+  let active = true;
+  const wrapped: JSON['parse'] = function parse(this: unknown, text, reviver) {
+    const parsed = Reflect.apply(originalParse, this, [text, reviver]) as unknown;
+    try {
+      if (!isLikelyDecryptedNetflixManifest(parsed)) return parsed;
+      const observedOptions = currentOptions;
+      observedOptions.schedule(() => {
+        if (!isCurrent(observedOptions)) return;
+        try {
+          safeEmit(observedOptions.onDiagnostic, 'metadata_json_parsed');
+          const catalog = extractCatalogObservation(parsed, {
+            allowSyntheticAuthoritative: false,
+          });
+          if (!catalog.ok) {
+            safeEmit(
+              observedOptions.onDiagnostic,
+              'metadata_catalog_unrecognized',
+            );
+            return;
+          }
+          safeEmit(
+            observedOptions.onDiagnostic,
+            'metadata_catalog_recognized',
+          );
+          safeEmit(observedOptions.onCatalogMetadata, parsed);
+          safeEmit(observedOptions.onCatalog, catalog.value);
+        } catch {
+          // Parsed metadata observation must never alter Netflix's JSON result.
+        }
+      });
+    } catch {
+      // Detection is advisory and must never alter JSON.parse semantics.
+    }
+    return parsed;
+  };
+
+  const handle: ProbeInstallation = {
+    dispose() {
+      if (!active) return;
+      active = false;
+      if (target.parse === wrapped) target.parse = originalParse;
+      if (JSON_PARSE_PATCHES.get(target)?.handle === handle) {
+        JSON_PARSE_PATCHES.delete(target);
+      }
+    },
+  };
+  function isCurrent(observedOptions: ResolvedNetworkProbeOptions): boolean {
+    if (!active || observedOptions !== currentOptions) return false;
+    try {
+      return observedOptions.currentGeneration() === observedOptions.generation;
+    } catch {
+      return false;
+    }
+  }
+
+  JSON_PARSE_PATCHES.set(target, {
+    handle,
+    wrapped,
+    update(nextOptions) {
+      currentOptions = snapshotProbeOptions(nextOptions);
+    },
+  });
+  target.parse = wrapped;
+  return handle;
+}
 
 export function installFetchProbe(
   target: FetchTargetLike,
@@ -251,18 +581,27 @@ export function installFetchProbe(
     ...args
   ) {
     const observedOptions = currentOptions;
+    const candidate = candidateUrl(args[0], undefined);
+    const binding = readCurrentTimedTextBinding(observedOptions);
     const originalPromise = originalFetch.apply(this, args);
     void originalPromise.then(
       (response) => {
         try {
           if (!isCurrent(observedOptions)) return;
-          const candidate = candidateUrl(args[0], undefined);
           if (candidate === null) return;
+          const metadataCandidate = isNetflixMetadataCandidate(candidate);
+          if (metadataCandidate) {
+            safeEmit(
+              observedOptions.onDiagnostic,
+              'metadata_candidate_observed',
+            );
+          }
           const prepared = prepareFetchResponse(
             response,
             candidate,
             response.url,
             observedOptions.maxBytes,
+            binding,
           );
           if (prepared === null) {
             const catalog = prepareCatalogFetchResponse(
@@ -272,11 +611,17 @@ export function installFetchProbe(
               observedOptions.maxBytes,
             );
             if (catalog === null) return;
+            safeEmit(
+              observedOptions.onDiagnostic,
+              'metadata_response_accepted',
+            );
             observedOptions.schedule(() => {
               if (!isCurrent(observedOptions)) return;
               void inspectCatalogFetchResponse(
                 catalog,
                 observedOptions.maxBytes,
+                observedOptions.metadataReadTimeoutMs,
+                observedOptions.onDiagnostic,
               ).then(
                 (inspected) => {
                   if (inspected !== null && isCurrent(observedOptions)) {
@@ -287,11 +632,23 @@ export function installFetchProbe(
                     safeEmit(observedOptions.onCatalog, inspected.payload);
                   }
                 },
-                () => undefined,
+                () => {
+                  safeEmit(
+                    observedOptions.onDiagnostic,
+                    'metadata_body_read_failed',
+                  );
+                },
               );
             });
             return;
           }
+          safeEmit(observedOptions.onTimedTextCandidate, {
+            bound: binding !== undefined,
+            outcome: 'pending',
+            responseType: 'response',
+            stage: 'request',
+            transport: 'fetch',
+          });
           observedOptions.schedule(() => {
             if (!isCurrent(observedOptions)) return;
             void inspectFetchResponse(prepared, observedOptions.maxBytes).then(
@@ -347,6 +704,7 @@ interface PreparedFetchResponse {
   readonly resourceId: string;
   readonly trackId: string;
   readonly language: string;
+  readonly requiresEmbeddedLanguage: boolean;
 }
 
 function prepareFetchResponse(
@@ -354,15 +712,16 @@ function prepareFetchResponse(
   requestedCandidate: string,
   finalCandidate: string | undefined,
   maxBytes: number,
+  binding?: NetflixCatalogTimedTextBinding,
 ): PreparedFetchResponse | null {
-  const requestedIdentity = canonicalizeNetflixTimedTextResource(requestedCandidate);
-  if (!requestedIdentity.ok) return null;
-  let identity = requestedIdentity.value;
-  if (finalCandidate !== undefined && finalCandidate.length > 0) {
-    const finalIdentity = canonicalizeNetflixTimedTextResource(finalCandidate);
-    if (!finalIdentity.ok) return null;
-    identity = finalIdentity.value;
-  }
+  const identity = resolveObservedTimedTextIdentity(
+    requestedCandidate,
+    finalCandidate,
+    binding,
+  );
+  if (identity === null) return null;
+  const requiresEmbeddedLanguage = binding === undefined &&
+    !canonicalizeNetflixTimedTextResource(requestedCandidate).ok;
 
   const contentType = response.headers.get('content-type');
   const normalizedType = normalizeContentType(contentType);
@@ -384,6 +743,7 @@ function prepareFetchResponse(
       resourceId: identity.resourceId,
       trackId: identity.trackId,
       language: identity.language,
+      requiresEmbeddedLanguage,
     };
   } catch {
     return null;
@@ -401,12 +761,16 @@ async function inspectFetchResponse(
     maxBytes,
   );
   if (!timedText.ok) return null;
+  const language = response.requiresEmbeddedLanguage
+    ? extractNetflixTimedTextEmbeddedLanguage(timedText.value.body, timedText.value.format)
+    : response.language;
+  if (language === null) return null;
 
   return {
     type: 'timed-text',
     resourceId: response.resourceId,
     trackId: response.trackId,
-    language: response.language,
+    language,
     format: timedText.value.format,
     body: timedText.value.body,
   };
@@ -449,45 +813,82 @@ function prepareCatalogFetchResponse(
 async function inspectCatalogFetchResponse(
   response: PreparedCatalogFetchResponse,
   maxBytes: number,
+  metadataReadTimeoutMs: number,
+  emitDiagnostic: (code: NetflixCatalogProbeDiagnosticCode) => void,
 ): Promise<{
   readonly metadata: unknown;
   readonly payload: NetflixCatalogPayload;
 } | null> {
-  const body = await readBoundedUtf8(
-    response.clone,
-    response.contentLength,
-    maxBytes,
-  );
-  if (!body.ok) return null;
+  let body: Result<string, NetflixProbeError>;
+  try {
+    body = await readBoundedUtf8(
+      response.clone,
+      response.contentLength,
+      maxBytes,
+      metadataReadTimeoutMs,
+    );
+  } catch {
+    safeEmit(emitDiagnostic, 'metadata_body_read_failed');
+    return null;
+  }
+  if (!body.ok) {
+    safeEmit(
+      emitDiagnostic,
+      body.error.code === 'body_read_timeout'
+        ? 'metadata_body_timeout'
+        : body.error.code === 'body_too_large'
+          ? 'metadata_body_too_large'
+          : 'metadata_body_unsupported',
+    );
+    return null;
+  }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(body.value) as unknown;
   } catch {
+    safeEmit(emitDiagnostic, 'metadata_json_invalid');
     return null;
   }
+  safeEmit(emitDiagnostic, 'metadata_json_parsed');
   const catalog = extractCatalogObservation(parsed, {
     allowSyntheticAuthoritative: false,
   });
-  return catalog.ok ? { metadata: parsed, payload: catalog.value } : null;
+  if (!catalog.ok) {
+    safeEmit(emitDiagnostic, 'metadata_catalog_unrecognized');
+    return null;
+  }
+  safeEmit(emitDiagnostic, 'metadata_catalog_recognized');
+  return { metadata: parsed, payload: catalog.value };
 }
 
 async function readBoundedUtf8(
   response: ProbeResponseLike,
   contentLength: number | null,
   maxBytes: number,
+  readTimeoutMs: number,
 ): Promise<Result<string, NetflixProbeError>> {
   if (response.body !== undefined && response.body !== null) {
     const reader = response.body.getReader();
     const chunks: Uint8Array[] = [];
     let bytes = 0;
+    const deadline = Date.now() + readTimeoutMs;
     for (;;) {
-      const next = await reader.read();
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        void cancelReader(reader, 'SubTwin metadata read timeout');
+        return probeError('body_read_timeout');
+      }
+      const next = await withReadTimeout(reader.read(), remainingMs);
+      if (next === READ_TIMEOUT) {
+        void cancelReader(reader, 'SubTwin metadata read timeout');
+        return probeError('body_read_timeout');
+      }
       if (next.done) break;
       if (next.value === undefined) continue;
       bytes += next.value.byteLength;
       if (bytes > maxBytes) {
-        await cancelReader(reader, 'SubTwin metadata size limit');
+        void cancelReader(reader, 'SubTwin metadata size limit');
         return probeError('body_too_large');
       }
       chunks.push(next.value);
@@ -505,19 +906,36 @@ async function readBoundedUtf8(
     return probeError('body_too_large');
   }
   if (response.arrayBuffer !== undefined) {
-    const body = await response.arrayBuffer();
+    const body = await withReadTimeout(response.arrayBuffer(), readTimeoutMs);
+    if (body === READ_TIMEOUT) return probeError('body_read_timeout');
     return body.byteLength <= maxBytes
       ? ok(new TextDecoder().decode(body))
       : probeError('body_too_large');
   }
   if (response.text !== undefined) {
-    const body = await response.text();
+    const body = await withReadTimeout(response.text(), readTimeoutMs);
+    if (body === READ_TIMEOUT) return probeError('body_read_timeout');
     if (body.length > maxBytes) return probeError('body_too_large');
     return new TextEncoder().encode(body).byteLength <= maxBytes
       ? ok(body)
       : probeError('body_too_large');
   }
   return probeError('unsupported_payload');
+}
+
+async function withReadTimeout<Value>(
+  operation: Promise<Value>,
+  timeoutMs: number,
+): Promise<Value | typeof READ_TIMEOUT> {
+  let handle: ReturnType<typeof globalThis.setTimeout> | undefined;
+  const timeout = new Promise<typeof READ_TIMEOUT>((resolve) => {
+    handle = globalThis.setTimeout(() => resolve(READ_TIMEOUT), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (handle !== undefined) globalThis.clearTimeout(handle);
+  }
 }
 
 async function readBoundedTimedText(
@@ -696,12 +1114,15 @@ function concatenateBytes(chunks: readonly Uint8Array[], bytes: number): Uint8Ar
   return combined;
 }
 
-async function cancelReader(
+function cancelReader(
   reader: ReturnType<ProbeReadableStreamLike['getReader']>,
   reason: string,
-): Promise<void> {
+): void {
   try {
-    await reader.cancel?.(reason);
+    const cancellation = reader.cancel?.(reason);
+    if (cancellation !== undefined) {
+      void cancellation.catch(() => undefined);
+    }
   } catch {
     // Cancellation is best-effort and must not escape into the page.
   }
@@ -709,6 +1130,7 @@ async function cancelReader(
 
 export interface XhrLike {
   readonly responseType: string;
+  readonly response?: unknown;
   readonly responseText: string;
   readonly responseURL: string;
   addEventListener(type: string, listener: () => void, options?: unknown): void;
@@ -734,6 +1156,7 @@ interface XhrPatch {
 
 interface XhrRequestState {
   readonly candidate: string | null;
+  binding: NetflixCatalogTimedTextBinding | undefined;
   listener: PendingXhrListener | null;
 }
 
@@ -773,15 +1196,35 @@ export function installXhrProbe(
       detachListener(previous.listener);
     }
     const candidate = candidateUrl(args[1], undefined);
-    metadata.set(this, { candidate, listener: null });
+    metadata.set(this, { binding: undefined, candidate, listener: null });
     return originalOpen.apply(this, args);
   };
   const patchedSend: XhrPrototypeLike['send'] = function (this: object, ...args) {
     const xhr = this as unknown as XhrLike;
     const state = metadata.get(this);
+    if (state !== undefined) {
+      state.binding = readCurrentTimedTextBinding(currentOptions);
+    }
     let entry: PendingXhrListener | null = null;
-    if (state !== undefined && state.listener === null) {
+    const shouldObserve = state?.candidate !== null && state?.candidate !== undefined && (
+      isNetflixMetadataCandidate(state.candidate) ||
+      resolveObservedTimedTextIdentity(
+        state.candidate,
+        undefined,
+        state.binding,
+      ) !== null
+    );
+    if (state !== undefined && state.listener === null && shouldObserve) {
       const observedOptions = currentOptions;
+      if (!isNetflixMetadataCandidate(state.candidate ?? '')) {
+        safeEmit(observedOptions.onTimedTextCandidate, {
+          bound: state.binding !== undefined,
+          outcome: 'pending',
+          responseType: xhr.responseType === '' ? 'text' : xhr.responseType,
+          stage: 'request',
+          transport: 'xhr',
+        });
+      }
       const listener = () => {
         if (entry !== null) detachListener(entry);
         try {
@@ -796,6 +1239,9 @@ export function installXhrProbe(
                 observedOptions.onTimedText,
                 observedOptions.onCatalog,
                 observedOptions.onCatalogMetadata,
+                observedOptions.onDiagnostic,
+                state.binding,
+                observedOptions.onTimedTextCandidate,
               );
             } catch {
               // Observation failures must never escape into Netflix callbacks.
@@ -866,21 +1312,44 @@ function inspectLoadedXhr(
   emit: (payload: NetflixObservedTimedTextPayload) => void,
   emitCatalog: (payload: NetflixCatalogPayload) => void,
   emitCatalogMetadata: (metadata: unknown) => void,
+  emitDiagnostic: (code: NetflixCatalogProbeDiagnosticCode) => void,
+  binding?: NetflixCatalogTimedTextBinding,
+  emitTimedTextCandidate: ResolvedNetworkProbeOptions['onTimedTextCandidate'] = () => undefined,
 ): void {
-  if (xhr.responseType !== '' && xhr.responseType !== 'text') return;
   if (openedCandidate === null) return;
   const finalCandidate = candidateUrl(xhr.responseURL, undefined);
   const metadataCandidate = isNetflixMetadataCandidate(openedCandidate);
+  if (metadataCandidate) {
+    safeEmit(emitDiagnostic, 'metadata_candidate_observed');
+  }
   const openedIdentity = metadataCandidate
     ? null
-    : canonicalizeNetflixTimedTextResource(openedCandidate);
-  if (!metadataCandidate && (openedIdentity === null || !openedIdentity.ok)) {
+    : resolveObservedTimedTextIdentity(openedCandidate, finalCandidate, binding);
+  if (!metadataCandidate && openedIdentity === null) {
+    safeEmit(emitTimedTextCandidate, {
+      bound: binding !== undefined,
+      outcome: 'identity_rejected',
+      responseType: xhr.responseType === '' ? 'text' : xhr.responseType,
+      stage: 'loaded',
+      transport: 'xhr',
+    });
     return;
   }
   if (finalCandidate !== null) {
     if (metadataCandidate) {
       if (!isNetflixMetadataCandidate(finalCandidate)) return;
-    } else if (!canonicalizeNetflixTimedTextResource(finalCandidate).ok) {
+    } else if (resolveObservedTimedTextIdentity(
+      openedCandidate,
+      finalCandidate,
+      binding,
+    ) === null) {
+      safeEmit(emitTimedTextCandidate, {
+        bound: binding !== undefined,
+        outcome: 'redirect_rejected',
+        responseType: xhr.responseType === '' ? 'text' : xhr.responseType,
+        stage: 'loaded',
+        transport: 'xhr',
+      });
       return;
     }
   }
@@ -888,48 +1357,158 @@ function inspectLoadedXhr(
   const contentType = xhr.getResponseHeader('content-type');
   const normalizedType = normalizeContentType(contentType);
   if (normalizedType.startsWith('audio/') || normalizedType.startsWith('video/')) {
+    if (metadataCandidate) {
+      safeEmit(emitDiagnostic, 'metadata_body_unsupported');
+    }
+    if (!metadataCandidate) safeEmit(emitTimedTextCandidate, {
+      bound: binding !== undefined,
+      outcome: 'media_rejected',
+      responseType: xhr.responseType === '' ? 'text' : xhr.responseType,
+      stage: 'loaded',
+      transport: 'xhr',
+    });
     return;
   }
   const contentLength = parseContentLength(xhr.getResponseHeader('content-length'));
-  if (contentLength !== null && contentLength > maxBytes) return;
+  if (contentLength !== null && contentLength > maxBytes) {
+    if (metadataCandidate) {
+      safeEmit(emitDiagnostic, 'metadata_body_too_large');
+    }
+    if (!metadataCandidate) safeEmit(emitTimedTextCandidate, {
+      bound: binding !== undefined,
+      outcome: 'size_rejected',
+      responseType: xhr.responseType === '' ? 'text' : xhr.responseType,
+      stage: 'loaded',
+      transport: 'xhr',
+    });
+    return;
+  }
+
+  if (metadataCandidate && xhr.responseType === 'json') {
+    if (normalizedType !== 'application/json' && normalizedType !== 'text/json') {
+      safeEmit(emitDiagnostic, 'metadata_body_unsupported');
+      return;
+    }
+    safeEmit(emitDiagnostic, 'metadata_response_accepted');
+    let parsed: unknown;
+    try {
+      parsed = xhr.response;
+    } catch {
+      safeEmit(emitDiagnostic, 'metadata_body_read_failed');
+      return;
+    }
+    safeEmit(emitDiagnostic, 'metadata_json_parsed');
+    const catalog = extractCatalogObservation(parsed, {
+      allowSyntheticAuthoritative: false,
+    });
+    if (catalog.ok) {
+      safeEmit(emitDiagnostic, 'metadata_catalog_recognized');
+      safeEmit(emitCatalogMetadata, parsed);
+      safeEmit(emitCatalog, catalog.value);
+    } else {
+      safeEmit(emitDiagnostic, 'metadata_catalog_unrecognized');
+    }
+    return;
+  }
+  if (!metadataCandidate && xhr.responseType === 'arraybuffer') {
+    if (openedIdentity === null) return;
+    let rawBody: unknown;
+    try {
+      rawBody = xhr.response;
+    } catch {
+      return;
+    }
+    if (!(rawBody instanceof ArrayBuffer) || rawBody.byteLength > maxBytes) return;
+    const bytes = new Uint8Array(rawBody);
+    const sniffed = sniffTimedText({
+      contentType,
+      contentLength,
+      firstChunk: bytes.subarray(0, MAX_TIMED_TEXT_SNIFF_PREFIX_BYTES),
+      maxBytes,
+    });
+    if (!sniffed.ok) return;
+    const body = new TextDecoder().decode(bytes);
+    const language = binding === undefined &&
+        !canonicalizeNetflixTimedTextResource(openedCandidate).ok
+      ? extractNetflixTimedTextEmbeddedLanguage(body, sniffed.value.format)
+      : openedIdentity.language;
+    if (language === null) return;
+    safeEmit(emitTimedTextCandidate, {
+      bound: binding !== undefined,
+      outcome: 'accepted',
+      responseType: 'arraybuffer',
+      stage: 'loaded',
+      transport: 'xhr',
+    });
+    safeEmit(emit, {
+      type: 'timed-text',
+      resourceId: openedIdentity.resourceId,
+      trackId: openedIdentity.trackId,
+      language,
+      format: sniffed.value.format,
+      body,
+    });
+    return;
+  }
+  if (xhr.responseType !== '' && xhr.responseType !== 'text') {
+    if (!metadataCandidate) safeEmit(emitTimedTextCandidate, {
+      bound: binding !== undefined,
+      outcome: 'response_type_rejected',
+      responseType: xhr.responseType,
+      stage: 'loaded',
+      transport: 'xhr',
+    });
+    return;
+  }
+
   let body: string;
   try {
     body = xhr.responseText;
   } catch {
+    if (metadataCandidate) {
+      safeEmit(emitDiagnostic, 'metadata_body_read_failed');
+    }
     return;
   }
   if (
     body.length > maxBytes ||
     new TextEncoder().encode(body).byteLength > maxBytes
-  ) return;
-
-  if (metadataCandidate) {
-    if (normalizedType !== 'application/json' && normalizedType !== 'text/json') {
-      return;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(body) as unknown;
-    } catch {
-      return;
-    }
-    const catalog = extractCatalogObservation(parsed, {
-      allowSyntheticAuthoritative: false,
-    });
-    if (catalog.ok) {
-      safeEmit(emitCatalogMetadata, parsed);
-      safeEmit(emitCatalog, catalog.value);
+  ) {
+    if (metadataCandidate) {
+      safeEmit(emitDiagnostic, 'metadata_body_too_large');
     }
     return;
   }
 
-  if (openedIdentity === null || !openedIdentity.ok) return;
-  let identity = openedIdentity.value;
-  if (finalCandidate !== null) {
-    const finalIdentity = canonicalizeNetflixTimedTextResource(finalCandidate);
-    if (!finalIdentity.ok) return;
-    identity = finalIdentity.value;
+  if (metadataCandidate) {
+    if (normalizedType !== 'application/json' && normalizedType !== 'text/json') {
+      safeEmit(emitDiagnostic, 'metadata_body_unsupported');
+      return;
+    }
+    safeEmit(emitDiagnostic, 'metadata_response_accepted');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body) as unknown;
+    } catch {
+      safeEmit(emitDiagnostic, 'metadata_json_invalid');
+      return;
+    }
+    safeEmit(emitDiagnostic, 'metadata_json_parsed');
+    const catalog = extractCatalogObservation(parsed, {
+      allowSyntheticAuthoritative: false,
+    });
+    if (catalog.ok) {
+      safeEmit(emitDiagnostic, 'metadata_catalog_recognized');
+      safeEmit(emitCatalogMetadata, parsed);
+      safeEmit(emitCatalog, catalog.value);
+    } else {
+      safeEmit(emitDiagnostic, 'metadata_catalog_unrecognized');
+    }
+    return;
   }
+
+  if (openedIdentity === null) return;
+  const identity = openedIdentity;
 
   const sniffed = sniffTimedText({
     contentType,
@@ -937,15 +1516,65 @@ function inspectLoadedXhr(
     firstChunk: body.slice(0, 4096),
     maxBytes,
   });
-  if (!sniffed.ok) return;
+  if (!sniffed.ok) {
+    safeEmit(emitTimedTextCandidate, {
+      bound: binding !== undefined,
+      outcome: sniffed.error.code,
+      responseType: 'text',
+      stage: 'loaded',
+      transport: 'xhr',
+    });
+    return;
+  }
+  const language = binding === undefined &&
+      !canonicalizeNetflixTimedTextResource(openedCandidate).ok
+    ? extractNetflixTimedTextEmbeddedLanguage(body, sniffed.value.format)
+    : identity.language;
+  if (language === null) {
+    safeEmit(emitTimedTextCandidate, {
+      bound: binding !== undefined,
+      outcome: 'language_rejected',
+      responseType: 'text',
+      stage: 'loaded',
+      transport: 'xhr',
+    });
+    return;
+  }
+  safeEmit(emitTimedTextCandidate, {
+    bound: binding !== undefined,
+    outcome: 'accepted',
+    responseType: 'text',
+    stage: 'loaded',
+    transport: 'xhr',
+  });
   safeEmit(emit, {
     type: 'timed-text',
     resourceId: identity.resourceId,
     trackId: identity.trackId,
-    language: identity.language,
+    language,
     format: sniffed.value.format,
     body,
   });
+}
+
+export function extractNetflixTimedTextEmbeddedLanguage(
+  body: string,
+  format: 'ttml' | 'webvtt',
+): string | null {
+  if (format !== 'ttml') return null;
+  const prefix = body.replace(/^\uFEFF/u, '').trimStart().slice(0, 8_192);
+  const root = /^(?:<\?xml[^>]*>\s*)?<(?:[A-Za-z][\w.-]*:)?tt\b([^>]*)>/iu.exec(prefix);
+  if (root === null) return null;
+  const attributes = root[1] ?? '';
+  const languages = [...attributes.matchAll(
+    /(?:^|\s)xml:lang\s*=\s*(["'])([^"']+)\1/giu,
+  )].map((match) => match[2]?.trim().replaceAll('_', '-'));
+  const language = languages.length === 1 ? languages[0] : undefined;
+  return language !== undefined &&
+      language.length <= 35 &&
+      /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(language)
+    ? language
+    : null;
 }
 
 export function extractCatalogObservation(
@@ -1204,13 +1833,18 @@ function isNetflixMetadataCandidate(input: string): boolean {
   } catch {
     return false;
   }
+  const hasManifestSegment = url.pathname
+    .split('/')
+    .some((segment) =>
+      /^(?:licensedmanifest|manifests?|metadata)(?:\.json)?$/iu.test(segment),
+    );
   return (
     url.protocol === 'https:' &&
     url.username === '' &&
     url.password === '' &&
     (url.port === '' || url.port === '443') &&
     isNetflixOwnedHost(url.hostname) &&
-    /(?:manifest|metadata|playback|shakti)/iu.test(url.pathname)
+    hasManifestSegment
   );
 }
 
@@ -1248,6 +1882,49 @@ function parseContentLength(value: string | null): number | null {
   if (value === null || !/^\d+$/.test(value.trim())) return null;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function normalizeMetadataReadTimeout(value: number | undefined): number {
+  return Number.isSafeInteger(value) &&
+      value !== undefined &&
+      value > 0 &&
+      value <= MAX_METADATA_READ_TIMEOUT_MS
+    ? value
+    : DEFAULT_METADATA_READ_TIMEOUT_MS;
+}
+
+function isLikelyDecryptedNetflixManifest(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const resultDescriptor = Object.getOwnPropertyDescriptor(value, 'result');
+  let candidate: unknown = resultDescriptor !== undefined && 'value' in resultDescriptor
+    ? resultDescriptor.value
+    : value;
+  if (candidate === value) {
+    const dataDescriptor = Object.getOwnPropertyDescriptor(value, 'data');
+    const data = dataDescriptor !== undefined && 'value' in dataDescriptor
+      ? dataDescriptor.value
+      : undefined;
+    if (isRecord(data)) {
+      const nestedResultDescriptor = Object.getOwnPropertyDescriptor(data, 'result');
+      if (nestedResultDescriptor !== undefined && 'value' in nestedResultDescriptor) {
+        candidate = nestedResultDescriptor.value;
+      }
+    }
+  }
+  if (!isRecord(candidate)) return false;
+  const tracksDescriptor = Object.getOwnPropertyDescriptor(
+    candidate,
+    'timedtexttracks',
+  );
+  if (
+    tracksDescriptor === undefined ||
+    !('value' in tracksDescriptor) ||
+    !Array.isArray(tracksDescriptor.value)
+  ) return false;
+  return ['movieId', 'titleId', 'videoId'].some((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+    return descriptor !== undefined && 'value' in descriptor;
+  });
 }
 
 function isOpaqueId(value: unknown): value is string {

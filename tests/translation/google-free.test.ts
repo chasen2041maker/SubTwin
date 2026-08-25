@@ -158,6 +158,40 @@ describe('GoogleFreeProvider', () => {
     });
   });
 
+  it.each([
+    'Netflix',
+    'FBI',
+    '2024',
+    'John',
+    'ChatGPT',
+    'https://example.com/show',
+    '@SubTwin',
+  ])('accepts an unchanged protected token: %s', async (sourceText) => {
+    const provider = new GoogleFreeProvider({
+      fetch: vi.fn<typeof globalThis.fetch>().mockResolvedValue(
+        response([[[sourceText, sourceText]]]),
+      ),
+      minStartIntervalMs: 0,
+    });
+    const sourceRequest: TranslationRequest = {
+      ...request,
+      cues: [{ ...request.cues[0]!, text: sourceText }],
+    };
+
+    const result = await provider.translate(
+      sourceRequest,
+      new AbortController().signal,
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        translations: [{ cueId: 'cue-1', text: sourceText }],
+        retryCueIds: [],
+      },
+    });
+  });
+
   it('never retries 403', async () => {
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(response({}, 403));
     const provider = new GoogleFreeProvider({ fetch, minStartIntervalMs: 0 });

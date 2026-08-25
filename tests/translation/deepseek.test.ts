@@ -153,6 +153,47 @@ describe('PersonalDeepSeekProvider', () => {
   });
 
   it.each([
+    'Netflix',
+    'FBI',
+    '2024',
+    'John',
+    'ChatGPT',
+    'https://example.com/show',
+    '@SubTwin',
+  ])('accepts an unchanged protected token: %s', async (sourceText) => {
+    const protectedRequest: TranslationRequest = {
+      ...request,
+      cues: [{ ...request.cues[0]!, text: sourceText }],
+    };
+    const provider = new PersonalDeepSeekProvider({
+      apiKey: 'test-key-not-real',
+      fetch: vi.fn<typeof globalThis.fetch>().mockResolvedValue(jsonResponse({
+        choices: [{
+          finish_reason: 'stop',
+          message: {
+            content: JSON.stringify({
+              translations: [{ id: 'cue-1', text: sourceText }],
+            }),
+          },
+        }],
+      })),
+    });
+
+    const result = await provider.translate(
+      protectedRequest,
+      new AbortController().signal,
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        translations: [{ cueId: 'cue-1', text: sourceText }],
+        retryCueIds: [],
+      },
+    });
+  });
+
+  it.each([
     ['invalid JSON', 'not-json'],
     ['unknown ID', JSON.stringify({ translations: [
       { id: 'cue-1', text: '你好' },

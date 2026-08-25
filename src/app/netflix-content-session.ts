@@ -29,7 +29,7 @@ import {
   type SubtitleSessionTickSource,
 } from './session-controller';
 
-const MAX_PENDING_TIMED_TEXT = 2;
+const MAX_BUFFERED_TIMED_TEXTS = 16;
 const MAX_FAILED_TIMED_TEXT_BODIES_PER_RESOURCE = 3;
 const NATIVE_MATCH_TOLERANCE_MS = 2_000;
 
@@ -49,6 +49,15 @@ export interface NetflixContentCatalogSummary {
   readonly tracks: NetflixCatalogPayload['tracks'];
 }
 
+export interface NetflixContentDiagnostic {
+  readonly code:
+    | 'timed_text_accepted'
+    | 'timed_text_descriptor_missing'
+    | 'timed_text_parse_failed'
+    | 'timed_text_received';
+  readonly detail?: string;
+}
+
 export interface NetflixContentSessionOptions {
   readonly settings: RuntimeSettingsState;
   readonly tickSource: SubtitleSessionTickSource;
@@ -59,6 +68,7 @@ export interface NetflixContentSessionOptions {
   readonly onSessionState?: (state: NetflixContentSessionState) => void;
   readonly onCatalogSummary?: (summary: NetflixContentCatalogSummary) => void;
   readonly onBridgeRestart?: (reason: NetflixContentRestartReason) => void;
+  readonly onDiagnostic?: (diagnostic: NetflixContentDiagnostic) => void;
 }
 
 export interface NetflixContentSession {
@@ -67,7 +77,7 @@ export interface NetflixContentSession {
     settings: RuntimeSettingsState,
     options?: { readonly translationConfigurationChanged?: boolean },
   ): void;
-  playerRemounted(): void;
+  playerRemounted(watchTitleId: string | null): void;
   dispose(): void;
 }
 
@@ -113,6 +123,19 @@ export function bufferEarlyCatalogPayload(
   ];
 }
 
+export function bufferNetflixTimedTextPayload(
+  current: readonly NetflixTimedTextPayload[],
+  payload: NetflixTimedTextPayload,
+): NetflixTimedTextPayload[] {
+  return [
+    ...current.filter((candidate) => !(
+      candidate.titleId === payload.titleId &&
+      candidate.resourceId === payload.resourceId
+    )),
+    payload,
+  ].slice(-MAX_BUFFERED_TIMED_TEXTS);
+}
+
 interface AcceptedTimedTextResource {
   readonly fingerprint: string;
   readonly cueCount: number;
@@ -138,7 +161,10 @@ export function createNetflixContentSession(
   let nativeEvidenceByTrack = new Map<string, Set<string>>();
   let stronglyConfirmedTrackId: string | null = null;
   let pendingTimedText: NetflixTimedTextPayload[] = [];
+  let pendingWatchTitleId: string | null = null;
   let controller: SubtitleSessionController | undefined;
+  let liveCueSequence = 0;
+  let lastLiveCueText: string | null = null;
   let disposed = false;
 
   const safeStatus = (status: Parameters<SessionStatusSink['publish']>[0]): void => {
@@ -210,27 +236,38 @@ export function createNetflixContentSession(
   const selectParsedTrack = (
     category: 'english' | 'simplified-chinese',
   ): SubtitleTrack | null => {
-    const candidates = parsedTrackCandidates(category);
-    if (candidates.length === 0) return null;
-
-    // Once native Netflix text identifies the user's selected track, make that
-    // track authoritative for rendering/scheduling instead of relying on
-    // lexical track-id ordering (which can confuse English and English [CC]).
-    const activeTrackId = adapter?.tracks.find(
-      ({ active, language, lifecycle }) =>
-        active && lifecycle !== 'disposed' && language.category === category,
-    )?.trackId;
-    if (activeTrackId !== undefined) {
-      const active = candidates.find(({ id }) => id === activeTrackId);
-      if (active !== undefined) return active;
-    }
-    if (category === 'english' && stronglyConfirmedTrackId !== null) {
-      const stronglyConfirmed = candidates.find(
-        ({ id }) => id === stronglyConfirmedTrackId,
+    const candidates = descriptors
+      .filter((descriptor) =>
+        normalizeNetflixLanguageTag(descriptor.language)?.category === category)
+      .sort(compareTrackDescriptors);
+    if (category === 'english') {
+      if (stronglyConfirmedTrackId !== null) {
+        const confirmed = parsedTracks.get(stronglyConfirmedTrackId);
+        if (confirmed !== undefined && candidates.some(
+          ({ id }) => id === stronglyConfirmedTrackId,
+        )) return confirmed;
+      }
+      const activeIds = new Set(
+        (adapter?.tracks ?? [])
+          .filter(({ active, language, lifecycle }) =>
+            active &&
+            lifecycle !== 'disposed' &&
+            language.category === 'english')
+          .map(({ trackId }) => trackId),
       );
-      if (stronglyConfirmed !== undefined) return stronglyConfirmed;
+      const active = candidates.find(({ id }) => activeIds.has(id));
+      if (active !== undefined) return parsedTracks.get(active.id) ?? null;
+      if (candidates.length !== 1) return null;
     }
-    return candidates[0] ?? null;
+    const selected = candidates.find(({ id }) => parsedTracks.has(id));
+    return selected === undefined ? null : (parsedTracks.get(selected.id) ?? null);
+  };
+  const safeDiagnostic = (diagnostic: NetflixContentDiagnostic): void => {
+    try {
+      options.onDiagnostic?.(diagnostic);
+    } catch {
+      // Diagnostics are advisory and must never affect playback.
+    }
   };
 
   const currentTrackHash = (englishTrack: SubtitleTrack | null): string =>
@@ -251,6 +288,7 @@ export function createNetflixContentSession(
     subscribe(listener) {
       return options.tickSource.subscribe((tick) => {
         confirmActiveTrack(tick);
+        captureLiveEnglishCue(tick);
         listener(tick);
       });
     },
@@ -283,10 +321,9 @@ export function createNetflixContentSession(
       });
       return;
     }
-    // The route is changed first so a late official track closes the provider
-    // gate before any newly parsed body is exposed to the controller.
-    controller.updateRoute(decision);
-    controller.updateTracks({
+    // Route and track ownership must change atomically: either ordering alone
+    // can briefly schedule the old track or apply the old scheduling scope.
+    controller.updateRouteAndTracks(decision, {
       englishTrack,
       officialChineseTrack,
       trackHash,
@@ -305,27 +342,39 @@ export function createNetflixContentSession(
 
   const beginTitle = (catalog: NetflixCatalogPayload): void => {
     const initialPending = adapter === null ? pendingTimedText : [];
-    if (adapter !== null) reportSession('disposed');
+    const previousEventBase = eventBase();
+    if (previousEventBase !== null) reportSession('disposed');
     titleId = catalog.titleId;
     episodeId = episodeIdentity(catalog.titleId);
-    adapter = createNetflixAdapterState(
-      {
-        contentId: episodeId,
-        mountId: `mount_${++mountSequence}`,
-      },
-      options.nonceFactory === undefined
-        ? {}
-        : { nonceFactory: options.nonceFactory },
-    );
+    const mountId = `mount_${++mountSequence}`;
+    if (previousEventBase === null) {
+      adapter = createNetflixAdapterState(
+        { contentId: episodeId, mountId },
+        options.nonceFactory === undefined
+          ? {}
+          : { nonceFactory: options.nonceFactory },
+      );
+    } else if (!applyEvent({
+      ...previousEventBase,
+      type: 'session-transition',
+      nextContentId: episodeId,
+      nextMountId: mountId,
+      reason: 'episode-change',
+    })) {
+      return;
+    }
     descriptors = [];
     parsedTracks = new Map();
     acceptedResources = new Map();
     failedResourceFingerprints = new Map();
     nativeEvidenceByTrack = new Map();
     stronglyConfirmedTrackId = null;
+    liveCueSequence = 0;
+    lastLiveCueText = null;
     pendingTimedText = initialPending;
     applyCatalog(catalog);
     drainPendingTimedText();
+    if (adapter === null) return;
 
     const decision = route();
     if (controller === undefined) {
@@ -374,6 +423,10 @@ export function createNetflixContentSession(
   };
 
   const handleCatalog = (catalog: NetflixCatalogPayload): void => {
+    if (
+      pendingWatchTitleId !== null &&
+      catalog.titleId !== pendingWatchTitleId
+    ) return;
     const changedTitle = titleId !== null && titleId !== catalog.titleId;
     if (
       changedTitle &&
@@ -384,11 +437,16 @@ export function createNetflixContentSession(
     }
     if (titleId === null || changedTitle) {
       beginTitle(catalog);
-      if (changedTitle) safeCall(options.onBridgeRestart, 'episode-change');
     } else {
       applyCatalog(catalog);
       drainPendingTimedText();
       reconcile();
+    }
+    if (
+      pendingWatchTitleId === catalog.titleId &&
+      catalog.authority === 'authoritative'
+    ) {
+      pendingWatchTitleId = null;
     }
     if (adapter !== null) {
       safeCall(options.onCatalogSummary, {
@@ -419,7 +477,10 @@ export function createNetflixContentSession(
       payload.titleId !== titleId
     ) return false;
     const descriptor = resolveDescriptor(payload);
-    if (descriptor === null) return false;
+    if (descriptor === null) {
+      safeDiagnostic({ code: 'timed_text_descriptor_missing' });
+      return false;
+    }
     const bodyFingerprint = hashTranslationSource(
       `${payload.format}\u001f${payload.body}`,
     );
@@ -445,6 +506,16 @@ export function createNetflixContentSession(
       kind: descriptor.kind,
     });
     if (!parsed.ok) {
+      const category = normalizeNetflixLanguageTag(descriptor.language)?.category;
+      if (
+        (category === 'english' || category === 'simplified-chinese') &&
+        parsedTrackCandidates(category).length === 0
+      ) {
+        safeDiagnostic({
+          code: 'timed_text_parse_failed',
+          detail: parsed.error.code,
+        });
+      }
       const nextFailures = failures ?? new Set<string>();
       nextFailures.add(bodyFingerprint);
       failedResourceFingerprints.set(payload.resourceId, nextFailures);
@@ -457,6 +528,14 @@ export function createNetflixContentSession(
     acceptedResources.set(payload.resourceId, candidate);
     failedResourceFingerprints.delete(payload.resourceId);
     parsedTracks.set(descriptor.id, parsed.value);
+    safeDiagnostic({
+      code: 'timed_text_accepted',
+      detail:
+        parsedTrackCandidates('english').length > 0 &&
+          parsedTrackCandidates('simplified-chinese').length > 0
+          ? 'dual'
+          : 'partial',
+    });
     const base = eventBase();
     if (base !== null) {
       applyEvent({
@@ -473,14 +552,14 @@ export function createNetflixContentSession(
   };
 
   const handleTimedText = (payload: NetflixTimedTextPayload): void => {
+    if (
+      pendingWatchTitleId !== null &&
+      payload.titleId !== pendingWatchTitleId
+    ) return;
+    safeDiagnostic({ code: 'timed_text_received' });
     if (ingestTimedText(payload)) return;
     if (adapter !== null && resolveDescriptor(payload) !== null) return;
-    pendingTimedText = [
-      ...pendingTimedText.filter(
-        ({ resourceId }) => resourceId !== payload.resourceId,
-      ),
-      payload,
-    ].slice(-MAX_PENDING_TIMED_TEXT);
+    pendingTimedText = bufferNetflixTimedTextPayload(pendingTimedText, payload);
   };
 
   const drainPendingTimedText = (): void => {
@@ -506,7 +585,14 @@ export function createNetflixContentSession(
     if (match === undefined) return;
     const englishTrack = match.track;
     const matchedCue = match.cue;
-
+    const activeEnglish = adapter.tracks.find(
+      ({ active, language, lifecycle }) =>
+        active && lifecycle !== 'disposed' && language.category === 'english',
+    );
+    if (activeEnglish?.trackId !== englishTrack.id) {
+      nativeEvidenceByTrack = new Map();
+      stronglyConfirmedTrackId = null;
+    }
     let becameStronglyConfirmed = false;
     if (isDistinctiveNativeCueEvidence(englishTrack, matchedCue, visibleText)) {
       const evidence = nativeEvidenceByTrack.get(englishTrack.id) ?? new Set<string>();
@@ -534,6 +620,68 @@ export function createNetflixContentSession(
     }
   }
 
+  function captureLiveEnglishCue(tick: SubtitleSessionTick): void {
+    if (
+      controller === undefined ||
+      adapter === null ||
+      adapter.catalog.authority !== 'authoritative' ||
+      (settings.provider !== 'google-free' && settings.provider !== 'deepseek') ||
+      parsedTrackCandidates('english').length > 0
+    ) return;
+    const visibleText = normalizeVisibleText(tick.visibleText);
+    if (visibleText === null) {
+      lastLiveCueText = null;
+      return;
+    }
+    if (visibleText === lastLiveCueText) return;
+
+    const englishDescriptors = descriptors
+      .filter((descriptor) =>
+        normalizeNetflixLanguageTag(descriptor.language)?.category === 'english')
+      .sort(compareTrackDescriptors);
+    const activeEnglishIds = new Set(
+      adapter.tracks
+        .filter(({ active, language, lifecycle }) =>
+          active && lifecycle !== 'disposed' && language.category === 'english')
+        .map(({ trackId }) => trackId),
+    );
+    // Live fallback translates the text Netflix is visibly rendering, so the
+    // exact catalog variant (for example English vs English CC) does not alter
+    // the translation source. Prefer the active descriptor when known and use
+    // the stable catalog ordering otherwise.
+    const descriptor = englishDescriptors.find(({ id }) => activeEnglishIds.has(id)) ??
+      englishDescriptors[0];
+    if (descriptor === undefined) return;
+
+    const current = adapter.tracks.find(({ trackId }) => trackId === descriptor.id);
+    if (current?.active !== true) {
+      const base = eventBase();
+      if (base === null || !applyEvent({
+        ...base,
+        type: 'track-activity-changed',
+        trackId: descriptor.id,
+        active: true,
+      })) return;
+    }
+    stronglyConfirmedTrackId = descriptor.id;
+    controller.updateRoute(route());
+
+    const currentTimeMs = tick.currentTimeMs ?? options.tickSource.currentTimeMs();
+    if (
+      currentTimeMs === undefined ||
+      !Number.isFinite(currentTimeMs) ||
+      currentTimeMs < 0
+    ) return;
+    lastLiveCueText = visibleText;
+    liveCueSequence += 1;
+    controller.appendEnglishCue(descriptor.id, {
+      id: `native-live-${liveCueSequence}`,
+      startMs: Math.max(0, currentTimeMs - 250),
+      endMs: currentTimeMs + 6_000,
+      text: visibleText,
+    });
+  }
+
   if (!settings.enabled || settings.provider === 'unset') {
     safeStatus({ mode: 'unset' });
   } else {
@@ -543,7 +691,11 @@ export function createNetflixContentSession(
   return {
     handlePayload(payload) {
       if (disposed) return;
-      if (payload.type === 'catalog') handleCatalog(payload);
+      if (payload.type === 'diagnostic') {
+        if (payload.code === 'display_unavailable') {
+          safeStatus({ mode: 'error', code: 'netflix_unavailable' });
+        }
+      } else if (payload.type === 'catalog') handleCatalog(payload);
       else if (payload.type === 'timed-text') handleTimedText(payload);
     },
 
@@ -571,34 +723,23 @@ export function createNetflixContentSession(
       }
     },
 
-    playerRemounted() {
-      if (disposed || adapter === null || titleId === null || episodeId === null) return;
-      reportSession('disposed');
-      adapter = createNetflixAdapterState(
-        {
-          contentId: episodeId,
-          mountId: `mount_${++mountSequence}`,
-        },
-        options.nonceFactory === undefined
-          ? {}
-          : { nonceFactory: options.nonceFactory },
-      );
-      descriptors = [];
-      parsedTracks = new Map();
-      acceptedResources = new Map();
-      failedResourceFingerprints = new Map();
-      nativeEvidenceByTrack = new Map();
-      stronglyConfirmedTrackId = null;
-      pendingTimedText = [];
-      controller?.playerRemounted(adapter.session.sessionId, 'track_pending');
-      controller?.updateRoute(route());
-      controller?.updateTracks({
-        englishTrack: null,
-        officialChineseTrack: null,
-        trackHash: 'track_pending',
+    playerRemounted(watchTitleId) {
+      // Netflix may replace the DOM video node without changing the title.
+      // The tick source and native clock already rebind independently, so this
+      // must not invalidate the page-lifetime bridge or discard parsed tracks.
+      if (
+        disposed ||
+        watchTitleId === null ||
+        titleId === null ||
+        watchTitleId === titleId
+      ) return;
+      pendingWatchTitleId = watchTitleId;
+      beginTitle({
+        type: 'catalog',
+        titleId: watchTitleId,
+        authority: 'provisional',
+        tracks: [],
       });
-      reportSession('active');
-      safeCall(options.onBridgeRestart, 'player-remount');
     },
 
     dispose() {
@@ -613,6 +754,7 @@ export function createNetflixContentSession(
       nativeEvidenceByTrack.clear();
       stronglyConfirmedTrackId = null;
       pendingTimedText = [];
+      pendingWatchTitleId = null;
       try {
         options.overlay.clear();
       } catch {

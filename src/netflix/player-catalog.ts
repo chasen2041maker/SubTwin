@@ -1,5 +1,6 @@
 import type { NetflixCatalogPayload, NetflixCatalogTrackDescriptor } from './bridge';
 import { err, ok, type AppError, type Result } from '../shared/result';
+import { canonicalizeNetflixLogicalTrackId } from './track-identity';
 
 export const MAX_NETFLIX_PLAYER_SESSIONS = 64;
 export const MAX_NETFLIX_PLAYER_TRACKS = 256;
@@ -13,7 +14,9 @@ export type NetflixPlayerCatalogErrorCode =
   | 'netflix_player_catalog_too_large'
   | 'netflix_player_session_failed'
   | 'netflix_player_session_invalid'
-  | 'netflix_player_session_unavailable';
+  | 'netflix_player_session_unavailable'
+  | 'netflix_player_track_control_invalid'
+  | 'netflix_player_track_control_unavailable';
 
 export type NetflixPlayerCatalogError = AppError<NetflixPlayerCatalogErrorCode>;
 
@@ -25,8 +28,8 @@ const LANGUAGE_FIELDS = [
 ] as const;
 const ID_FIELDS = [
   'trackId',
-  'id',
   'new_track_id',
+  'id',
   'downloadableId',
 ] as const;
 const KIND_FIELDS = ['kind', 'trackType', 'rawTrackType', 'type'] as const;
@@ -52,6 +55,157 @@ type TrackParseResult =
       readonly value: NetflixCatalogTrackDescriptor;
     };
 
+export interface NetflixPlayerTrackCapture {
+  readonly titleId: string;
+  readonly originalTrackId: string | undefined;
+  switchTo(trackId: string): boolean;
+  restore(): void;
+}
+
+/**
+ * Prepares a reversible, MAIN-world-only controller for forcing Netflix to
+ * request subtitle bodies. Raw Player track objects never leave this closure.
+ */
+export function prepareNetflixPlayerTrackCapture(
+  target: unknown,
+  catalog: NetflixCatalogPayload,
+): Result<NetflixPlayerTrackCapture, NetflixPlayerCatalogError> {
+  if (
+    catalog.authority !== 'authoritative' ||
+    catalog.tracks.length === 0 ||
+    catalog.tracks.length > MAX_NETFLIX_PLAYER_TRACKS
+  ) {
+    return playerCatalogError('netflix_player_track_control_invalid');
+  }
+
+  let player: Readonly<Record<string, unknown>>;
+  let rawTitleId: unknown;
+  let rawTracks: unknown;
+  let originalTrack: unknown;
+  try {
+    const playerApp = nestedRecord(target, [
+      'netflix',
+      'appContext',
+      'state',
+      'playerApp',
+    ]);
+    if (playerApp === null || typeof playerApp.getAPI !== 'function') {
+      return playerCatalogError('netflix_player_track_control_unavailable');
+    }
+    const api = Reflect.apply(playerApp.getAPI, playerApp, []) as unknown;
+    if (
+      !isRecord(api) ||
+      !isRecord(api.videoPlayer) ||
+      typeof api.videoPlayer.getAllPlayerSessionIds !== 'function' ||
+      typeof api.videoPlayer.getVideoPlayerBySessionId !== 'function'
+    ) {
+      return playerCatalogError('netflix_player_track_control_unavailable');
+    }
+    const sessionIds = Reflect.apply(
+      api.videoPlayer.getAllPlayerSessionIds,
+      api.videoPlayer,
+      [],
+    ) as unknown;
+    if (!Array.isArray(sessionIds)) {
+      return playerCatalogError('netflix_player_track_control_invalid');
+    }
+    const validSessionIds = uniqueValidSessionIds(sessionIds);
+    const sessionId = validSessionIds.find((id) => id.toLowerCase().includes('watch')) ??
+      validSessionIds[0];
+    if (sessionId === undefined) {
+      return playerCatalogError('netflix_player_track_control_unavailable');
+    }
+    const candidate = Reflect.apply(
+      api.videoPlayer.getVideoPlayerBySessionId,
+      api.videoPlayer,
+      [sessionId],
+    ) as unknown;
+    if (
+      !isRecord(candidate) ||
+      typeof candidate.getMovieId !== 'function' ||
+      typeof candidate.getTextTrackList !== 'function' ||
+      typeof candidate.getTimedTextTrack !== 'function' ||
+      typeof candidate.setTimedTextTrack !== 'function'
+    ) {
+      return playerCatalogError('netflix_player_track_control_unavailable');
+    }
+    player = candidate;
+    rawTitleId = Reflect.apply(candidate.getMovieId, candidate, []) as unknown;
+    rawTracks = Reflect.apply(candidate.getTextTrackList, candidate, []) as unknown;
+    originalTrack = Reflect.apply(candidate.getTimedTextTrack, candidate, []) as unknown;
+  } catch {
+    return playerCatalogError('netflix_player_track_control_unavailable');
+  }
+
+  const titleId = sanitizeTitleId(rawTitleId);
+  if (
+    titleId === null ||
+    titleId !== catalog.titleId ||
+    !Array.isArray(rawTracks) ||
+    rawTracks.length > MAX_NETFLIX_PLAYER_TRACKS
+  ) {
+    return playerCatalogError('netflix_player_track_control_invalid');
+  }
+
+  const expected = new Map(catalog.tracks.map((track) => [track.id, track]));
+  const rawByTrackId = new Map<string, unknown>();
+  let originalTrackId: string | undefined;
+  try {
+    for (let index = 0; index < rawTracks.length; index += 1) {
+      const parsed = sanitizeTrack(rawTracks[index], index);
+      if (parsed.kind !== 'track') continue;
+      const approved = expected.get(parsed.value.id);
+      if (
+        approved === undefined ||
+        approved.language.toLowerCase() !== parsed.value.language.toLowerCase() ||
+        approved.kind !== parsed.value.kind ||
+        rawByTrackId.has(parsed.value.id)
+      ) continue;
+      rawByTrackId.set(parsed.value.id, rawTracks[index]);
+      if (rawTracks[index] === originalTrack) originalTrackId = parsed.value.id;
+    }
+  } catch {
+    return playerCatalogError('netflix_player_track_control_invalid');
+  }
+  if (rawByTrackId.size === 0) {
+    return playerCatalogError('netflix_player_track_control_invalid');
+  }
+
+  const setTimedTextTrack = player.setTimedTextTrack;
+  let currentTrack = originalTrack;
+  let restored = true;
+  return ok({
+    titleId,
+    originalTrackId,
+    switchTo(trackId) {
+      const rawTrack = rawByTrackId.get(trackId);
+      if (rawTrack === undefined) return false;
+      if (rawTrack === currentTrack) return true;
+      try {
+        Reflect.apply(setTimedTextTrack as (...args: unknown[]) => unknown, player, [rawTrack]);
+        currentTrack = rawTrack;
+        restored = rawTrack === originalTrack;
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    restore() {
+      if (restored || currentTrack === originalTrack) {
+        restored = true;
+        return;
+      }
+      try {
+        Reflect.apply(setTimedTextTrack as (...args: unknown[]) => unknown, player, [originalTrack]);
+        currentTrack = originalTrack;
+        restored = true;
+      } catch {
+        // Page teardown and Netflix API changes must not escape cleanup.
+      }
+    },
+  });
+}
+
 /**
  * Reads Netflix's live MAIN-world player API without changing player state.
  * A successful result represents the complete text-track list and is therefore
@@ -59,6 +213,7 @@ type TrackParseResult =
  */
 export function readNetflixPlayerCatalog(
   target: unknown = globalThis,
+  onMetadata?: (metadata: unknown) => void,
 ): Result<NetflixCatalogPayload, NetflixPlayerCatalogError> {
   let videoPlayer: Readonly<Record<string, unknown>>;
   try {
@@ -169,12 +324,93 @@ export function readNetflixPlayerCatalog(
     return playerCatalogError('netflix_player_catalog_failed');
   }
 
-  return ok({
+  const catalog: NetflixCatalogPayload = {
     type: 'catalog',
     titleId,
     authority: 'authoritative',
     tracks: [...tracks.values()],
-  });
+  };
+  try {
+    if (onMetadata !== undefined) {
+      onMetadata(readPlayerMetadata(player, titleId, rawTracks));
+    }
+  } catch {
+    // MAIN-world metadata observation is advisory and must not affect catalog use.
+  }
+  return ok(catalog);
+}
+
+function readPlayerMetadata(
+  player: Readonly<Record<string, unknown>>,
+  titleId: string,
+  rawTracks: readonly unknown[],
+): unknown {
+  for (const method of [
+    'getManifest',
+    'getMovieManifest',
+    'getPlaybackInfo',
+  ] as const) {
+    try {
+      const candidate = player[method];
+      if (typeof candidate !== 'function') continue;
+      const metadata = Reflect.apply(candidate, player, []) as unknown;
+      if (
+        isRecord(metadata) &&
+        typeof metadata.then !== 'function'
+      ) {
+        return {
+          titleId,
+          metadata,
+        };
+      }
+    } catch {
+      // Private read-only accessors are best-effort; try the next known shape.
+    }
+  }
+  try {
+    const candidate = player.getInternalPlayer;
+    if (typeof candidate === 'function') {
+      const internalPlayer = Reflect.apply(candidate, player, []) as unknown;
+      const playback = isRecord(internalPlayer)
+        ? internalPlayer.playback
+        : undefined;
+      const manifest = isRecord(playback)
+        ? playback.manifest
+        : undefined;
+      const manifestResult = isRecord(manifest)
+        ? manifest.manifestResult
+        : undefined;
+      if (
+        isRecord(manifestResult) &&
+        typeof manifestResult.then !== 'function'
+      ) {
+        return {
+          titleId,
+          metadata: manifestResult,
+        };
+      }
+    }
+  } catch {
+    // Cadmium's internal manifest is advisory; retain the shallow fallback.
+  }
+  try {
+    const candidate = player.getTimedTextTrackList;
+    if (typeof candidate === 'function') {
+      const timedTextTracks = Reflect.apply(candidate, player, []) as unknown;
+      if (Array.isArray(timedTextTracks)) {
+        return {
+          titleId,
+          timedtexttracks: timedTextTracks,
+        };
+      }
+    }
+  } catch {
+    // The read-only Cadmium list is best-effort; retain the legacy fallback.
+  }
+  return {
+    titleId,
+    timedtexttracks: rawTracks,
+  };
 }
 
 function sanitizeTrack(value: unknown, index: number): TrackParseResult {
@@ -253,17 +489,8 @@ function sanitizeKind(
 function firstSafeOpaqueId(value: Readonly<Record<string, unknown>>): string | null {
   for (const field of ID_FIELDS) {
     if (!Object.hasOwn(value, field)) continue;
-    const raw = value[field];
-    if (typeof raw === 'string') {
-      const candidate = raw.trim();
-      if (isOpaqueId(candidate)) return candidate;
-    } else if (
-      typeof raw === 'number' &&
-      Number.isSafeInteger(raw) &&
-      raw >= 0
-    ) {
-      return String(raw);
-    }
+    const candidate = canonicalizeNetflixLogicalTrackId(value[field]);
+    if (candidate !== null) return candidate;
   }
   return null;
 }

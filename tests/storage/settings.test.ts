@@ -37,6 +37,29 @@ class MemoryStorage implements SettingsStorageAdapter {
 }
 
 describe('versioned settings', () => {
+  test('migrates schema v1 appearance records to the font-aware schema v2', () => {
+    expect(SETTINGS_SCHEMA_VERSION).toBe(2);
+    const migrated = migrateSettings({
+      schemaVersion: 1,
+      enabled: true,
+      provider: 'unset',
+      deepseek: { apiKey: '', model: 'deepseek-v4-flash' },
+      appearance: {
+        english: { visible: true, color: '#FFFFFF', fontSizePx: 28, fontWeight: 600 },
+        chinese: { visible: true, color: '#FFFFFF', fontSizePx: 32, fontWeight: 600 },
+        order: 'english-first',
+        lineSpacingPx: 8,
+        verticalOffsetPercent: 8,
+        backgroundOpacity: 0.55,
+        shadow: 'soft',
+      },
+    });
+
+    expect(migrated.schemaVersion).toBe(2);
+    expect(migrated.appearance.english.fontFamily).toBe('sans');
+    expect(migrated.appearance.chinese.fontFamily).toBe('sans');
+  });
+
   test('uses an enabled but provider-unset privacy-safe first-run default', async () => {
     const storage = new MemoryStorage();
 
@@ -64,12 +87,14 @@ describe('versioned settings', () => {
         english: {
           visible: false,
           color: '#abc',
+          fontFamily: 'serif',
           fontSize: 34,
           fontWeight: 500,
         },
         chinese: {
           visible: true,
           color: '#12abEF',
+          fontFamily: 'rounded',
           fontSize: 38,
           fontWeight: 700,
         },
@@ -94,17 +119,20 @@ describe('versioned settings', () => {
         english: {
           visible: false,
           color: '#AABBCC',
+          fontFamily: 'serif',
           fontSizePx: 34,
           fontWeight: 500,
         },
         chinese: {
           visible: true,
           color: '#12ABEF',
+          fontFamily: 'rounded',
           fontSizePx: 38,
           fontWeight: 700,
         },
         order: 'chinese-first',
         lineSpacingPx: 12,
+        maxLineWidthPercent: 96,
         verticalOffsetPercent: 14,
         backgroundOpacity: 0.7,
         shadow: 'soft',
@@ -134,11 +162,13 @@ describe('versioned settings', () => {
         chinese: {
           visible: false,
           color: '#010203',
+          fontFamily: 'invalid-font',
           fontSizePx: 900,
           fontWeight: -1,
         },
         order: 'side-by-side',
         lineSpacingPx: 999,
+        maxLineWidthPercent: 999,
         verticalOffsetPercent: -999,
         backgroundOpacity: 5,
         shadow: 'glow',
@@ -161,11 +191,13 @@ describe('versioned settings', () => {
         chinese: {
           visible: false,
           color: '#010203',
+          fontFamily: DEFAULT_SETTINGS.appearance.chinese.fontFamily,
           fontSizePx: 72,
           fontWeight: 100,
         },
         order: DEFAULT_SETTINGS.appearance.order,
         lineSpacingPx: 48,
+        maxLineWidthPercent: 100,
         verticalOffsetPercent: 0,
         backgroundOpacity: 1,
         shadow: DEFAULT_SETTINGS.appearance.shadow,

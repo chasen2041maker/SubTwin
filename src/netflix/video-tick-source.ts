@@ -76,6 +76,7 @@ export function createVideoTickSource(
   let framePending = false;
   let frameHandle: unknown;
   let lastClockEmissionMs: number | undefined;
+  let lastNativeVisibleText: string | undefined;
 
   const safeNow = (): number | undefined => {
     try {
@@ -134,7 +135,9 @@ export function createVideoTickSource(
     const value = currentTimeMs();
     if (value === undefined) return;
     markClockEmission();
-    emit({ currentTimeMs: value });
+    emit(lastNativeVisibleText === undefined
+      ? { currentTimeMs: value }
+      : { visibleText: lastNativeVisibleText, currentTimeMs: value });
   };
 
   const cancelFrame = (): void => {
@@ -295,6 +298,7 @@ export function createVideoTickSource(
     unbindVideo();
     hasBoundVideo = false;
     lastClockEmissionMs = undefined;
+    lastNativeVisibleText = undefined;
   };
 
   return {
@@ -314,6 +318,7 @@ export function createVideoTickSource(
     },
     emitNative(tick) {
       if (disposed) return;
+      lastNativeVisibleText = tick.visibleText;
       markClockEmission();
       emit(tick);
     },

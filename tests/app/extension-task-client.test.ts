@@ -163,44 +163,54 @@ describe('extension translation task client', () => {
   });
 
   it('keeps retryable provider errors cue-local and allows later retry', async () => {
-    const providers: string[] = [];
-    const status = vi.fn();
-    const sendMessage = vi.fn(async (candidate: unknown) => {
-      const request = parsedRequest(candidate);
-      providers.push(request.payload.provider);
-      return ok(createMessage({
-        id: `${request.id}:background`,
-        source: 'background',
-        type: 'translation/result',
-        payload: {
-          taskId: request.payload.taskId,
-          sessionId: request.payload.sessionId,
-          provider: request.payload.provider,
-          episodeGeneration: request.payload.episodeGeneration,
-          providerGeneration: request.payload.providerGeneration,
-          status: 'error',
-          translations: [],
-          retryCueIds: [],
-          errorCode: 'rate_limited',
-          retryable: true,
-        },
+    vi.useFakeTimers();
+    try {
+      const providers: string[] = [];
+      const status = vi.fn();
+      const sendMessage = vi.fn(async (candidate: unknown) => {
+        const request = parsedRequest(candidate);
+        providers.push(request.payload.provider);
+        return ok(createMessage({
+          id: `${request.id}:background`,
+          source: 'background',
+          type: 'translation/result',
+          payload: {
+            taskId: request.payload.taskId,
+            sessionId: request.payload.sessionId,
+            provider: request.payload.provider,
+            episodeGeneration: request.payload.episodeGeneration,
+            providerGeneration: request.payload.providerGeneration,
+            status: 'error',
+            translations: [],
+            retryCueIds: [],
+            errorCode: 'rate_limited',
+            retryable: true,
+          },
+        }));
+      });
+      const client = createExtensionTranslationTaskClient({
+        sendMessage,
+        onRuntimeStatus: status,
+      });
+      const sink = callbacks();
+      const scheduled = task('google-free');
+
+      client.enqueue(scheduled, sink);
+      await client.whenIdle();
+      client.enqueue(scheduled, sink);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await client.whenIdle();
+
+      expect(providers).toEqual(['google-free', 'google-free']);
+      expect(sink.onError).toHaveBeenCalledTimes(2);
+      expect(sink.onError).toHaveBeenLastCalledWith(expect.objectContaining({
+        code: 'rate_limited',
+        retryable: true,
       }));
-    });
-    const client = createExtensionTranslationTaskClient({
-      sendMessage,
-      onRuntimeStatus: status,
-    });
-    const sink = callbacks();
-    const scheduled = task('google-free');
-
-    client.enqueue(scheduled, sink);
-    await client.whenIdle();
-    client.enqueue(scheduled, sink);
-    await client.whenIdle();
-
-    expect(providers).toEqual(['google-free', 'google-free']);
-    expect(sink.onError).not.toHaveBeenCalled();
-    expect(status).toHaveBeenLastCalledWith({ mode: 'error', code: 'rate_limited' });
+      expect(status).toHaveBeenLastCalledWith({ mode: 'error', code: 'rate_limited' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('contains Google cue validation failures without disabling the episode', async () => {
@@ -234,7 +244,10 @@ describe('extension translation task client', () => {
     client.enqueue(task('google-free'), sink);
     await client.whenIdle();
 
-    expect(sink.onError).not.toHaveBeenCalled();
+    expect(sink.onError).toHaveBeenCalledWith(expect.objectContaining({
+      code: 'invalid_response',
+      retryable: false,
+    }));
     expect(status).toHaveBeenLastCalledWith({
       mode: 'error',
       code: 'provider_unavailable',
@@ -255,7 +268,10 @@ describe('extension translation task client', () => {
     client.enqueue(task(), sink);
     await client.whenIdle();
 
-    expect(sink.onError).not.toHaveBeenCalled();
+    expect(sink.onError).toHaveBeenCalledWith(expect.objectContaining({
+      code: 'provider_unavailable',
+      retryable: true,
+    }));
     expect(status).toHaveBeenLastCalledWith({ mode: 'error', code: 'offline' });
   });
 

@@ -179,7 +179,7 @@ describe('TranslationScheduler priority and capacity', () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 
-  it('deduplicates an urgent cue that is already owned by an in-flight bulk request', async () => {
+  it('lets urgent work supersede a cue already owned by an in-flight bulk request', async () => {
     const bulk = deferred<TranslationResult>();
     const execute = vi.fn((scheduled: ScheduledTranslationTask) =>
       scheduled.priority === 'bulk'
@@ -197,15 +197,16 @@ describe('TranslationScheduler priority and capacity', () => {
 
     scheduler.enqueue(task('bulk', 'bulk', ['cue-1', 'cue-2', 'cue-3']));
     await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
-    expect(scheduler.enqueue(task('seek', 'urgent', ['cue-2']))).toBe('deduplicated');
-    expect(execute).toHaveBeenCalledOnce();
+    expect(scheduler.enqueue(task('seek', 'urgent', ['cue-2']))).toBe('queued');
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+    expect(execute.mock.calls[1]?.[0].cues.map(({ id }) => id)).toEqual(['cue-2']);
 
     bulk.resolve(translated(['cue-1', 'cue-2', 'cue-3']));
     await scheduler.whenIdle();
-    expect(execute).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledTimes(2);
   });
 
-  it('filters only overlapping in-flight bulk cues and still runs new urgent cues', async () => {
+  it('keeps overlapping and new cues together in an urgent request', async () => {
     const bulk = deferred<TranslationResult>();
     const urgent = deferred<TranslationResult>();
     const execute = vi.fn((scheduled: ScheduledTranslationTask) =>
@@ -224,13 +225,268 @@ describe('TranslationScheduler priority and capacity', () => {
     await vi.waitFor(() => expect(scheduler.snapshot().inFlight).toBe(1));
     expect(scheduler.enqueue(task('seek', 'urgent', ['cue-1', 'cue-2']))).toBe('queued');
     await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
-    expect(execute.mock.calls[1]?.[0].cues.map(({ id }) => id)).toEqual(['cue-2']);
+    expect(execute.mock.calls[1]?.[0].cues.map(({ id }) => id)).toEqual([
+      'cue-1',
+      'cue-2',
+    ]);
     expect(scheduler.snapshot().inFlight).toBe(2);
 
-    urgent.resolve(translated(['cue-2']));
+    urgent.resolve(translated(['cue-1', 'cue-2']));
     bulk.resolve(translated(['cue-1']));
     await scheduler.whenIdle();
     expect(scheduler.snapshot().inFlight).toBe(0);
+  });
+
+  it('keeps an urgent result when an overlapping bulk batch completes later', async () => {
+    const bulk = deferred<TranslationResult>();
+    const urgent = deferred<TranslationResult>();
+    const execute = vi.fn((scheduled: ScheduledTranslationTask) =>
+      scheduled.priority === 'bulk' ? bulk.promise : urgent.promise,
+    );
+    const cached = new Map<string, string>();
+    const rendered = new Map<string, string>();
+    const writeCache = vi.fn(async (
+      _scheduled: ScheduledTranslationTask,
+      batch: { readonly translations: readonly { readonly cueId: string; readonly text: string }[] },
+    ) => {
+      for (const translation of batch.translations) {
+        cached.set(translation.cueId, translation.text);
+      }
+    });
+    const render = vi.fn((
+      _scheduled: ScheduledTranslationTask,
+      batch: { readonly translations: readonly { readonly cueId: string; readonly text: string }[] },
+    ) => {
+      for (const translation of batch.translations) {
+        rendered.set(translation.cueId, translation.text);
+      }
+    });
+    const scheduler = new TranslationScheduler({
+      generation: { episodeGeneration: 1, providerGeneration: 1 },
+      execute,
+      writeCache,
+      render,
+      maxConcurrent: 2,
+      reservedUrgent: 1,
+    });
+
+    scheduler.enqueue(task('bulk', 'bulk', ['cue-1', 'cue-2']));
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    scheduler.enqueue(task('seek', 'urgent', ['cue-1']));
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+    urgent.resolve({
+      ok: true,
+      value: {
+        translations: [{ cueId: 'cue-1', text: '紧急翻译' }],
+        retryCueIds: [],
+      },
+    });
+    await vi.waitFor(() => expect(rendered.get('cue-1')).toBe('紧急翻译'));
+    bulk.resolve({
+      ok: true,
+      value: {
+        translations: [
+          { cueId: 'cue-1', text: '批量翻译' },
+          { cueId: 'cue-2', text: '第二句' },
+        ],
+        retryCueIds: [],
+      },
+    });
+    await scheduler.whenIdle();
+
+    expect(Object.fromEntries(cached)).toEqual({
+      'cue-1': '紧急翻译',
+      'cue-2': '第二句',
+    });
+    expect(Object.fromEntries(rendered)).toEqual({
+      'cue-1': '紧急翻译',
+      'cue-2': '第二句',
+    });
+    const bulkCommits = writeCache.mock.calls
+      .filter(([scheduled]) => scheduled.priority === 'bulk')
+      .flatMap(([, batch]) => batch.translations.map(({ cueId }) => cueId));
+    expect(bulkCommits).toEqual(['cue-2']);
+  });
+
+  it('revokes a bulk cache guard when urgent claims the cue during the cache write', async () => {
+    const bulkResult = deferred<TranslationResult>();
+    const urgentResult = deferred<TranslationResult>();
+    const bulkCacheStarted = deferred<void>();
+    const releaseBulkCache = deferred<void>();
+    let cachedText: string | undefined;
+    let renderedText: string | undefined;
+    const scheduler = new TranslationScheduler({
+      generation: { episodeGeneration: 1, providerGeneration: 1 },
+      execute: vi.fn((scheduled: ScheduledTranslationTask) =>
+        scheduled.priority === 'bulk' ? bulkResult.promise : urgentResult.promise),
+      async writeCache(scheduled, batch, guard) {
+        if (scheduled.priority === 'bulk') {
+          bulkCacheStarted.resolve();
+          await releaseBulkCache.promise;
+        }
+        if (guard.isCurrent()) cachedText = batch.translations[0]?.text;
+      },
+      render(_scheduled, batch) {
+        renderedText = batch.translations[0]?.text;
+      },
+      maxConcurrent: 2,
+      reservedUrgent: 1,
+    });
+
+    scheduler.enqueue(task('bulk-cache-race', 'bulk', ['cue-1']));
+    await vi.waitFor(() => expect(scheduler.snapshot().inFlight).toBe(1));
+    bulkResult.resolve({
+      ok: true,
+      value: {
+        translations: [{ cueId: 'cue-1', text: '批量翻译' }],
+        retryCueIds: [],
+      },
+    });
+    await bulkCacheStarted.promise;
+
+    scheduler.enqueue(task('urgent-cache-race', 'urgent', ['cue-1']));
+    await vi.waitFor(() => expect(scheduler.snapshot().inFlight).toBe(2));
+    urgentResult.resolve({
+      ok: true,
+      value: {
+        translations: [{ cueId: 'cue-1', text: '紧急翻译' }],
+        retryCueIds: [],
+      },
+    });
+    await vi.waitFor(() => expect(renderedText).toBe('紧急翻译'));
+    releaseBulkCache.resolve();
+    await scheduler.whenIdle();
+
+    expect(cachedText).toBe('紧急翻译');
+    expect(renderedText).toBe('紧急翻译');
+  });
+
+  it('reserves an overlapping cue for urgent even when bulk finishes first', async () => {
+    const bulk = deferred<TranslationResult>();
+    const urgent = deferred<TranslationResult>();
+    const execute = vi.fn((scheduled: ScheduledTranslationTask) =>
+      scheduled.priority === 'bulk' ? bulk.promise : urgent.promise,
+    );
+    const render = vi.fn();
+    const scheduler = new TranslationScheduler({
+      generation: { episodeGeneration: 1, providerGeneration: 1 },
+      execute,
+      writeCache: vi.fn().mockResolvedValue(undefined),
+      render,
+      maxConcurrent: 2,
+      reservedUrgent: 1,
+    });
+
+    scheduler.enqueue(task('bulk', 'bulk', ['cue-1', 'cue-2']));
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    scheduler.enqueue(task('seek', 'urgent', ['cue-1']));
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+    bulk.resolve(translated(['cue-1', 'cue-2']));
+    await vi.waitFor(() => expect(render).toHaveBeenCalledOnce());
+
+    expect(render.mock.calls[0]?.[1].translations.map(
+      ({ cueId }: { readonly cueId: string }) => cueId,
+    )).toEqual(['cue-2']);
+    urgent.resolve(translated(['cue-1']));
+    await scheduler.whenIdle();
+  });
+
+  it('returns cache and render ownership to bulk when overlapping urgent work fails', async () => {
+    const bulk = deferred<TranslationResult>();
+    const urgent = deferred<TranslationResult>();
+    const render = vi.fn();
+    const scheduler = new TranslationScheduler({
+      generation: { episodeGeneration: 1, providerGeneration: 1 },
+      execute: vi.fn((scheduled: ScheduledTranslationTask) =>
+        scheduled.priority === 'bulk' ? bulk.promise : urgent.promise),
+      writeCache: vi.fn().mockResolvedValue(undefined),
+      render,
+      maxConcurrent: 2,
+      reservedUrgent: 1,
+    });
+
+    scheduler.enqueue(task('bulk-fallback', 'bulk', ['cue-1']));
+    await vi.waitFor(() => expect(scheduler.snapshot().inFlight).toBe(1));
+    scheduler.enqueue(task('urgent-failure', 'urgent', ['cue-1']));
+    await vi.waitFor(() => expect(scheduler.snapshot().inFlight).toBe(2));
+    urgent.resolve({
+      ok: false,
+      error: { code: 'timeout', message: 'Timed out.', retryable: true },
+    });
+    await vi.waitFor(() => expect(scheduler.snapshot().inFlight).toBe(1));
+    bulk.resolve(translated(['cue-1']));
+    await scheduler.whenIdle();
+
+    expect(render).toHaveBeenCalledOnce();
+    expect(render.mock.calls[0]?.[0].priority).toBe('bulk');
+    expect(render.mock.calls[0]?.[1].translations.map(
+      ({ cueId }: { readonly cueId: string }) => cueId,
+    )).toEqual(['cue-1']);
+  });
+
+  it('holds an earlier bulk result until overlapping urgent work succeeds or fails', async () => {
+    const bulk = deferred<TranslationResult>();
+    const urgent = deferred<TranslationResult>();
+    const render = vi.fn();
+    const scheduler = new TranslationScheduler({
+      generation: { episodeGeneration: 1, providerGeneration: 1 },
+      execute: vi.fn((scheduled: ScheduledTranslationTask) =>
+        scheduled.priority === 'bulk' ? bulk.promise : urgent.promise),
+      writeCache: vi.fn().mockResolvedValue(undefined),
+      render,
+      maxConcurrent: 2,
+      reservedUrgent: 1,
+    });
+
+    scheduler.enqueue(task('early-bulk-fallback', 'bulk', ['cue-1']));
+    await vi.waitFor(() => expect(scheduler.snapshot().inFlight).toBe(1));
+    scheduler.enqueue(task('later-urgent-failure', 'urgent', ['cue-1']));
+    await vi.waitFor(() => expect(scheduler.snapshot().inFlight).toBe(2));
+    bulk.resolve(translated(['cue-1']));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(render).not.toHaveBeenCalled();
+    expect(scheduler.snapshot().inFlight).toBe(2);
+
+    urgent.resolve({
+      ok: false,
+      error: { code: 'timeout', message: 'Timed out.', retryable: true },
+    });
+    await scheduler.whenIdle();
+
+    expect(render).toHaveBeenCalledOnce();
+    expect(render.mock.calls[0]?.[0].priority).toBe('bulk');
+  });
+
+  it('parks a completed bulk fallback so queued urgent work can use the only slot', async () => {
+    const bulk = deferred<TranslationResult>();
+    const urgent = deferred<TranslationResult>();
+    const execute = vi.fn((scheduled: ScheduledTranslationTask) =>
+      scheduled.priority === 'bulk' ? bulk.promise : urgent.promise);
+    const render = vi.fn();
+    const scheduler = new TranslationScheduler({
+      generation: { episodeGeneration: 1, providerGeneration: 1 },
+      execute,
+      writeCache: vi.fn().mockResolvedValue(undefined),
+      render,
+      maxConcurrent: 1,
+      reservedUrgent: 0,
+    });
+
+    scheduler.enqueue(task('single-slot-bulk', 'bulk', ['cue-1']));
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    scheduler.enqueue(task('single-slot-urgent', 'urgent', ['cue-1']));
+    bulk.resolve(translated(['cue-1']));
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+
+    urgent.resolve({
+      ok: false,
+      error: { code: 'timeout', message: 'Timed out.', retryable: true },
+    });
+    await scheduler.whenIdle();
+
+    expect(render).toHaveBeenCalledOnce();
+    expect(render.mock.calls[0]?.[0].priority).toBe('bulk');
   });
 
   it.each(['dispose', 'generation'] as const)(
@@ -269,6 +525,25 @@ describe('TranslationScheduler priority and capacity', () => {
       await scheduler.whenIdle();
     },
   );
+
+  it('resolves idle waiters when disposed before a scheduled pump starts', async () => {
+    const scheduler = new TranslationScheduler({
+      generation: { episodeGeneration: 1, providerGeneration: 1 },
+      execute: vi.fn().mockResolvedValue(translated(['cue-1'])),
+      writeCache: vi.fn().mockResolvedValue(undefined),
+      render: vi.fn(),
+    });
+    scheduler.enqueue(task('dispose-before-pump', 'urgent', ['cue-1']));
+    let idle = false;
+    const idlePromise = scheduler.whenIdle().then(() => { idle = true; });
+
+    scheduler.dispose();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(idle).toBe(true);
+    await idlePromise;
+  });
 
   it('deduplicates the same provider/generation/cue content even when task IDs differ', async () => {
     const blocker = deferred<TranslationResult>();
@@ -427,11 +702,46 @@ describe('TranslationScheduler retries and generations', () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 
+  it('pauses queued provider work until the rate-limit cooldown expires', async () => {
+    vi.useFakeTimers();
+    try {
+      const execute = vi.fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          error: { code: 'rate_limited', message: 'Rate limited.', retryable: true },
+        })
+        .mockResolvedValueOnce(translated(['cue-2']));
+      const scheduler = new TranslationScheduler({
+        generation: { episodeGeneration: 1, providerGeneration: 1 },
+        execute,
+        writeCache: vi.fn().mockResolvedValue(undefined),
+        render: vi.fn(),
+        maxConcurrent: 1,
+        reservedUrgent: 0,
+        rateLimitCooldownMs: 30_000,
+      });
+
+      scheduler.enqueue(task('limited', 'urgent', ['cue-1']));
+      scheduler.enqueue(task('queued', 'bulk', ['cue-2']));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(execute).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(execute).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await scheduler.whenIdle();
+      expect(execute).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('allows the controller to explicitly retry a transient provider failure', async () => {
     const execute = vi.fn()
       .mockResolvedValueOnce({
         ok: false,
-        error: { code: 'rate_limited', message: 'Rate limited.', retryable: true },
+        error: { code: 'timeout', message: 'Timed out.', retryable: true },
       })
       .mockResolvedValueOnce(translated(['cue-1']));
     const scheduler = new TranslationScheduler({

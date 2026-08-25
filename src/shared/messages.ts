@@ -7,6 +7,7 @@ import type {
 import {
   isExactSubTwinSettings,
   isExactRuntimeSettingsState,
+  isExactSubtitleAppearanceSettings,
   normalizeSettings,
   type RuntimeSettingsState,
   type SubTwinSettings,
@@ -23,6 +24,13 @@ export type ExtensionContext =
   | 'page'
   | 'popup';
 
+export interface OptionsSettingsPatch {
+  readonly enabled?: boolean;
+  readonly provider?: TranslationProviderSetting;
+  readonly deepseek?: SubTwinSettings['deepseek'];
+  readonly appearance?: SubTwinSettings['appearance'];
+}
+
 export interface MessagePayloadMap {
   readonly 'runtime/settings-get': Record<string, never>;
   readonly 'runtime/settings-state': RuntimeSettingsState;
@@ -37,13 +45,27 @@ export interface MessagePayloadMap {
     readonly provider: TranslationProviderSetting;
   };
   readonly 'settings/options-update': {
-    readonly settings: SubTwinSettings;
-    readonly updateEnabled: boolean;
+    readonly patch: OptionsSettingsPatch;
   };
   readonly 'settings/options-update-result': {
     readonly status: 'error' | 'success';
     readonly errorCode: 'settings_unavailable' | null;
     readonly enabled: boolean;
+  };
+  readonly 'settings/page-update': {
+    readonly enabled: boolean;
+    readonly provider: TranslationProviderSetting;
+    readonly appearance: RuntimeSettingsState['appearance'];
+    readonly updateEnabled: boolean;
+    readonly updateAppearance: boolean;
+    readonly updateProvider: boolean;
+  };
+  readonly 'settings/page-update-result': {
+    readonly status: 'error' | 'success';
+    readonly errorCode: 'settings_unavailable' | null;
+    readonly enabled: boolean;
+    readonly provider: TranslationProviderSetting;
+    readonly appearance: RuntimeSettingsState['appearance'];
   };
   readonly 'settings/private-get': Record<string, never>;
   readonly 'settings/private-get-result': {
@@ -282,6 +304,26 @@ export function parseMessageEnvelope(
   }
 
   if (
+    input.source === 'content' &&
+    input.type === 'settings/page-update' &&
+    isSettingsPageUpdatePayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: {
+        enabled: input.payload.enabled,
+        provider: input.payload.provider,
+        appearance: snapshotAppearance(input.payload.appearance),
+        updateEnabled: input.payload.updateEnabled,
+        updateAppearance: input.payload.updateAppearance,
+        updateProvider: input.payload.updateProvider,
+      },
+    }));
+  }
+
+  if (
     input.source === 'popup' &&
     input.type === 'settings/public-get' &&
     isEmptyRecord(input.payload)
@@ -317,8 +359,7 @@ export function parseMessageEnvelope(
       source: input.source,
       type: input.type,
       payload: {
-        settings: normalizeSettings(input.payload.settings),
-        updateEnabled: input.payload.updateEnabled,
+        patch: snapshotOptionsSettingsPatch(input.payload.patch),
       },
     }));
   }
@@ -359,6 +400,22 @@ export function parseMessageEnvelope(
       source: input.source,
       type: input.type,
       payload: { settings: normalizeSettings(input.payload.settings) },
+    }));
+  }
+
+  if (
+    input.source === 'background' &&
+    input.type === 'settings/page-update-result' &&
+    isSettingsPageUpdateResultPayload(input.payload)
+  ) {
+    return ok(createMessage({
+      id: input.id,
+      source: input.source,
+      type: input.type,
+      payload: {
+        ...input.payload,
+        appearance: snapshotAppearance(input.payload.appearance),
+      },
     }));
   }
 
@@ -564,15 +621,37 @@ function snapshotRuntimeSettingsState(
     enabled: value.enabled,
     provider: value.provider,
     deepseekKeyReady: value.deepseekKeyReady,
-    appearance: {
-      english: { ...value.appearance.english },
-      chinese: { ...value.appearance.chinese },
-      order: value.appearance.order,
-      lineSpacingPx: value.appearance.lineSpacingPx,
-      verticalOffsetPercent: value.appearance.verticalOffsetPercent,
-      backgroundOpacity: value.appearance.backgroundOpacity,
-      shadow: value.appearance.shadow,
-    },
+    appearance: snapshotAppearance(value.appearance),
+  };
+}
+
+function snapshotAppearance(
+  value: RuntimeSettingsState['appearance'],
+): RuntimeSettingsState['appearance'] {
+  return {
+    english: { ...value.english },
+    chinese: { ...value.chinese },
+    order: value.order,
+    lineSpacingPx: value.lineSpacingPx,
+    maxLineWidthPercent: value.maxLineWidthPercent,
+    verticalOffsetPercent: value.verticalOffsetPercent,
+    backgroundOpacity: value.backgroundOpacity,
+    shadow: value.shadow,
+  };
+}
+
+function snapshotOptionsSettingsPatch(
+  patch: OptionsSettingsPatch,
+): OptionsSettingsPatch {
+  return {
+    ...(patch.enabled === undefined ? {} : { enabled: patch.enabled }),
+    ...(patch.provider === undefined ? {} : { provider: patch.provider }),
+    ...(patch.deepseek === undefined
+      ? {}
+      : { deepseek: { ...patch.deepseek } }),
+    ...(patch.appearance === undefined
+      ? {}
+      : { appearance: snapshotAppearance(patch.appearance) }),
   };
 }
 
@@ -588,9 +667,80 @@ function isSettingsOptionsUpdatePayload(
   value: unknown,
 ): value is MessagePayloadMap['settings/options-update'] {
   return isRecord(value) &&
-    hasExactlyKeys(value, ['settings', 'updateEnabled']) &&
+    hasExactlyKeys(value, ['patch']) &&
+    isOptionsSettingsPatch(value.patch);
+}
+
+function isOptionsSettingsPatch(value: unknown): value is OptionsSettingsPatch {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  if (
+    keys.length === 0 ||
+    !keys.every((key) =>
+      key === 'appearance' ||
+      key === 'deepseek' ||
+      key === 'enabled' ||
+      key === 'provider')
+  ) return false;
+  return (!hasOwn(value, 'enabled') || typeof value.enabled === 'boolean') &&
+    (!hasOwn(value, 'provider') || isSettingsProvider(value.provider)) &&
+    (!hasOwn(value, 'deepseek') || isExactDeepSeekSettings(value.deepseek)) &&
+    (!hasOwn(value, 'appearance') ||
+      isExactSubtitleAppearanceSettings(value.appearance));
+}
+
+function isExactDeepSeekSettings(
+  value: unknown,
+): value is SubTwinSettings['deepseek'] {
+  return isRecord(value) &&
+    hasExactlyKeys(value, ['apiKey', 'model']) &&
+    typeof value.apiKey === 'string' &&
+    value.apiKey === value.apiKey.trim() &&
+    value.apiKey.length <= 512 &&
+    (value.model === 'deepseek-v4-flash' || value.model === 'deepseek-v4-pro');
+}
+
+function isSettingsPageUpdatePayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/page-update'] {
+  return isRecord(value) &&
+    hasExactlyKeys(value, [
+      'appearance',
+      'enabled',
+      'provider',
+      'updateAppearance',
+      'updateEnabled',
+      'updateProvider',
+    ]) &&
+    typeof value.enabled === 'boolean' &&
+    isSettingsProvider(value.provider) &&
     typeof value.updateEnabled === 'boolean' &&
-    isExactSubTwinSettings(value.settings);
+    typeof value.updateAppearance === 'boolean' &&
+    typeof value.updateProvider === 'boolean' &&
+    (value.updateEnabled || value.updateAppearance || value.updateProvider) &&
+    isExactSubtitleAppearanceSettings(value.appearance);
+}
+
+function isSettingsPageUpdateResultPayload(
+  value: unknown,
+): value is MessagePayloadMap['settings/page-update-result'] {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, [
+      'appearance',
+      'enabled',
+      'errorCode',
+      'provider',
+      'status',
+    ]) ||
+    typeof value.enabled !== 'boolean' ||
+    !isSettingsProvider(value.provider) ||
+    !isExactSubtitleAppearanceSettings(value.appearance) ||
+    (value.status !== 'error' && value.status !== 'success')
+  ) return false;
+  return value.status === 'success'
+    ? value.errorCode === null
+    : value.errorCode === 'settings_unavailable';
 }
 
 function isSettingsPublicGetResultPayload(
@@ -930,6 +1080,10 @@ const EXTENSION_CONTEXTS: readonly ExtensionContext[] = [
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
 function isNonEmptyString(value: unknown): value is string {

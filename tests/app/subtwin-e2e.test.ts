@@ -32,7 +32,7 @@ describe('SubTwin content-to-background E2E simulation', () => {
   it('keeps official bilingual, discovery, and provider-unset paths at zero provider network calls', async () => {
     const background = new MemoryBackgroundWithTransparentProviderCache();
 
-    const official = createHarness(background, settings('deepseek', true));
+    const official = createHarness(background, settings('unset', true));
     official.session.handlePayload(catalog('official-title', 'authoritative', [
       descriptor('official-en', 'en-US'),
       descriptor('official-zh', 'zh-Hans'),
@@ -188,7 +188,7 @@ describe('SubTwin content-to-background E2E simulation', () => {
     await harness.dispose();
   });
 
-  it('keeps a late provider response out after an official Chinese track appears', async () => {
+  it('keeps a stale response out after switching from Google to Netflix native', async () => {
     const background = new MemoryBackgroundWithTransparentProviderCache();
     background.deferNext('google-free');
     const harness = createHarness(background, settings('google-free', false));
@@ -198,6 +198,9 @@ describe('SubTwin content-to-background E2E simulation', () => {
     await vi.waitFor(() => {
       expect(background.pendingCount('google-free')).toBe(1);
     });
+    harness.session.updateSettings(settings('unset', false), {
+      translationConfigurationChanged: true,
+    });
     harness.session.handlePayload(catalog(
       'late-official-title',
       'authoritative',
@@ -205,6 +208,13 @@ describe('SubTwin content-to-background E2E simulation', () => {
         descriptor('en-main', 'en'),
         descriptor('zh-main', 'zh-CN'),
       ],
+    ));
+    harness.session.handlePayload(timedText(
+      'late-official-title',
+      'tt_1111111111111111',
+      'en-main',
+      'en',
+      'Official takes over',
     ));
     harness.session.handlePayload(timedText(
       'late-official-title',
@@ -217,7 +227,7 @@ describe('SubTwin content-to-background E2E simulation', () => {
 
     expect(harness.overlay.last()?.chinese).toBe('官方接管');
     background.resolveNext('google-free', 'late-provider');
-    await flushMicrotasks();
+    await harness.client.whenIdle();
 
     expect(background.providerNetworkCalls.map(({ provider }) => provider))
       .toEqual(['google-free']);

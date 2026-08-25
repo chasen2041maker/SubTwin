@@ -59,8 +59,7 @@ describe('language routing', () => {
       input: {
         ...READY_ENGLISH_CATALOG,
         simplifiedChineseAvailable: true,
-        provider: 'deepseek',
-        deepseekKeyReady: true,
+        provider: 'unset',
       },
       mode: 'official',
       sourceMode: 'official-alignment',
@@ -99,6 +98,35 @@ describe('language routing', () => {
       mode: 'google-free',
       externalCallsAllowed: true,
       provider: 'google-free',
+      schedulingScope: 'bulk',
+      sourceMode: 'external-translation',
+    });
+  });
+
+  it('honors an explicit Google selection even when Netflix has official Chinese', () => {
+    expect(routeLanguages({
+      ...READY_ENGLISH_CATALOG,
+      provider: 'google-free',
+      simplifiedChineseAvailable: true,
+    })).toEqual<LanguageRoute>({
+      mode: 'google-free',
+      externalCallsAllowed: true,
+      provider: 'google-free',
+      schedulingScope: 'bulk',
+      sourceMode: 'external-translation',
+    });
+  });
+
+  it('honors an explicit DeepSeek selection even when Netflix has official Chinese', () => {
+    expect(routeLanguages({
+      ...READY_ENGLISH_CATALOG,
+      provider: 'deepseek',
+      deepseekKeyReady: true,
+      simplifiedChineseAvailable: true,
+    })).toEqual<LanguageRoute>({
+      mode: 'deepseek',
+      externalCallsAllowed: true,
+      provider: 'deepseek',
       schedulingScope: 'bulk',
       sourceMode: 'external-translation',
     });
@@ -150,21 +178,6 @@ describe('language routing', () => {
         catalogAuthority: 'provisional',
         provider: 'deepseek',
         deepseekKeyReady: true,
-      } as const,
-    },
-    {
-      name: 'official Chinese with Google selected',
-      patch: {
-        provider: 'google-free',
-        simplifiedChineseAvailable: true,
-      } as const,
-    },
-    {
-      name: 'official Chinese with DeepSeek selected',
-      patch: {
-        provider: 'deepseek',
-        deepseekKeyReady: true,
-        simplifiedChineseAvailable: true,
       } as const,
     },
     {

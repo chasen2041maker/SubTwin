@@ -30,6 +30,7 @@ type SettingsActionResponse =
   | MessageFor<'settings/deepseek-test-result'>
   | MessageFor<'settings/enabled-set-result'>
   | MessageFor<'settings/options-update-result'>
+  | MessageFor<'settings/page-update-result'>
   | MessageFor<'settings/private-get-result'>
   | MessageFor<'settings/public-get-result'>;
 
@@ -65,6 +66,10 @@ export function createSettingsActionHandler(
     if (parsed.value.type === 'settings/options-update') {
       const message = parsed.value;
       return serializeMutation(() => updateOptionsSettings(message, options));
+    }
+    if (parsed.value.type === 'settings/page-update') {
+      const message = parsed.value;
+      return serializeMutation(() => updatePageSettings(message, options));
     }
     if (parsed.value.type === 'settings/deepseek-test') {
       await mutationTail;
@@ -200,10 +205,9 @@ async function updateOptionsSettings(
 ): Promise<SettingsActionResult> {
   try {
     const current = await options.settingsStore.load();
-    const requested = message.payload.settings;
     const saved = await options.settingsStore.save({
-      ...requested,
-      enabled: message.payload.updateEnabled ? requested.enabled : current.enabled,
+      ...current,
+      ...message.payload.patch,
     });
     return ok(createMessage({
       id: `${message.id}:background`,
@@ -219,7 +223,53 @@ async function updateOptionsSettings(
       payload: {
         status: 'error',
         errorCode: 'settings_unavailable',
-        enabled: message.payload.settings.enabled,
+        enabled: message.payload.patch.enabled ?? false,
+      },
+    }));
+  }
+}
+
+async function updatePageSettings(
+  message: MessageFor<'settings/page-update'>,
+  options: SettingsActionHandlerOptions,
+): Promise<SettingsActionResult> {
+  try {
+    const current = await options.settingsStore.load();
+    const saved = await options.settingsStore.save({
+      ...current,
+      enabled: message.payload.updateEnabled
+        ? message.payload.enabled
+        : current.enabled,
+      provider: message.payload.updateProvider
+        ? message.payload.provider
+        : current.provider,
+      appearance: message.payload.updateAppearance
+        ? message.payload.appearance
+        : current.appearance,
+    });
+    return ok(createMessage({
+      id: `${message.id}:background`,
+      source: 'background',
+      type: 'settings/page-update-result',
+      payload: {
+        status: 'success',
+        errorCode: null,
+        enabled: saved.enabled,
+        provider: saved.provider,
+        appearance: saved.appearance,
+      },
+    }));
+  } catch {
+    return ok(createMessage({
+      id: `${message.id}:background`,
+      source: 'background',
+      type: 'settings/page-update-result',
+      payload: {
+        status: 'error',
+        errorCode: 'settings_unavailable',
+        enabled: message.payload.enabled,
+        provider: message.payload.provider,
+        appearance: message.payload.appearance,
       },
     }));
   }

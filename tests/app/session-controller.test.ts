@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { LanguageRoute } from '../../src/app/language-router';
 import {
@@ -11,6 +11,7 @@ import {
   type SubtitleSessionTickSource,
   type TranslationTaskCallbacks,
 } from '../../src/app/session-controller';
+import type { RuntimeErrorCode } from '../../src/app/status';
 import type { NormalizedActiveCueState } from '../../src/renderer/SubtitleOverlay';
 import { DEFAULT_SETTINGS } from '../../src/storage/schema';
 import type { SubtitleCue, SubtitleTrack } from '../../src/subtitles/types';
@@ -47,6 +48,60 @@ describe('subtitle session controller', () => {
       chinese: '一\n二',
     });
     expect(harness.status.last()).toEqual({ mode: 'official' });
+  });
+
+  it('uses an explicitly selected external provider even when an official Chinese track exists', () => {
+    const harness = createHarness({
+      englishTrack: numberedTrack(6),
+      officialChineseTrack: numberedTrack(6, 'zh-Hans', '官方中文'),
+      route: route('google-free', 'bulk'),
+      currentTimeMs: 100,
+    });
+
+    expect(harness.tasks.scheduled.length).toBeGreaterThan(0);
+    expect(harness.tasks.scheduled.every(({ task }) => task.provider === 'google-free'))
+      .toBe(true);
+    expect(harness.status.last()).toEqual({ mode: 'google-free' });
+  });
+
+  it('schedules a live native English cue when a downloadable track is unavailable', () => {
+    const harness = createHarness({
+      englishTrack: null,
+      route: route('google-free', 'urgent-window'),
+      currentTimeMs: 500,
+    });
+
+    harness.controller.appendEnglishCue('native-en', cue(
+      'native-live-1',
+      0,
+      4_000,
+      'Translate the visible Netflix subtitle',
+    ));
+    harness.controller.tick({
+      visibleText: 'Translate the visible Netflix subtitle',
+      currentTimeMs: 500,
+    });
+
+    expect(harness.tasks.scheduled.some(({ task }) =>
+      task.provider === 'google-free' &&
+      task.cues.some(({ id }) => id === 'native-live-1'))).toBe(true);
+  });
+
+  it('reveals provider subtitles only when English and Chinese can appear together', () => {
+    const harness = createHarness({
+      route: route('deepseek', 'urgent-window'),
+      currentTimeMs: 100,
+    });
+    const pending = harness.tasks.find('deepseek', 'cue-0');
+
+    expect(harness.overlay.states).toHaveLength(0);
+
+    pending.callbacks.onResult(batch('cue-0', '整句中文'));
+
+    expect(harness.overlay.lastState()).toEqual({
+      english: 'Line 0',
+      chinese: '整句中文',
+    });
   });
 
   it('preserves Netflix native subtitles until an official Chinese body can align', () => {
@@ -133,13 +188,14 @@ describe('subtitle session controller', () => {
     )).toBe(true);
   });
 
-  it('cancels provider work immediately when an official track appears late', () => {
+  it('keeps an explicitly selected provider when an official track appears late', () => {
     const harness = createHarness({
       route: route('deepseek', 'bulk'),
       currentTimeMs: 100,
     });
     const pending = harness.tasks.find('deepseek', 'cue-0');
     pending.callbacks.onResult(batch('cue-0', '外部翻译'));
+    const renderedBeforeOfficialTrack = harness.overlay.states.length;
 
     harness.controller.updateTracks({
       englishTrack: numberedTrack(6),
@@ -150,13 +206,16 @@ describe('subtitle session controller', () => {
 
     expect(pending.callbacks.isCurrent()).toBe(false);
     expect(harness.overlay.clearCount).toBeGreaterThan(0);
+    expect(harness.overlay.states).toHaveLength(renderedBeforeOfficialTrack);
     expect(harness.overlay.lastState()).toEqual({
       english: 'Line 0',
-      chinese: '官方中文',
+      chinese: '外部翻译',
     });
-    const countAfterOfficial = harness.tasks.scheduled.length;
+    expect(harness.tasks.scheduled.some(
+      ({ task }) => task !== pending.task && task.provider === 'deepseek',
+    )).toBe(true);
+    expect(harness.status.last()).toEqual({ mode: 'deepseek' });
     pending.callbacks.onResult(batch('cue-0', '过期外部文本'));
-    expect(harness.tasks.scheduled).toHaveLength(countAfterOfficial);
     expect(harness.overlay.states).not.toContainEqual({
       english: 'Line 0',
       chinese: '过期外部文本',
@@ -299,7 +358,7 @@ describe('subtitle session controller', () => {
     expect(harness.overlay.states).toHaveLength(rendersBeforeDisable);
   });
 
-  it('contains provider failures, keeps English usable, and never calls a second provider', () => {
+  it('contains provider failures, renders no partial cue, and never calls a second provider', () => {
     const harness = createHarness({
       route: route('google-free', 'urgent-window'),
       currentTimeMs: 100,
@@ -314,23 +373,129 @@ describe('subtitle session controller', () => {
     request.callbacks.onError(error);
 
     expect(harness.status.last()).toEqual({ mode: 'error', code: 'rate_limited' });
-    expect(harness.overlay.lastState()).toEqual({ english: 'Line 0', chinese: null });
+    expect(harness.overlay.states).toHaveLength(0);
+    expect(harness.overlay.clearCount).toBeGreaterThan(0);
     expect(harness.tasks.scheduled.every(
       ({ task }) => task.provider === 'google-free',
     )).toBe(true);
   });
 
+  it('keeps translated cues and scheduling alive after a retryable timeout', () => {
+    const harness = createHarness({
+      englishTrack: numberedTrack(30),
+      route: route('deepseek', 'bulk'),
+      currentTimeMs: 100,
+    });
+    const translated = harness.tasks.find('deepseek', 'cue-0');
+    const failed = harness.tasks.find('deepseek', 'cue-20');
+    translated.callbacks.onResult(batch('cue-0', '已翻译'));
+    const scheduledBeforeFailure = harness.tasks.scheduled.length;
+
+    failed.callbacks.onError({
+      code: 'timeout',
+      message: 'Timed out.',
+      retryable: true,
+    });
+
+    expect(harness.tasks.cancelled).toHaveLength(0);
+    expect(translated.callbacks.isCurrent()).toBe(true);
+    expect(failed.callbacks.isCurrent()).toBe(true);
+    expect(harness.overlay.lastState()).toEqual({ english: 'Line 0', chinese: '已翻译' });
+
+    harness.controller.seek(25_100);
+
+    expect(harness.tasks.scheduled.length).toBeGreaterThan(scheduledBeforeFailure);
+    expect(harness.tasks.scheduled.slice(scheduledBeforeFailure).some(
+      ({ task }) => task.cues.some(({ id }) => id === 'cue-25'),
+    )).toBe(true);
+  });
+
+  it('holds rate-limited work during a cooldown and resumes afterward', () => {
+    let now = 1_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const harness = createHarness({
+        englishTrack: numberedTrack(8),
+        route: route('google-free', 'bulk'),
+        currentTimeMs: 100,
+      });
+      const failed = harness.tasks.find('google-free', 'cue-0');
+      const scheduledBeforeFailure = harness.tasks.scheduled.length;
+
+      failed.callbacks.onError({
+        code: 'rate_limited',
+        message: 'Rate limited.',
+        retryable: true,
+      });
+      harness.controller.seek(4_100);
+
+      expect(harness.tasks.cancelled).toHaveLength(0);
+      expect(harness.tasks.scheduled).toHaveLength(scheduledBeforeFailure);
+
+      now += 60_000;
+      harness.controller.seek(7_100);
+
+      expect(harness.tasks.scheduled.length).toBeGreaterThan(scheduledBeforeFailure);
+      expect(harness.tasks.scheduled.slice(scheduledBeforeFailure).some(
+        ({ task }) => task.cues.some(({ id }) => id === 'cue-7'),
+      )).toBe(true);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('scopes a rate-limit cooldown to the provider that returned it', () => {
+    const harness = createHarness({
+      englishTrack: numberedTrack(8),
+      route: route('google-free', 'bulk'),
+      currentTimeMs: 100,
+    });
+    const failed = harness.tasks.find('google-free', 'cue-0');
+    const scheduledBeforeSwitch = harness.tasks.scheduled.length;
+
+    failed.callbacks.onError({
+      code: 'rate_limited',
+      message: 'Rate limited.',
+      retryable: true,
+    });
+    harness.controller.updateRoute(route('deepseek', 'urgent-window'));
+
+    expect(harness.tasks.scheduled.length).toBeGreaterThan(scheduledBeforeSwitch);
+    expect(harness.tasks.scheduled.slice(scheduledBeforeSwitch).every(
+      ({ task }) => task.provider === 'deepseek',
+    )).toBe(true);
+  });
+
+  it.each([
+    { code: 'invalid_request', retryable: false, statusCode: 'provider_unavailable' },
+    { code: 'invalid_response', retryable: false, statusCode: 'provider_unavailable' },
+    { code: 'provider_unavailable', retryable: true, statusCode: 'provider_unavailable' },
+  ] satisfies readonly (Pick<TranslationError, 'code' | 'retryable'> & {
+    readonly statusCode: RuntimeErrorCode;
+  })[])(
+    'contains $code to the failed task without sealing the provider generation',
+    ({ code, retryable, statusCode }) => {
+      const harness = createHarness({
+        englishTrack: numberedTrack(10),
+        route: route('deepseek', 'bulk'),
+        currentTimeMs: 100,
+      });
+      const failed = harness.tasks.find('deepseek', 'cue-0');
+
+      failed.callbacks.onError({ code, message: 'Task failed.', retryable });
+
+      expect(harness.tasks.cancelled).toHaveLength(0);
+      expect(failed.callbacks.isCurrent()).toBe(true);
+      expect(harness.status.last()).toEqual({ mode: 'error', code: statusCode });
+    },
+  );
+
   it.each([
     { code: 'authentication_failed', retryable: false },
     { code: 'insufficient_balance', retryable: false },
     { code: 'invalid_configuration', retryable: false },
-    { code: 'invalid_request', retryable: false },
-    { code: 'invalid_response', retryable: false },
     { code: 'provider_forbidden', retryable: false },
-    { code: 'provider_unavailable', retryable: true },
     { code: 'provider_unset', retryable: false },
-    { code: 'rate_limited', retryable: true },
-    { code: 'timeout', retryable: true },
   ] satisfies readonly Pick<TranslationError, 'code' | 'retryable'>[])(
     'cancels and seals a provider generation after $code',
     ({ code, retryable }) => {
@@ -399,6 +564,32 @@ describe('subtitle session controller', () => {
     expect(failed.callbacks.isCurrent()).toBe(false);
   });
 
+  it('clears an authentication block after provider configuration is refreshed', () => {
+    const harness = createHarness({
+      route: route('deepseek', 'bulk'),
+      currentTimeMs: 100,
+    });
+    const failed = harness.tasks.find('deepseek', 'cue-0');
+
+    failed.callbacks.onError({
+      code: 'authentication_failed',
+      message: 'Authentication failed.',
+      retryable: false,
+    });
+    const scheduledWhileBlocked = harness.tasks.scheduled.length;
+    harness.controller.seek(4_100);
+    expect(harness.tasks.scheduled).toHaveLength(scheduledWhileBlocked);
+
+    harness.controller.refreshProviderConfiguration();
+
+    const resumed = harness.tasks.scheduled.slice(scheduledWhileBlocked);
+    expect(resumed.length).toBeGreaterThan(0);
+    expect(resumed.every(({ task, callbacks }) =>
+      task.provider === 'deepseek' &&
+      task.providerGeneration === 3 &&
+      callbacks.isCurrent())).toBe(true);
+  });
+
   it('stops the same synchronous scheduling loop when its first task fails', () => {
     const tasks = new RecordingTaskClient();
     let failed = false;
@@ -445,6 +636,7 @@ describe('subtitle session controller', () => {
     const stale = harness.tasks.find('deepseek', 'cue-0');
     stale.callbacks.onResult(batch('cue-0', '旧配置'));
     const beforeRefresh = harness.tasks.scheduled.length;
+    const renderedBeforeRefresh = harness.overlay.states.length;
 
     harness.controller.refreshProviderConfiguration();
 
@@ -456,7 +648,9 @@ describe('subtitle session controller', () => {
     expect(harness.tasks.scheduled.slice(beforeRefresh).every(
       ({ task }) => task.provider === 'deepseek' && task.providerGeneration === 2,
     )).toBe(true);
-    expect(harness.overlay.lastState()).toEqual({ english: 'Line 0', chinese: null });
+    expect(harness.overlay.states).toHaveLength(renderedBeforeRefresh);
+    expect(harness.overlay.lastState()).toEqual({ english: 'Line 0', chinese: '旧配置' });
+    expect(harness.overlay.clearCount).toBeGreaterThan(0);
   });
 
   it('sends precise cancellation reasons for every lifecycle boundary', () => {

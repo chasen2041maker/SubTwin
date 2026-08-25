@@ -46,10 +46,11 @@ export function routeLanguages(input: LanguageRoutingInput): LanguageRoute {
     return nativeOnly('discovering');
   }
   if (!input.englishAvailable) return nativeOnly('missing-English');
-  if (input.simplifiedChineseAvailable) {
-    return nativeOnly('official', 'official-alignment');
+  if (input.provider === 'unset') {
+    return input.simplifiedChineseAvailable
+      ? nativeOnly('official', 'official-alignment')
+      : nativeOnly('provider-unset');
   }
-  if (input.provider === 'unset') return nativeOnly('provider-unset');
   if (input.provider === 'deepseek' && !input.deepseekKeyReady) {
     return nativeOnly('missing-key');
   }
