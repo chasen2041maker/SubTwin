@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: pnpm
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          expected="v${version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package version ${version}."
+            exit 1
+          fi
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify and package extension
+        run: pnpm release
+
+      - name: Prepare release assets
+        id: package
+        shell: bash
+        run: |
+          version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          asset=".output/subtwin-${version}-chrome-mv3.zip"
+          if [[ ! -f "${asset}" ]]; then
+            echo "::error::Expected release asset was not produced: ${asset}"
+            exit 1
+          fi
+          (
+            cd .output
+            sha256sum "$(basename "${asset}")" > SHA256SUMS.txt
+          )
+          echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
+          echo "checksums=.output/SHA256SUMS.txt" >> "${GITHUB_OUTPUT}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "::error::Release ${GITHUB_REF_NAME} already exists."
+            exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            "${{ steps.package.outputs.asset }}#Chrome MV3 extension" \
+            "${{ steps.package.outputs.checksums }}#SHA-256 checksums" \
+            --verify-tag \
+            --latest \
+            --title "SubTwin ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --notes "First public build artifact for SubTwin. Download the Chrome MV3 ZIP below, verify it with SHA256SUMS.txt, unzip it, and load the directory from chrome://extensions. See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for the complete release summary."
