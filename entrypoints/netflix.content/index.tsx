@@ -168,7 +168,7 @@ export default defineContentScript({
         } else if (payload.code === 'download_succeeded') {
           updateSubtitlePipeline('downloaded', '字幕已下载，等待解析');
         } else if (payload.code === 'display_unavailable') {
-          updateSubtitlePipeline('failed', 'Netflix 字幕下载失败');
+          updateSubtitlePipeline('failed', '字幕捕获失败，保留 Netflix 原字幕');
         }
       }
       if (contentSession !== undefined) {

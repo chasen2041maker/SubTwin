@@ -108,6 +108,22 @@ describe('page subtitle pipeline', () => {
     });
   });
 
+  it('reports exhausted capture retries after only one track was parsed', () => {
+    const partial = {
+      bridgeGeneration: 5,
+      episodeGeneration: 1,
+      stage: 'partial' as const,
+      message: '已解析一条字幕轨，等待另一条',
+    };
+
+    expect(advancePageSubtitlePipeline(partial, {
+      bridgeGeneration: 5,
+      episodeGeneration: 1,
+      stage: 'failed',
+      message: '字幕捕获失败，保留 Netflix 原字幕',
+    }).stage).toBe('failed');
+  });
+
   it('starts a fresh catalog stage when the content-session generation changes', () => {
     const accepted = {
       bridgeGeneration: 8,

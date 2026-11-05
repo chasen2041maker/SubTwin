@@ -38,9 +38,9 @@ const ERROR_MESSAGES: Readonly<Record<RuntimeErrorCode, string>> = {
 };
 
 const MODE_MESSAGES: Readonly<Record<Exclude<RuntimeMode, 'error'>, string>> = {
-  deepseek: '官方中文字幕缺失，正在使用 DeepSeek 上下文翻译。',
+  deepseek: '已选择 DeepSeek 上下文翻译，译文就绪后显示双语字幕。',
   discovering: '正在确认 Netflix 官方字幕轨道；确认前不会调用外部翻译。',
-  'google-free': '官方中文字幕缺失，正在使用实验性的 Google 免费翻译。',
+  'google-free': '已选择实验性的 Google 免费翻译，译文就绪后显示双语字幕。',
   official: '已发现 Netflix 官方英文与简体中文字幕，不会调用外部翻译。',
   unset: '尚未选择翻译方式，任何字幕都不会发送给外部服务。',
 };

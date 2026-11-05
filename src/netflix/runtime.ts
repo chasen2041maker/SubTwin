@@ -1,5 +1,6 @@
 import { err, ok, type AppError, type Result } from '../shared/result';
 import { normalizeNetflixLanguageTag } from './adapter';
+import { createNetflixTimedTextRequestBindings } from './observed-timed-text';
 import {
   NETFLIX_BRIDGE_PROTOCOL,
   NETFLIX_BRIDGE_VERSION,
@@ -283,6 +284,7 @@ type CatalogMetadataSource = 'network' | 'player';
 
 const PLAYER_CATALOG_POLL_INTERVAL_MS = 1_500;
 const TRACK_CAPTURE_TIMEOUT_MS = 3_000;
+const MAX_TRACK_CAPTURE_ATTEMPTS = 2;
 const CATALOG_DOWNLOAD_MAX_ATTEMPTS = 3;
 const CATALOG_DOWNLOAD_RETRY_BASE_MS = 250;
 
@@ -394,6 +396,9 @@ export function installMainWorldNetflixRuntime(options: {
     if (control.generation <= highestGeneration) return;
 
     disposeActive();
+    const sourceFetch = options.window.fetch;
+    const fetcher: NetflixTimedTextFetch = (input, init) =>
+      sourceFetch.call(options.window, input, init) as unknown as ReturnType<NetflixTimedTextFetch>;
     const previousHighestGeneration = highestGeneration;
     highestGeneration = control.generation;
     const queue = createEarlyBridgeQueue({
@@ -420,11 +425,12 @@ export function installMainWorldNetflixRuntime(options: {
       NetflixCatalogDownloadResource
     >();
     const observedBodyTrackIds = new Set<string>();
+    const observedRequests = createNetflixTimedTextRequestBindings();
     const pendingEmbeddedTimedText = new Map<
       string,
       Parameters<NetworkProbeOptions['onTimedText']>[0]
     >();
-    const performanceDownloadAttempts = new Map<string, number>();
+    const performanceDownloadAttempts = new Map<string, { titleId: string; attempts: number }>();
     const inFlightPerformanceDownloads = new Map<string, AbortController>();
     const retryDownloads = new Map<string, {
       readonly cancel: () => void;
@@ -439,7 +445,7 @@ export function installMainWorldNetflixRuntime(options: {
     let pendingCaptureTrackIds: string[] = [];
     let cancelCaptureTimeout: () => void = () => undefined;
     let captureTitleId: string | undefined;
-    const attemptedCaptureTrackIds = new Set<string>();
+    const attemptedCaptureTrackIds = new Map<string, number>();
     let playerCatalogUnavailable = true;
     let downloadStartedPublished = false;
     let downloadSucceededPublished = false;
@@ -481,6 +487,8 @@ export function installMainWorldNetflixRuntime(options: {
     };
     const resetPublishedStateForTitle = (titleId: string): void => {
       if (publishedTitleId !== undefined && publishedTitleId !== titleId) {
+        pendingEmbeddedTimedText.clear();
+        observedRequests.clear();
         publishedDiagnostics.clear();
         downloadStartedPublished = false;
         downloadSucceededPublished = false;
@@ -541,6 +549,7 @@ export function installMainWorldNetflixRuntime(options: {
       if (captureTitleId !== undefined && captureTitleId !== catalog.titleId) {
         stopTrackCapture();
         attemptedCaptureTrackIds.clear();
+        observedBodyTrackIds.clear();
       }
       captureTitleId = catalog.titleId;
       currentAuthoritativeCatalog = catalog;
@@ -552,36 +561,20 @@ export function installMainWorldNetflixRuntime(options: {
     const publishEmbeddedTimedText = (
       payload: Parameters<NetworkProbeOptions['onTimedText']>[0],
     ): boolean => {
-      if (
-        !/^oca_[a-f0-9]{16}$/u.test(payload.trackId) ||
-        !/^tt_[a-f0-9]{16}$/u.test(payload.resourceId)
-      ) return false;
       const catalog = currentAuthoritativeCatalog;
       if (catalog === undefined) return false;
-      const observedLanguage = normalizeNetflixLanguageTag(payload.language);
-      if (observedLanguage === null) return true;
-      const matches = catalog.tracks.filter((track) => {
-        const language = normalizeNetflixLanguageTag(track.language);
-        return language !== null &&
-          language.sourceTag.toLowerCase() ===
-            observedLanguage.sourceTag.toLowerCase();
-      });
-      if (matches.length !== 1) return true;
-      const track = matches[0];
-      if (track === undefined) return true;
-      if (queue.publish({
-        ...payload,
-        titleId: catalog.titleId,
-        trackId: track.id,
-        language: track.language,
-      }, control.generation)) {
-        observedBodyTrackIds.add(track.id);
+      const bound = observedRequests.bind(payload, catalog);
+      if (bound === null) {
+        publishDiagnostic('download_candidate_unmatched');
+        return false;
       }
-      if (activeCaptureBinding?.trackId === track.id) {
+      if (!queue.publish(bound, control.generation)) return false;
+      observedBodyTrackIds.add(bound.trackId);
+      if (activeCaptureBinding?.trackId === bound.trackId) {
         activeCaptureBinding = undefined;
         safeTrackCaptureEvent(options.onTrackCaptureEvent, {
           state: 'body_captured',
-          language: track.language,
+          language: bound.language,
         });
         startNextTrackCapture();
       }
@@ -612,6 +605,7 @@ export function installMainWorldNetflixRuntime(options: {
         startNextTrackCapture();
         return;
       }
+      if (observedBodyTrackIds.has(trackId)) { startNextTrackCapture(); return; }
       activeCaptureBinding = { titleId: catalog.titleId, trackId };
       if (!controller.switchTo(trackId)) {
         activeCaptureBinding = undefined;
@@ -622,7 +616,7 @@ export function installMainWorldNetflixRuntime(options: {
         startNextTrackCapture();
         return;
       }
-      attemptedCaptureTrackIds.add(trackId);
+      attemptedCaptureTrackIds.set(trackId, (attemptedCaptureTrackIds.get(trackId) ?? 0) + 1);
       safeTrackCaptureEvent(options.onTrackCaptureEvent, {
         state: 'switch_started',
         language: track.language,
@@ -635,6 +629,9 @@ export function installMainWorldNetflixRuntime(options: {
             state: 'timed_out',
             language: track.language,
           });
+          if ((attemptedCaptureTrackIds.get(trackId) ?? 0) >= MAX_TRACK_CAPTURE_ATTEMPTS) {
+            publishDiagnostic('display_unavailable');
+          }
           startNextTrackCapture();
         }, TRACK_CAPTURE_TIMEOUT_MS);
       } catch {
@@ -662,7 +659,7 @@ export function installMainWorldNetflixRuntime(options: {
       }
       if (!selected.has('english') || !selected.has('simplified-chinese')) return;
       const missing = [...selected.values()].filter((track) =>
-        !attemptedCaptureTrackIds.has(track.id) &&
+        (attemptedCaptureTrackIds.get(track.id) ?? 0) < MAX_TRACK_CAPTURE_ATTEMPTS &&
         !observedBodyTrackIds.has(track.id) &&
         ![...approvedObservedResources.values()].some(
           (resource) => resource.trackId === track.id,
@@ -757,8 +754,6 @@ export function installMainWorldNetflixRuntime(options: {
           code: 'download_started',
         }, control.generation);
       }
-      const fetcher: NetflixTimedTextFetch = (input, init) =>
-        options.window.fetch.call(options.window, input, init) as unknown as ReturnType<NetflixTimedTextFetch>;
       const reportFailure = (
         code: NetflixCatalogDownloadError['code'],
       ): void => {
@@ -951,7 +946,7 @@ export function installMainWorldNetflixRuntime(options: {
           // Diagnostics are advisory and must never affect playback.
         }
         const catalog = currentAuthoritativeCatalog;
-        if (/^oca_[a-f0-9]{16}$/u.test(payload.trackId)) {
+        if (/^oca_[a-f0-9]{16}$/u.test(payload.trackId) || payload.requestBinding !== undefined) {
           if (!publishEmbeddedTimedText(payload)) {
             if (pendingEmbeddedTimedText.size >= 4) {
               const oldest = pendingEmbeddedTimedText.keys().next().value as string | undefined;
@@ -1012,6 +1007,7 @@ export function installMainWorldNetflixRuntime(options: {
       },
       onCatalogMetadata,
       currentTimedTextBinding: () => activeCaptureBinding,
+      onTimedTextRequest: (event) => observedRequests.remember(event),
       ...(options.onTimedTextCandidate === undefined
         ? {}
         : { onTimedTextCandidate: options.onTimedTextCandidate }),
@@ -1043,16 +1039,16 @@ export function installMainWorldNetflixRuntime(options: {
         if (!identity.ok) continue;
         candidateCount += 1;
         const key = identity.value.resourceId;
-        const attempts = performanceDownloadAttempts.get(key) ?? 0;
+        const previousAttempt = performanceDownloadAttempts.get(key);
+        if (previousAttempt !== undefined && previousAttempt.titleId !== catalog.titleId) continue;
+        const attempts = previousAttempt?.attempts ?? 0;
         if (attempts >= 2 || inFlightPerformanceDownloads.has(key)) continue;
-        performanceDownloadAttempts.set(key, attempts + 1);
+        performanceDownloadAttempts.set(key, { titleId: catalog.titleId, attempts: attempts + 1 });
         safePerformanceTimedTextEvent(options.onPerformanceTimedTextEvent, {
           state: 'candidate_started',
         });
         const controller = new AbortController();
         inFlightPerformanceDownloads.set(key, controller);
-        const fetcher: NetflixTimedTextFetch = (input, init) =>
-          options.window.fetch.call(options.window, input, init) as unknown as ReturnType<NetflixTimedTextFetch>;
         void downloadEmbeddedTimedText(fetcher, entry.name, {
           signal: controller.signal,
         }).then((result) => {
@@ -1061,7 +1057,8 @@ export function installMainWorldNetflixRuntime(options: {
           if (
             controller.signal.aborted ||
             disposed ||
-            active !== nextActive
+            active !== nextActive ||
+            currentAuthoritativeCatalog?.titleId !== catalog.titleId
           ) return;
           if (!result.ok) {
             safePerformanceTimedTextEvent(options.onPerformanceTimedTextEvent, {
@@ -1114,6 +1111,7 @@ export function installMainWorldNetflixRuntime(options: {
           failedDownloads.clear();
           approvedObservedResources.clear();
           observedBodyTrackIds.clear();
+          observedRequests.clear();
           pendingEmbeddedTimedText.clear();
           for (const controller of inFlightPerformanceDownloads.values()) {
             controller.abort();
