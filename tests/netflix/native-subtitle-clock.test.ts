@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   createNativeSubtitleClock,
+  createNativeSubtitleMicrotaskScheduler,
   type NativeSubtitleClockScheduler,
   type NativeSubtitleDocument,
   type NativeSubtitleMutationObserver,
@@ -71,6 +72,149 @@ function node(
     innerHTML: `<span data-secret="do-not-emit">${text}</span>`,
   };
 }
+
+function microtaskHarness(isGenerationCurrent?: (generation: number) => boolean) {
+  const document = new FakeDocument();
+  document.container = node('Initial subtitle');
+  const observers: FakeObserver[] = [];
+  const ticks: string[] = [];
+  const queued: Array<() => void> = [];
+  const scheduler = createNativeSubtitleMicrotaskScheduler((callback) => {
+    queued.push(callback);
+    queueMicrotask(callback);
+  });
+  const clock = createNativeSubtitleClock({
+    document,
+    scheduler,
+    createObserver: (callback) => {
+      const observer = new FakeObserver(callback);
+      observers.push(observer);
+      return observer;
+    },
+    sessionId: 'microtask-session',
+    generation: 1,
+    onTick: (tick) => ticks.push(tick.visibleText),
+    ...(isGenerationCurrent === undefined ? {} : { isGenerationCurrent }),
+  });
+  return { document, observers, ticks, queued, clock };
+}
+
+describe('native subtitle microtask scheduling', () => {
+  it('delivers the final text of a mutation burst in the current microtask checkpoint', async () => {
+    expect(createNativeSubtitleMicrotaskScheduler).toBeTypeOf('function');
+    const harness = microtaskHarness();
+    harness.clock.start();
+    const container = harness.document.container;
+    if (container === null) throw new Error('Expected a subtitle container.');
+    container.textContent = 'An incomplete';
+    harness.observers[1]?.trigger();
+    container.textContent = 'The complete native subtitle';
+    harness.observers[1]?.trigger();
+    harness.observers[1]?.trigger();
+    expect(harness.ticks).toEqual([]);
+    expect(harness.queued).toHaveLength(1);
+
+    queueMicrotask(() => harness.ticks.push('checkpoint-marker'));
+    await Promise.resolve();
+
+    expect(harness.ticks).toEqual(['The complete native subtitle', 'checkpoint-marker']);
+    harness.clock.dispose();
+  });
+
+  it('cancels queued work without suppressing the next real microtask', async () => {
+    const scheduler = createNativeSubtitleMicrotaskScheduler(queueMicrotask);
+    const calls: string[] = [];
+    const cancelled = scheduler.schedule(() => calls.push('cancelled'));
+    scheduler.cancel(cancelled);
+    scheduler.cancel(cancelled);
+    scheduler.schedule(() => calls.push('current'));
+    expect(calls).toEqual([]);
+
+    await Promise.resolve();
+
+    expect(calls).toEqual(['current']);
+  });
+
+  it('ignores cancelled and repeated late delivery of the queued wrapper', () => {
+    const queued: Array<() => void> = [];
+    const scheduler = createNativeSubtitleMicrotaskScheduler((callback) => queued.push(callback));
+    const calls: string[] = [];
+    const cancelled = scheduler.schedule(() => calls.push('cancelled'));
+    scheduler.cancel(cancelled);
+    scheduler.schedule(() => calls.push('current'));
+
+    queued[0]?.();
+    queued[0]?.();
+    queued[1]?.();
+    queued[1]?.();
+
+    expect(calls).toEqual(['current']);
+  });
+
+  it('cannot cancel another scheduler instance through a foreign handle', async () => {
+    const first = createNativeSubtitleMicrotaskScheduler(queueMicrotask);
+    const second = createNativeSubtitleMicrotaskScheduler(queueMicrotask);
+    const calls: string[] = [];
+    const foreign = second.schedule(() => calls.push('second'));
+    first.cancel(foreign);
+    first.cancel(undefined);
+    first.cancel(1);
+    await Promise.resolve();
+
+    expect(calls).toEqual(['second']);
+  });
+
+  it('propagates enqueue failures and invalidates a partially queued callback', () => {
+    const queued: Array<() => void> = [];
+    const calls: string[] = [];
+    let failEnqueue = true;
+    const scheduler = createNativeSubtitleMicrotaskScheduler((callback) => {
+      queued.push(callback);
+      if (failEnqueue) throw new Error('Synthetic microtask enqueue failure.');
+    });
+    expect(() => scheduler.schedule(() => calls.push('failed')))
+      .toThrow('Synthetic microtask enqueue failure.');
+    failEnqueue = false;
+    scheduler.schedule(() => calls.push('current'));
+    queued[0]?.();
+    queued[1]?.();
+
+    expect(calls).toEqual(['current']);
+  });
+
+  it('cancels the old container microtask when rebinding before delivery', async () => {
+    const harness = microtaskHarness();
+    harness.clock.start();
+    const staleObserver = harness.observers[1];
+    harness.document.container = node('Replacement subtitle');
+    harness.observers[0]?.trigger();
+    staleObserver?.trigger();
+    harness.observers[2]?.trigger();
+    expect(harness.ticks).toEqual([]);
+    await Promise.resolve();
+
+    expect(harness.ticks).toEqual(['Replacement subtitle']);
+    expect(staleObserver?.disconnectCount).toBe(1);
+    harness.clock.dispose();
+  });
+
+  it.each(['generation-change', 'dispose'] as const)(
+    'drops a pending microtask after %s',
+    async (action) => {
+      let currentGeneration = 1;
+      const harness = microtaskHarness((generation) => generation === currentGeneration);
+      harness.clock.start();
+      if (action === 'generation-change') currentGeneration = 2;
+      else harness.clock.dispose();
+      await Promise.resolve();
+
+      expect(harness.ticks).toEqual([]);
+      harness.queued[0]?.();
+      expect(harness.ticks).toEqual([]);
+      harness.clock.dispose();
+    },
+  );
+});
 
 describe('native Netflix subtitle clock', () => {
   it('starts and disposes idempotently without modifying the native node', () => {

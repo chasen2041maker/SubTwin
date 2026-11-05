@@ -201,8 +201,12 @@ export interface SubtitleOverlayMount {
     state: NormalizedActiveCueState,
     appearance: SubtitleOverlayAppearance,
   ): boolean;
-  /** 请求在替代字幕提交后隐藏原字幕；等待、清空或失败时保留原字幕。 */
+  /** 启用替代字幕或限时翻译等待时的原字幕隐藏请求；清空或失败时恢复原字幕。 */
   setNativeSubtitlesHidden(hidden: boolean): void;
+  /** 暂时隐藏原字幕以等待双语同显；调用方必须限时 render 或 clear，失败时恢复原字幕。 */
+  waitForTranslation(): void;
+  /** 订阅替代字幕渲染或宿主故障；返回取消订阅函数，监听器错误不会影响其他监听器。 */
+  subscribeRenderFailure(listener: () => void): () => void;
   setDragMode(enabled: boolean): void;
   clear(): void;
   dispose(): void;
@@ -237,17 +241,30 @@ export function mountSubtitleOverlay(
   let disposed = false;
   let nativeHidden = false;
   let nativeSuppressed = false;
+  let waitingForTranslation = false;
   let committedLineCount = 0;
   let renderGeneration = 0;
   let dragEnabled = false;
   let lastAppearance: SubtitleOverlayAppearance | undefined;
   let lastState: NormalizedActiveCueState | undefined;
+  const renderFailureListeners = new Set<() => void>();
 
-  const hasNativeReplacement = (): boolean =>
-    committedLineCount >= 2 || (nativeSuppressed && committedLineCount > 0);
+  const notifyRenderFailure = (): void => {
+    for (const listener of [...renderFailureListeners]) {
+      try {
+        listener();
+      } catch {
+        // 一个监听器失败不能阻止其他监听器恢复原字幕。
+      }
+    }
+  };
+
+  const shouldHideNative = (): boolean =>
+    committedLineCount >= 2 ||
+    (nativeSuppressed && (waitingForTranslation || committedLineCount > 0));
 
   const restoreNative = (force = false): void => {
-    if (!force && hasNativeReplacement()) return;
+    if (!force && shouldHideNative()) return;
     if (!nativeHidden && !force) return;
     nativeHidden = false;
     try {
@@ -268,14 +285,16 @@ export function mountSubtitleOverlay(
   };
 
   const syncNativeVisibility = (): void => {
-    if (hasNativeReplacement()) hideNative();
+    if (shouldHideNative()) hideNative();
     else restoreNative();
   };
 
   const invalidateReplacement = (): void => {
+    waitingForTranslation = false;
     committedLineCount = 0;
     renderGeneration += 1;
     syncNativeVisibility();
+    notifyRenderFailure();
   };
 
   const clearUnavailableReplacement = (): void => {
@@ -378,6 +397,24 @@ export function mountSubtitleOverlay(
   const mountedRoot = root;
   const mountedHost = host;
 
+  const clearRenderedCue = (waitForTranslation = false): void => {
+    renderGeneration += 1;
+    let cleared = true;
+    try {
+      mountedRoot.clear();
+    } catch {
+      // 清理失败时保留原字幕，不进入等待隐藏状态。
+      cleared = false;
+    } finally {
+      waitingForTranslation = waitForTranslation && cleared;
+      committedLineCount = 0;
+      syncNativeVisibility();
+      lastState = undefined;
+      lastAppearance = undefined;
+    }
+    if (waitForTranslation && !cleared) notifyRenderFailure();
+  };
+
   const mount: SubtitleOverlayMount = {
     render(state, appearance) {
       const visibleLines = selectVisibleLines(state, appearance);
@@ -421,13 +458,16 @@ export function mountSubtitleOverlay(
                 clearUnavailableReplacement();
                 return;
               }
+              waitingForTranslation = false;
               committedLineCount = visibleLines.length;
               syncNativeVisibility();
             },
             onError: () => {
               if (!disposed && generation === renderGeneration) {
+                waitingForTranslation = false;
                 committedLineCount = 0;
                 syncNativeVisibility();
+                notifyRenderFailure();
               }
             },
           },
@@ -439,6 +479,7 @@ export function mountSubtitleOverlay(
         } catch {
           // A failed render is already being downgraded to native subtitles.
         }
+        waitingForTranslation = false;
         committedLineCount = 0;
         syncNativeVisibility();
         return false;
@@ -448,7 +489,19 @@ export function mountSubtitleOverlay(
     setNativeSubtitlesHidden(hidden) {
       if (disposed || nativeSuppressed === hidden) return;
       nativeSuppressed = hidden;
+      if (!hidden) waitingForTranslation = false;
       syncNativeVisibility();
+    },
+
+    waitForTranslation() {
+      if (disposed) return;
+      clearRenderedCue(nativeSuppressed);
+    },
+
+    subscribeRenderFailure(listener) {
+      if (disposed) return () => undefined;
+      renderFailureListeners.add(listener);
+      return () => { renderFailureListeners.delete(listener); };
     },
 
     setDragMode(enabled) {
@@ -461,24 +514,16 @@ export function mountSubtitleOverlay(
 
     clear() {
       if (disposed) return;
-      renderGeneration += 1;
-      try {
-        mountedRoot.clear();
-      } catch {
-        // Native subtitles remain the safe fallback when React cannot clear.
-      } finally {
-        committedLineCount = 0;
-        syncNativeVisibility();
-        lastState = undefined;
-        lastAppearance = undefined;
-      }
+      clearRenderedCue();
     },
 
     dispose() {
       if (disposed) return;
       disposed = true;
       nativeSuppressed = false;
+      waitingForTranslation = false;
       committedLineCount = 0;
+      renderFailureListeners.clear();
       renderGeneration += 1;
       try {
         hostObserver?.disconnect();

@@ -19,7 +19,7 @@ export interface NetflixSessionRegistry {
   recordCatalog(
     tabId: number,
     message: MessageFor<'netflix/catalog-summary'>,
-  ): TranslationRevocation | null;
+  ): null;
   authorize(
     tabId: number,
     message: MessageFor<'translation/request'>,
@@ -72,12 +72,6 @@ interface ActiveNetflixSession {
   simplifiedChineseSeen: boolean;
   latestAuthorizedProviderGeneration: number | undefined;
   order: number;
-}
-
-interface TranslationRevocation {
-  readonly sessionId: string;
-  readonly episodeGeneration: number;
-  readonly providerGeneration: number;
 }
 
 interface PendingNetflixCatalog {
@@ -221,19 +215,11 @@ export function createNetflixSessionRegistry(): NetflixSessionRegistry {
           pending?.sessionId === next.sessionId &&
           pending.generation === next.generation
         ) pendingCatalogs.delete(tabId);
-        const shouldRevoke = !current.simplifiedChineseSeen &&
-          sawSimplifiedChinese &&
-          current.latestAuthorizedProviderGeneration !== undefined;
         current.catalogAuthority = next.authority;
         current.englishAvailable = englishAvailable;
         current.simplifiedChineseSeen ||= sawSimplifiedChinese;
         current.order = ++order;
-        if (!shouldRevoke) return null;
-        return {
-          sessionId: current.sessionId,
-          episodeGeneration: current.generation,
-          providerGeneration: current.latestAuthorizedProviderGeneration ?? 0,
-        };
+        return null;
       }
 
       // Runtime messages are delivered independently. Quarantine catalog
@@ -280,7 +266,6 @@ export function createNetflixSessionRegistry(): NetflixSessionRegistry {
         current.generation !== request.episodeGeneration ||
         current.catalogAuthority !== 'authoritative' ||
         !current.englishAvailable ||
-        current.simplifiedChineseSeen ||
         (current.latestAuthorizedProviderGeneration !== undefined &&
           request.providerGeneration < current.latestAuthorizedProviderGeneration)
       ) return { allowed: false, stateChanged: false };
@@ -529,23 +514,8 @@ export function createBackgroundMessageRouter(
           await persistSessionRegistry();
         }
       } else if (message.type === 'netflix/catalog-summary') {
-        const revocation = options.sessionRegistry.recordCatalog(tabId, message);
+        options.sessionRegistry.recordCatalog(tabId, message);
         await persistSessionRegistry();
-        if (revocation !== null) {
-          try {
-            await options.handleTranslation(createMessage({
-              id: `${message.id}:official-track`,
-              source: 'content',
-              type: 'translation/cancel',
-              payload: {
-                ...revocation,
-                reason: 'official-track',
-              },
-            }), tabId);
-          } catch {
-            // The persisted policy latch still prevents any subsequent request.
-          }
-        }
       }
       return undefined;
     }

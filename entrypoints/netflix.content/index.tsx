@@ -24,7 +24,10 @@ import {
 } from '../../src/app/runtime-settings-client';
 import type { RuntimeStatus } from '../../src/app/status';
 import type { NetflixBridgePayload } from '../../src/netflix/bridge';
-import { createNativeSubtitleClock } from '../../src/netflix/native-subtitle-clock';
+import {
+  createNativeSubtitleClock,
+  createNativeSubtitleMicrotaskScheduler,
+} from '../../src/netflix/native-subtitle-clock';
 import { createNativeSubtitleVisibility } from '../../src/netflix/native-subtitle-visibility';
 import {
   readNetflixPageMetadata,
@@ -384,10 +387,8 @@ export default defineContentScript({
       const generation = bridgeGeneration;
       clock = createNativeSubtitleClock({
         document: documentFacade,
-        scheduler: {
-          schedule: (callback) => window.requestAnimationFrame(() => callback()),
-          cancel: (handle) => window.cancelAnimationFrame(handle as number),
-        },
+        scheduler: createNativeSubtitleMicrotaskScheduler((callback) =>
+          window.queueMicrotask(callback)),
         createObserver,
         sessionId: bridgeSessionId(bridgeNonce),
         generation,

@@ -1,4 +1,5 @@
 import type { LanguageRoute } from './language-router';
+import { createCueDisplayPolicy } from './cue-display-policy';
 import {
   type RuntimeErrorCode,
   type RuntimeStatus,
@@ -30,6 +31,7 @@ const RATE_LIMIT_COOLDOWN_MS = 30_000;
 export interface SubtitleSessionTick {
   readonly visibleText?: string;
   readonly currentTimeMs?: number;
+  readonly seeking?: boolean;
 }
 
 export interface SubtitleSessionTickSource {
@@ -68,6 +70,8 @@ export interface SessionOverlaySink {
     appearance: SubtitleOverlayAppearance,
   ): boolean;
   clear(): void;
+  waitForTranslation?(): void;
+  subscribeRenderFailure?(listener: () => void): () => void;
 }
 
 export interface SessionStatusSink {
@@ -141,9 +145,11 @@ export function createSubtitleSessionController(
   let disposed = false;
   let generationInvalidating = false;
   let unsubscribe: (() => void) | undefined;
+  let unsubscribeRenderFailure: (() => void) | undefined;
   let activeCueIndex: number | null = null;
   let lastTimeMs: number | undefined;
   let lastRenderSignature: string | null = null;
+  let nativeGap = false;
   let appearanceRevision = 0;
   let taskSequence = 0;
   let sortedEnglishCues: readonly SubtitleCue[] = sortCues(englishTrack?.cues ?? []);
@@ -169,6 +175,10 @@ export function createSubtitleSessionController(
       // A failing custom overlay must never interfere with Netflix playback.
     }
   };
+  const cueDisplay = createCueDisplayPolicy({
+    onWait: () => { lastRenderSignature = null; options.overlay.waitForTranslation?.(); },
+    onFallback: safeClearOverlay,
+  });
 
   const publish = (status: RuntimeStatus): void => {
     try {
@@ -259,7 +269,7 @@ export function createSubtitleSessionController(
     if (disposed || !isSessionEnabled()) return;
     const cue = currentCue();
     if (cue === null) {
-      if (lastRenderSignature !== null) safeClearOverlay();
+      if (cueDisplay.reset() || lastRenderSignature !== null) safeClearOverlay();
       return;
     }
 
@@ -267,9 +277,19 @@ export function createSubtitleSessionController(
       english: normalizeDisplayText(cue.text),
       chinese: chineseForCue(cue),
     };
+    if (options.overlay.waitForTranslation !== undefined && appearance.chinese.visible &&
+      route.provider !== null && route.provider === blockedProvider) return;
+    const online = effectiveProvider() !== null;
+    const boundedWait = online && appearance.chinese.visible &&
+      options.overlay.waitForTranslation !== undefined;
+    if (boundedWait) {
+      if (!cueDisplay.shouldRender(cue.id, state.chinese !== null)) return;
+    } else {
+      cueDisplay.reset();
+    }
     if (
       (effectiveOfficial() && state.chinese === null) ||
-      (effectiveProvider() !== null && state.chinese === null) ||
+      (online && appearance.chinese.visible && state.chinese === null) ||
       (route.sourceMode === 'official-alignment' && !effectiveOfficial())
     ) {
       if (force || lastRenderSignature !== null) safeClearOverlay();
@@ -286,9 +306,11 @@ export function createSubtitleSessionController(
     lastRenderSignature = signature;
     try {
       if (!options.overlay.render(state, appearance)) {
+        cueDisplay.fail(cue.id);
         lastRenderSignature = null;
       }
     } catch {
+      cueDisplay.fail(cue.id);
       safeClearOverlay();
     }
   };
@@ -330,6 +352,9 @@ export function createSubtitleSessionController(
     if (!isTaskCurrent(task) || error.code === 'aborted' || error.code === 'stale_generation') {
       return;
     }
+    const active = currentCue();
+    if (active !== null && !providerTranslations.has(active.id) &&
+      task.cues.some(({ id }) => id === active.id)) cueDisplay.fail(active.id);
     publish({ mode: 'error', code: runtimeErrorForTranslation(error) });
     if (isTerminalProviderError(error)) {
       invalidate('provider-change', false);
@@ -356,6 +381,8 @@ export function createSubtitleSessionController(
       options.taskClient.enqueue(task, callbacks);
       return true;
     } catch {
+      const active = currentCue();
+      if (active !== null) cueDisplay.fail(active.id);
       publish({ mode: 'error', code: 'provider_unavailable' });
       renderActiveCue();
       return false;
@@ -448,6 +475,8 @@ export function createSubtitleSessionController(
       : readCurrentTime(options.tickSource);
     if (clockTime !== undefined) lastTimeMs = clockTime;
     const visible = normalizeDisplayText(tick.visibleText ?? '');
+    if (tick.visibleText !== undefined) nativeGap = visible === null;
+    if (nativeGap) return null;
     if (visible !== null) {
       const nativeIndex = findCueByVisibleText(
         sortedEnglishCues,
@@ -464,7 +493,15 @@ export function createSubtitleSessionController(
 
   const handleTick = (tick: SubtitleSessionTick, promote: boolean): void => {
     if (disposed) return;
+    let displayRevoked = false;
+    if (tick.seeking) {
+      displayRevoked = cueDisplay.reset();
+      nativeGap = false;
+      activeCueIndex = null;
+    }
     const nextIndex = locateCue(tick);
+    if (tick.seeking && nextIndex === null &&
+      (displayRevoked || lastRenderSignature !== null)) safeClearOverlay();
     if (nextIndex === activeCueIndex) return;
     activeCueIndex = nextIndex;
     renderActiveCue();
@@ -477,7 +514,7 @@ export function createSubtitleSessionController(
       englishTrack,
       officialChineseTrack,
     );
-    activeCueIndex = lastTimeMs === undefined
+    activeCueIndex = lastTimeMs === undefined || nativeGap
       ? null
       : findCueAtTime(sortedEnglishCues, lastTimeMs);
     publishRouteStatus();
@@ -491,6 +528,7 @@ export function createSubtitleSessionController(
     clearBlockedProvider = false,
   ): void => {
     const staleGeneration = currentGeneration();
+    cueDisplay.reset();
     generationInvalidating = true;
     try {
       options.taskClient.cancel(staleGeneration, reason);
@@ -511,6 +549,16 @@ export function createSubtitleSessionController(
     safeClearOverlay();
   };
 
+  try {
+    unsubscribeRenderFailure = options.overlay.subscribeRenderFailure?.(() => {
+      if (disposed) return;
+      const cue = currentCue();
+      if (cue !== null) cueDisplay.fail(cue.id);
+    });
+  } catch {
+    // 订阅失败时仍由字幕层自己的错误边界恢复原生字幕，不影响 Netflix 播放。
+    unsubscribeRenderFailure = undefined;
+  }
   lastTimeMs = readCurrentTime(options.tickSource);
   restartCurrentState();
   try {
@@ -528,8 +576,11 @@ export function createSubtitleSessionController(
 
     seek(currentTimeMs) {
       if (disposed || !validTime(currentTimeMs)) return;
+      const displayRevoked = cueDisplay.reset();
+      nativeGap = false;
       lastTimeMs = currentTimeMs;
       const nextIndex = findCueAtTime(sortedEnglishCues, currentTimeMs);
+      if (nextIndex === null && (displayRevoked || lastRenderSignature !== null)) safeClearOverlay();
       activeCueIndex = nextIndex;
       renderActiveCue();
       if (nextIndex !== null) promoteNeighborhood(nextIndex);
@@ -611,6 +662,7 @@ export function createSubtitleSessionController(
 
     updateAppearance(nextAppearance) {
       if (disposed || appearance === nextAppearance) return;
+      if (appearance.chinese.visible !== nextAppearance.chinese.visible) cueDisplay.reset();
       appearance = nextAppearance;
       appearanceRevision += 1;
       renderActiveCue(true);
@@ -646,12 +698,19 @@ export function createSubtitleSessionController(
       englishTrack = change.englishTrack;
       officialChineseTrack = change.officialChineseTrack ?? null;
       route = change.route;
+      nativeGap = false;
       lastTimeMs = readCurrentTime(options.tickSource);
       restartCurrentState();
     },
 
     dispose() {
       if (disposed) return;
+      try {
+        unsubscribeRenderFailure?.();
+      } catch {
+        // 即使解除订阅失败，disposed 守卫仍会阻止遗留回调操作字幕层。
+      }
+      unsubscribeRenderFailure = undefined;
       invalidate('player-disposed', true);
       disposed = true;
       try {

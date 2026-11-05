@@ -32,6 +32,35 @@ export interface NativeSubtitleClockScheduler {
   cancel(handle: unknown): void;
 }
 
+/**
+ * 在当前微任务检查点派发字幕更新，避免延迟到下一绘制帧。
+ * 入队函数必须异步调度回调；句柄仅在当前调度器有效，取消或已执行后不会再次派发。
+ * 入队失败时清理句柄并向调用方传播错误。
+ */
+export function createNativeSubtitleMicrotaskScheduler(
+  enqueueMicrotask: (callback: () => void) => void,
+): NativeSubtitleClockScheduler {
+  const pending = new Set<object>();
+  return {
+    schedule(callback) {
+      const handle = {};
+      pending.add(handle);
+      try {
+        enqueueMicrotask(() => {
+          if (pending.delete(handle)) callback();
+        });
+      } catch (error) {
+        pending.delete(handle);
+        throw error;
+      }
+      return handle;
+    },
+    cancel(handle) {
+      if (typeof handle === 'object' && handle !== null) pending.delete(handle);
+    },
+  };
+}
+
 export interface NativeSubtitleTick {
   readonly sessionId: string;
   readonly generation: number;
