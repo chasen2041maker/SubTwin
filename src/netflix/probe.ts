@@ -4,6 +4,17 @@ import {
   type NetflixCatalogPayload,
   type NetflixCatalogTrackDescriptor,
 } from './bridge';
+import {
+  extractNetflixTimedTextEmbeddedLanguage,
+  type NetflixCatalogTimedTextBinding,
+  type NetflixObservedTimedTextPayload,
+  type NetflixTimedTextRequestObservation,
+} from './observed-timed-text';
+export {
+  extractNetflixTimedTextEmbeddedLanguage,
+  type NetflixCatalogTimedTextBinding,
+  type NetflixObservedTimedTextPayload,
+} from './observed-timed-text';
 
 export const MAX_TIMED_TEXT_BYTES = MAX_NETFLIX_BRIDGE_BYTES;
 const MAX_TIMED_TEXT_SNIFF_PREFIX_BYTES = 4096;
@@ -43,25 +54,6 @@ export interface TimedTextResourceIdentity {
   readonly resourceId: string;
   readonly trackId: string;
   readonly language: string;
-}
-
-export interface NetflixCatalogTimedTextBinding {
-  readonly titleId: string;
-  readonly trackId: string;
-  /** MAIN-world-only opaque profile discriminator. Never bridge the raw
-   * Netflix text-profile name or a signed URL. */
-  readonly variantId?: string;
-}
-
-/** A page-observed body is not bridge-ready until runtime binds it to an
- * authoritative Player title and matching track. */
-export interface NetflixObservedTimedTextPayload {
-  readonly type: 'timed-text';
-  readonly resourceId: string;
-  readonly trackId: string;
-  readonly language: string;
-  readonly format: 'ttml' | 'webvtt';
-  readonly body: string;
 }
 
 export function canonicalizeNetflixTimedTextResource(
@@ -398,9 +390,9 @@ export interface NetworkProbeOptions {
   readonly generation: number;
   readonly currentGeneration: () => number;
   readonly onTimedText: (payload: NetflixObservedTimedTextPayload) => void;
-  /** Snapshotted when a request starts. Only supplied while runtime is
-   * intentionally switching to an authoritative Player text track. */
+  /** 在请求开始时保存快照，只在受控切换权威目录中的轨道时提供。 */
   readonly currentTimedTextBinding?: () => NetflixCatalogTimedTextBinding | undefined;
+  readonly onTimedTextRequest?: (event: NetflixTimedTextRequestObservation) => void;
   readonly onTimedTextCandidate?: (event: {
     readonly bound: boolean;
     readonly outcome: string;
@@ -422,6 +414,7 @@ interface ResolvedNetworkProbeOptions {
   readonly currentGeneration: () => number;
   readonly onTimedText: (payload: NetflixObservedTimedTextPayload) => void;
   readonly currentTimedTextBinding: () => NetflixCatalogTimedTextBinding | undefined;
+  readonly onTimedTextRequest: (event: NetflixTimedTextRequestObservation) => void;
   readonly onTimedTextCandidate: (event: {
     readonly bound: boolean;
     readonly outcome: string;
@@ -445,6 +438,7 @@ function snapshotProbeOptions(
     currentGeneration: options.currentGeneration,
     onTimedText: options.onTimedText,
     currentTimedTextBinding: options.currentTimedTextBinding ?? (() => undefined),
+    onTimedTextRequest: options.onTimedTextRequest ?? (() => undefined),
     onTimedTextCandidate: options.onTimedTextCandidate ?? (() => undefined),
     onCatalog: options.onCatalog ?? (() => undefined),
     onCatalogMetadata: options.onCatalogMetadata ?? (() => undefined),
@@ -461,10 +455,23 @@ function readCurrentTimedTextBinding(
   options: ResolvedNetworkProbeOptions,
 ): NetflixCatalogTimedTextBinding | undefined {
   try {
-    return options.currentTimedTextBinding();
+    const binding = options.currentTimedTextBinding();
+    return binding === undefined ? undefined : Object.freeze({ ...binding });
   } catch {
     return undefined;
   }
+}
+
+function observeTimedTextRequest(
+  candidate: string | null,
+  binding: NetflixCatalogTimedTextBinding | undefined,
+  options: ResolvedNetworkProbeOptions,
+): void {
+  if (candidate === null || binding === undefined) return;
+  const identity = canonicalizeNetflixUnboundOcaTimedTextResource(candidate);
+  if (identity.ok) safeEmit(options.onTimedTextRequest, {
+    resourceId: identity.value.resourceId, binding,
+  });
 }
 
 interface FetchPatch {
@@ -583,6 +590,7 @@ export function installFetchProbe(
     const observedOptions = currentOptions;
     const candidate = candidateUrl(args[0], undefined);
     const binding = readCurrentTimedTextBinding(observedOptions);
+    observeTimedTextRequest(candidate, binding, observedOptions);
     const originalPromise = originalFetch.apply(this, args);
     void originalPromise.then(
       (response) => {
@@ -705,6 +713,7 @@ interface PreparedFetchResponse {
   readonly trackId: string;
   readonly language: string;
   readonly requiresEmbeddedLanguage: boolean;
+  readonly requestBinding?: NetflixCatalogTimedTextBinding;
 }
 
 function prepareFetchResponse(
@@ -744,6 +753,7 @@ function prepareFetchResponse(
       trackId: identity.trackId,
       language: identity.language,
       requiresEmbeddedLanguage,
+      ...(binding === undefined ? {} : { requestBinding: binding }),
     };
   } catch {
     return null;
@@ -773,6 +783,7 @@ async function inspectFetchResponse(
     language,
     format: timedText.value.format,
     body: timedText.value.body,
+    ...(response.requestBinding === undefined ? {} : { requestBinding: response.requestBinding }),
   };
 }
 
@@ -1204,6 +1215,7 @@ export function installXhrProbe(
     const state = metadata.get(this);
     if (state !== undefined) {
       state.binding = readCurrentTimedTextBinding(currentOptions);
+      observeTimedTextRequest(state.candidate, state.binding, currentOptions);
     }
     let entry: PendingXhrListener | null = null;
     const shouldObserve = state?.candidate !== null && state?.candidate !== undefined && (
@@ -1447,6 +1459,7 @@ function inspectLoadedXhr(
       language,
       format: sniffed.value.format,
       body,
+      ...(binding === undefined ? {} : { requestBinding: binding }),
     });
     return;
   }
@@ -1554,27 +1567,8 @@ function inspectLoadedXhr(
     language,
     format: sniffed.value.format,
     body,
+    ...(binding === undefined ? {} : { requestBinding: binding }),
   });
-}
-
-export function extractNetflixTimedTextEmbeddedLanguage(
-  body: string,
-  format: 'ttml' | 'webvtt',
-): string | null {
-  if (format !== 'ttml') return null;
-  const prefix = body.replace(/^\uFEFF/u, '').trimStart().slice(0, 8_192);
-  const root = /^(?:<\?xml[^>]*>\s*)?<(?:[A-Za-z][\w.-]*:)?tt\b([^>]*)>/iu.exec(prefix);
-  if (root === null) return null;
-  const attributes = root[1] ?? '';
-  const languages = [...attributes.matchAll(
-    /(?:^|\s)xml:lang\s*=\s*(["'])([^"']+)\1/giu,
-  )].map((match) => match[2]?.trim().replaceAll('_', '-'));
-  const language = languages.length === 1 ? languages[0] : undefined;
-  return language !== undefined &&
-      language.length <= 35 &&
-      /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(language)
-    ? language
-    : null;
 }
 
 export function extractCatalogObservation(

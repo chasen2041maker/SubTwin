@@ -201,6 +201,7 @@ export interface SubtitleOverlayMount {
     state: NormalizedActiveCueState,
     appearance: SubtitleOverlayAppearance,
   ): boolean;
+  /** 请求在替代字幕提交后隐藏原字幕；等待、清空或失败时保留原字幕。 */
   setNativeSubtitlesHidden(hidden: boolean): void;
   setDragMode(enabled: boolean): void;
   clear(): void;
@@ -229,20 +230,24 @@ export function mountSubtitleOverlay(
   if (existing !== undefined) return existing;
 
   let host: SubtitleOverlayNode | undefined;
+  let hostTarget: SubtitleOverlayNode | undefined;
   let root: SubtitleOverlayRenderRoot | undefined;
   let hostObserver: SubtitleOverlayHostObserver | undefined;
   let listenerAttached = false;
   let disposed = false;
   let nativeHidden = false;
   let nativeSuppressed = false;
-  let renderedBilingual = false;
+  let committedLineCount = 0;
   let renderGeneration = 0;
   let dragEnabled = false;
   let lastAppearance: SubtitleOverlayAppearance | undefined;
   let lastState: NormalizedActiveCueState | undefined;
 
+  const hasNativeReplacement = (): boolean =>
+    committedLineCount >= 2 || (nativeSuppressed && committedLineCount > 0);
+
   const restoreNative = (force = false): void => {
-    if (!force && (nativeSuppressed || renderedBilingual)) return;
+    if (!force && hasNativeReplacement()) return;
     if (!nativeHidden && !force) return;
     nativeHidden = false;
     try {
@@ -263,31 +268,46 @@ export function mountSubtitleOverlay(
   };
 
   const syncNativeVisibility = (): void => {
-    if (nativeSuppressed || renderedBilingual) hideNative();
+    if (hasNativeReplacement()) hideNative();
     else restoreNative();
+  };
+
+  const invalidateReplacement = (): void => {
+    committedLineCount = 0;
+    renderGeneration += 1;
+    syncNativeVisibility();
+  };
+
+  const clearUnavailableReplacement = (): void => {
+    invalidateReplacement();
+    try {
+      root?.clear();
+    } catch {
+      // 清理失败不能影响 Netflix 播放；原字幕已经恢复。
+    }
   };
 
   const moveHostToFullscreenRoot = (): boolean => {
     if (disposed || host === undefined) return false;
     const target = overlayDocument.fullscreenElement ?? overlayDocument.documentElement;
+    hostTarget = undefined;
     try {
       target.append(host);
     } catch {
-      restoreNative();
+      clearUnavailableReplacement();
       return false;
     }
     if (!host.isConnected) {
-      restoreNative();
+      clearUnavailableReplacement();
       return false;
     }
+    hostTarget = target;
     return true;
   };
 
   const recoverDetachedHost = (): void => {
     if (disposed || host === undefined || host.isConnected) return;
-    renderedBilingual = false;
-    syncNativeVisibility();
-    renderGeneration += 1;
+    invalidateReplacement();
     try {
       root?.clear();
     } catch {
@@ -365,12 +385,12 @@ export function mountSubtitleOverlay(
         if (!disposed) mount.clear();
         return false;
       }
-      const shouldHideNative = visibleLines.length >= 2;
       lastState = state;
       lastAppearance = appearance;
 
-      if (!mountedHost.isConnected) {
-        renderedBilingual = false;
+      if (!mountedHost.isConnected || hostTarget !==
+        (overlayDocument.fullscreenElement ?? overlayDocument.documentElement)) {
+        committedLineCount = 0;
         syncNativeVisibility();
         if (!moveHostToFullscreenRoot()) {
           try {
@@ -396,17 +416,17 @@ export function mountSubtitleOverlay(
           {
             onCommit: () => {
               if (disposed || generation !== renderGeneration) return;
-              if (!mountedHost.isConnected) {
-                renderedBilingual = false;
-                syncNativeVisibility();
+              if (!mountedHost.isConnected || hostTarget !==
+                (overlayDocument.fullscreenElement ?? overlayDocument.documentElement)) {
+                clearUnavailableReplacement();
                 return;
               }
-              renderedBilingual = shouldHideNative;
+              committedLineCount = visibleLines.length;
               syncNativeVisibility();
             },
             onError: () => {
               if (!disposed && generation === renderGeneration) {
-                renderedBilingual = false;
+                committedLineCount = 0;
                 syncNativeVisibility();
               }
             },
@@ -419,7 +439,7 @@ export function mountSubtitleOverlay(
         } catch {
           // A failed render is already being downgraded to native subtitles.
         }
-        renderedBilingual = false;
+        committedLineCount = 0;
         syncNativeVisibility();
         return false;
       }
@@ -447,7 +467,7 @@ export function mountSubtitleOverlay(
       } catch {
         // Native subtitles remain the safe fallback when React cannot clear.
       } finally {
-        renderedBilingual = false;
+        committedLineCount = 0;
         syncNativeVisibility();
         lastState = undefined;
         lastAppearance = undefined;
@@ -458,7 +478,7 @@ export function mountSubtitleOverlay(
       if (disposed) return;
       disposed = true;
       nativeSuppressed = false;
-      renderedBilingual = false;
+      committedLineCount = 0;
       renderGeneration += 1;
       try {
         hostObserver?.disconnect();

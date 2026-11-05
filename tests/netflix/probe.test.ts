@@ -205,6 +205,7 @@ describe('Netflix fetch instrumentation', () => {
       language: 'und',
       format: 'webvtt',
       body,
+      requestBinding: { titleId: 'title-1', trackId: 'zh-main' },
     });
     handle.dispose();
 

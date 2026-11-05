@@ -217,7 +217,7 @@ describe('subtitle overlay mount lifecycle', () => {
     expect(visibility).toEqual(['hide', 'restore']);
   });
 
-  it('suppresses native subtitles immediately while SubTwin is enabled', () => {
+  it('keeps native subtitles until enabled replacement subtitles commit', () => {
     const document = new FakeDocument();
     const root = new FakeRenderRoot();
     const visibility: string[] = [];
@@ -231,13 +231,101 @@ describe('subtitle overlay mount lifecycle', () => {
     });
 
     mount.setNativeSubtitlesHidden(true);
+    expect(visibility).toEqual([]);
+
+    mount.render(activeState, appearance);
+    expect(visibility).toEqual([]);
+    root.commit();
     expect(visibility).toEqual(['hide']);
 
     mount.clear();
-    expect(visibility).toEqual(['hide']);
+    expect(visibility).toEqual(['hide', 'restore']);
+    root.commitStale();
+    expect(visibility).toEqual(['hide', 'restore']);
 
     mount.setNativeSubtitlesHidden(false);
     expect(visibility).toEqual(['hide', 'restore']);
+    mount.dispose();
+  });
+
+  it('restores native subtitles after enabled replacement rendering fails', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+
+    mount.setNativeSubtitlesHidden(true);
+    mount.render(activeState, appearance);
+    root.commit();
+    expect(visibility).toEqual(['hide']);
+
+    root.fail();
+    expect(visibility).toEqual(['hide', 'restore']);
+    mount.setNativeSubtitlesHidden(true);
+    expect(visibility).toEqual(['hide', 'restore']);
+    mount.dispose();
+  });
+
+  it('restores native subtitles when an enabled replacement host is detached', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const hostObserver = new FakeHostObserver();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createHostObserver: (callback) => hostObserver.bind(callback),
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+
+    mount.setNativeSubtitlesHidden(true);
+    mount.render(activeState, appearance);
+    root.commit();
+    expect(visibility).toEqual(['hide']);
+
+    document.documentElement.children[0]?.remove();
+    hostObserver.notify();
+    expect(visibility).toEqual(['hide', 'restore']);
+    root.commitStale();
+    expect(visibility).toEqual(['hide', 'restore']);
+    mount.dispose();
+  });
+
+  it('hides native subtitles only after a selected single-language replacement commits', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+
+    mount.setNativeSubtitlesHidden(true);
+    mount.render(activeState, {
+      ...appearance,
+      english: { ...appearance.english, visible: false },
+    });
+    expect(visibility).toEqual([]);
+    root.commit();
+    expect(visibility).toEqual(['hide']);
+
+    mount.render({ english: null, chinese: null }, appearance);
+    expect(visibility).toEqual(['hide', 'restore']);
+    mount.dispose();
   });
 
   it('restores native subtitles on render failure and disposal', () => {
@@ -297,6 +385,42 @@ describe('subtitle overlay mount lifecycle', () => {
     first.dispose();
   });
 
+  it('restores native subtitles when moving an enabled replacement into fullscreen fails', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+
+    mount.setNativeSubtitlesHidden(true);
+    mount.render(activeState, appearance);
+    root.commit();
+    expect(visibility).toEqual(['hide']);
+
+    document.fullscreenElement = new FakeNode();
+    document.fullscreenElement.throwOnAppend = true;
+    document.emitFullscreenChange();
+    expect(visibility).toEqual(['hide', 'restore']);
+    expect(root.rendered.at(-1)).toBeNull();
+    root.commit();
+    expect(visibility).toEqual(['hide', 'restore']);
+    expect(mount.render(activeState, appearance)).toBe(false);
+    root.commit();
+    mount.setDragMode(true);
+    root.commit();
+    expect(visibility).toEqual(['hide', 'restore']);
+    document.fullscreenElement = null;
+    document.emitFullscreenChange();
+    expect(root.rendered.at(-1)).toBeNull();
+    mount.dispose();
+  });
+
   it('does not hide native subtitles when the host is removed before commit', () => {
     const document = new FakeDocument();
     const root = new FakeRenderRoot();
@@ -318,6 +442,33 @@ describe('subtitle overlay mount lifecycle', () => {
 
     expect(visibility).toEqual([]);
     expect(document.documentElement.children).toHaveLength(0);
+    mount.dispose();
+  });
+
+  it('keeps native subtitles when the fullscreen target changes before commit', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+
+    mount.setNativeSubtitlesHidden(true);
+    mount.render(activeState, appearance);
+    document.fullscreenElement = new FakeNode();
+    root.commit();
+    expect(visibility).toEqual([]);
+    expect(root.rendered.at(-1)).toBeNull();
+
+    document.emitFullscreenChange();
+    mount.render(activeState, appearance);
+    root.commit();
+    expect(visibility).toEqual(['hide']);
     mount.dispose();
   });
 

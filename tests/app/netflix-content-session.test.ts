@@ -175,6 +175,43 @@ describe('Netflix isolated content session', () => {
         'Translate the English line that is visibly selected'))).toBe(true);
   });
 
+  it('renders DeepSeek bilingual subtitles from native English when only the Chinese body is available in a multi-English catalog', () => {
+    const harness = createHarness(settings('deepseek', true));
+    const english = 'Translate this visible English subtitle';
+    const chinese = '这是实时英文字幕的译文。';
+    harness.session.handlePayload(catalog('native-deepseek-title', 'authoritative', [
+      descriptor('en-subtitle', 'en', 'subtitle'),
+      descriptor('en-cc', 'en', 'closed-caption'),
+      descriptor('zh-main', 'zh-Hans'),
+    ]));
+    harness.session.handlePayload(timedText(
+      'native-deepseek-title',
+      'tt_5555555555555555',
+      'zh-main',
+      'zh-Hans',
+      '官方中文字幕不替代显式选择的翻译服务。',
+    ));
+    expect(harness.tasks.scheduled).toHaveLength(0);
+
+    harness.ticks.emit({ visibleText: english, currentTimeMs: 500 });
+
+    expect(harness.tasks.scheduled).toHaveLength(1);
+    const scheduled = harness.tasks.scheduled[0];
+    if (scheduled === undefined) throw new Error('Expected a native subtitle translation task.');
+    expect(scheduled.task.provider).toBe('deepseek');
+    expect(scheduled.task.cues.map(({ text }) => text)).toEqual([english]);
+    expect(scheduled.callbacks.isCurrent()).toBe(true);
+    expect(harness.overlay.last()).toBeUndefined();
+
+    scheduled.callbacks.onResult({
+      translations: scheduled.task.cues.map(({ id }) => ({ cueId: id, text: chinese })),
+      retryCueIds: [],
+    });
+
+    expect(harness.overlay.last()).toEqual({ english, chinese });
+    harness.session.dispose();
+  });
+
   it('keeps discovery and provider-unset catalogs at exactly zero external work', () => {
     const discovering = createHarness(settings('google-free', false));
     discovering.session.handlePayload(catalog('title-1', 'provisional', [

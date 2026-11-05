@@ -27,7 +27,7 @@ const STAGE_RANK: Readonly<Record<PageSubtitlePipelineStage, number>> = {
   downloading: 5,
   downloaded: 6,
   received: 7,
-  failed: 8,
+  failed: 9,
   partial: 9,
   accepted: 10,
 };
