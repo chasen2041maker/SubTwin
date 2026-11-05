@@ -140,6 +140,14 @@ export function createVideoTickSource(
       : { visibleText: lastNativeVisibleText, currentTimeMs: value });
   };
 
+  const beginSeeking = (): void => {
+    lastNativeVisibleText = undefined;
+    const value = currentTimeMs();
+    if (value === undefined) return;
+    markClockEmission();
+    emit({ currentTimeMs: value, seeking: true });
+  };
+
   const cancelFrame = (): void => {
     if (!framePending) return;
     framePending = false;
@@ -198,7 +206,7 @@ export function createVideoTickSource(
 
   const eventListeners: Record<VideoTickEvent, () => void> = {
     timeupdate: emitCurrentTime,
-    seeking: emitCurrentTime,
+    seeking: beginSeeking,
     seeked: emitCurrentTime,
     play: startPlayback,
     playing: startPlayback,

@@ -155,8 +155,82 @@ describe('createVideoTickSource', () => {
     harness.video!.currentTime = -1;
     harness.video!.emit('timeupdate');
 
-    expect(ticks).toEqual([{ currentTimeMs: 8_750 }]);
+    expect(ticks).toEqual([{ currentTimeMs: 8_750, seeking: true }]);
     expect(harness.source.currentTimeMs()).toBeUndefined();
+  });
+
+  it.each([true, false])('clears pre-seek native text and immediately marks seeking while paused=%s', (paused) => {
+    const harness = createHarness();
+    const ticks: SubtitleSessionTick[] = [];
+    harness.video!.paused = paused;
+    harness.source.subscribe((tick) => ticks.push(tick));
+    harness.source.emitNative({
+      sessionId: 'seek-session',
+      generation: 1,
+      sequence: 1,
+      visibleText: 'Native text from before seeking',
+      currentTimeMs: 500,
+    });
+    ticks.length = 0;
+
+    harness.video!.currentTime = 10;
+    harness.video!.emit('seeking');
+    expect(ticks).toEqual([{ currentTimeMs: 10_000, seeking: true }]);
+    harness.video!.emit('seeked');
+    expect(ticks.at(-1)).toEqual({ currentTimeMs: 10_000 });
+    harness.video!.emit('timeupdate');
+    expect(ticks.at(-1)).toEqual({ currentTimeMs: 10_000 });
+    if (!paused) {
+      harness.setNow(170);
+      harness.runNextFrame();
+      expect(ticks.at(-1)).toEqual({ currentTimeMs: 10_000 });
+    }
+    harness.source.dispose();
+  });
+
+  it('retains new native text arriving during seeking without marking seeked as another reset', () => {
+    const harness = createHarness();
+    const ticks: SubtitleSessionTick[] = [];
+    harness.source.subscribe((tick) => ticks.push(tick));
+    harness.video!.currentTime = 12;
+    harness.video!.emit('seeking');
+    harness.source.emitNative({
+      sessionId: 'seek-session',
+      generation: 1,
+      sequence: 2,
+      visibleText: 'The subtitle at the new position',
+      currentTimeMs: 12_000,
+    });
+    harness.video!.emit('seeked');
+
+    expect(ticks[0]).toEqual({ currentTimeMs: 12_000, seeking: true });
+    expect(ticks.at(-1)).toEqual({
+      currentTimeMs: 12_000,
+      visibleText: 'The subtitle at the new position',
+    });
+    harness.source.dispose();
+  });
+
+  it('drops pre-seek native text even when the seeking event has an invalid clock value', () => {
+    const harness = createHarness();
+    const ticks: SubtitleSessionTick[] = [];
+    harness.source.subscribe((tick) => ticks.push(tick));
+    harness.source.emitNative({
+      sessionId: 'seek-session',
+      generation: 1,
+      sequence: 1,
+      visibleText: 'Old native subtitle',
+      currentTimeMs: 500,
+    });
+    ticks.length = 0;
+    harness.video!.currentTime = Number.NaN;
+    harness.video!.emit('seeking');
+    expect(ticks).toEqual([]);
+
+    harness.video!.currentTime = 18;
+    harness.video!.emit('timeupdate');
+    expect(ticks).toEqual([{ currentTimeMs: 18_000 }]);
+    harness.source.dispose();
   });
 
   it('uses a single throttled animation-frame fallback only while playing', () => {

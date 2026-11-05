@@ -417,7 +417,7 @@ describe('background runtime security router', () => {
     expect(runtime.handleTranslation).toHaveBeenCalledOnce();
   });
 
-  it('fails closed before external translation until an authoritative English-only catalog is registered', async () => {
+  it('requires an authoritative English catalog without overriding an explicit provider when Chinese exists', async () => {
     const request = translationRequest();
 
     const unregistered = harness();
@@ -439,7 +439,7 @@ describe('background runtime security router', () => {
     const officialChinese = harness();
     await registerCatalog(officialChinese, 'authoritative', ['en-US', 'zh-Hans']);
     await officialChinese.router(request, CONTENT_SENDER);
-    expect(officialChinese.handleTranslation).not.toHaveBeenCalled();
+    expect(officialChinese.handleTranslation).toHaveBeenCalledOnce();
 
     const authorized = harness();
     await registerCatalog(authorized, 'authoritative', ['en-US']);
@@ -472,11 +472,6 @@ describe('background runtime security router', () => {
   it.each([
     { authority: 'provisional' as const, languages: ['en-US'], name: 'provisional catalog' },
     { authority: 'authoritative' as const, languages: ['fr-FR'], name: 'missing English' },
-    {
-      authority: 'authoritative' as const,
-      languages: ['en-US', 'zh-Hans'],
-      name: 'official Simplified Chinese',
-    },
   ])('rejects translation for $name', async ({ authority, languages }) => {
     const runtime = harness();
     await registerCatalog(runtime, authority, languages);
@@ -568,7 +563,7 @@ describe('background runtime security router', () => {
     expect(runtime.persistSessionRegistry).toHaveBeenCalledTimes(2);
   });
 
-  it('latches late official Chinese, cancels current work, and never reopens that generation', async () => {
+  it('continues the explicitly selected provider when official Chinese arrives later', async () => {
     const runtime = harness();
     await registerCatalog(runtime, 'authoritative', ['en-US']);
     await runtime.router(translationRequest({ providerGeneration: 4 }), CONTENT_SENDER);
@@ -579,25 +574,21 @@ describe('background runtime security router', () => {
       CONTENT_SENDER,
     );
 
+    expect(runtime.handleTranslation).toHaveBeenCalledOnce();
+
+    await runtime.router(translationRequest({ providerGeneration: 4 }), CONTENT_SENDER);
     expect(runtime.handleTranslation).toHaveBeenCalledTimes(2);
     expect(runtime.handleTranslation.mock.calls[1]?.[0]).toMatchObject({
-      type: 'translation/cancel',
-      payload: {
-        sessionId: 'session-1',
-        episodeGeneration: 1,
-        providerGeneration: 4,
-        reason: 'official-track',
-      },
+      type: 'translation/request', payload: { provider: 'deepseek' },
     });
-    expect(runtime.handleTranslation.mock.calls[1]?.[1]).toBe(17);
 
     await runtime.router(catalogSummary('authoritative', ['en-US']), CONTENT_SENDER);
     await runtime.router(translationRequest({ providerGeneration: 5 }), CONTENT_SENDER);
 
-    expect(runtime.handleTranslation).toHaveBeenCalledTimes(2);
+    expect(runtime.handleTranslation).toHaveBeenCalledTimes(3);
   });
 
-  it('persists the official-Chinese latch before a best-effort cancellation', async () => {
+  it('preserves explicit provider authorization after bilingual catalog persistence and restart', async () => {
     const runtime = harness();
     await registerCatalog(runtime, 'authoritative', ['en-US']);
     await runtime.router(translationRequest({ providerGeneration: 4 }), CONTENT_SENDER);
@@ -606,7 +597,6 @@ describe('background runtime security router', () => {
     runtime.persistSessionRegistry.mockImplementation(async () => {
       persisted = JSON.parse(JSON.stringify(runtime.registry.snapshot())) as unknown;
     });
-    runtime.handleTranslation.mockRejectedValueOnce(new Error('cancel failed'));
 
     await expect(runtime.router(
       catalogSummary('authoritative', ['en-US', 'zh-Hans']),
@@ -614,12 +604,13 @@ describe('background runtime security router', () => {
     )).resolves.toBeUndefined();
 
     expect(runtime.persistSessionRegistry).toHaveBeenCalledOnce();
+    expect(runtime.handleTranslation).toHaveBeenCalledOnce();
     const restarted = createNetflixSessionRegistry();
     expect(restarted.restore(persisted)).toBe(true);
     expect(restarted.authorize(
       CONTENT_SENDER.tab.id,
       translationRequest({ providerGeneration: 5 }),
-    )).toEqual({ allowed: false, stateChanged: false });
+    )).toEqual({ allowed: true, stateChanged: true });
   });
 
   it('returns a credential-free settings snapshot only to a trusted Netflix tab', async () => {
@@ -798,8 +789,8 @@ describe('trusted Netflix session registry', () => {
       },
     }));
     expect(officialChinese.authorize(CONTENT_SENDER.tab.id, request)).toEqual({
-      allowed: false,
-      stateChanged: false,
+      allowed: true,
+      stateChanged: true,
     });
   });
 
@@ -968,11 +959,11 @@ describe('trusted Netflix session registry', () => {
     expect(restarted.recordCatalog(
       17,
       catalogSummary('authoritative', ['en-US', 'zh-Hans']),
-    )).toEqual({
-      sessionId: 'session-1',
-      episodeGeneration: 1,
-      providerGeneration: 4,
-    });
+    )).toBeNull();
+    expect(restarted.authorize(
+      17,
+      translationRequest({ providerGeneration: 4 }),
+    )).toEqual({ allowed: true, stateChanged: false });
   });
 });
 

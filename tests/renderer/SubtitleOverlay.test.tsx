@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import type { ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
+import { createSubtitleSessionController, type TranslationTaskCallbacks } from '../../src/app/session-controller';
+import { DEFAULT_SETTINGS } from '../../src/storage/schema';
 
 import {
   SubtitleOverlay,
@@ -273,6 +275,172 @@ describe('subtitle overlay mount lifecycle', () => {
     mount.dispose();
   });
 
+  it('keeps native English hidden while waiting and committing both translated lines', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+
+    mount.setNativeSubtitlesHidden(true);
+    expect(mount.waitForTranslation).toBeTypeOf('function');
+    mount.waitForTranslation();
+    expect(visibility).toEqual(['hide']);
+    expect(root.rendered.at(-1)).toBeNull();
+    mount.render(activeState, appearance);
+    expect(visibility).toEqual(['hide']);
+    root.commit();
+    expect(visibility).toEqual(['hide']);
+
+    mount.waitForTranslation();
+    expect(visibility).toEqual(['hide']);
+    mount.clear();
+    expect(visibility).toEqual(['hide', 'restore']);
+    root.commitStale();
+    expect(visibility).toEqual(['hide', 'restore']);
+    mount.dispose();
+  });
+
+  it('restores native English when a pending bilingual render fails', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+
+    mount.setNativeSubtitlesHidden(true);
+    expect(mount.waitForTranslation).toBeTypeOf('function');
+    mount.waitForTranslation();
+    mount.render(activeState, appearance);
+    root.fail();
+    expect(visibility).toEqual(['hide', 'restore']);
+    mount.dispose();
+  });
+
+  it('keeps an asynchronously failed bilingual cue on native through later updates', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+    mount.setNativeSubtitlesHidden(true);
+    let callbacks: TranslationTaskCallbacks | undefined;
+    const controller = createSubtitleSessionController({
+      sessionId: 'render-session', episodeId: 'render-episode', trackHash: 'render-track',
+      episodeGeneration: 1, enabled: true,
+      englishTrack: {
+        id: 'english', language: { tag: 'en', kind: 'subtitles' }, format: 'webvtt',
+        cues: [{ id: 'cue', startMs: 0, endMs: 5_000, text: 'Synthetic English' }],
+      },
+      route: {
+        mode: 'deepseek', provider: 'deepseek', externalCallsAllowed: true,
+        schedulingScope: 'urgent-window', sourceMode: 'external-translation',
+      },
+      appearance: DEFAULT_SETTINGS.appearance,
+      tickSource: { currentTimeMs: () => 500, subscribe: () => () => undefined },
+      taskClient: { enqueue(_task, next) { callbacks = next; }, cancel() {} },
+      overlay: mount, status: { publish() {} },
+    });
+    expect(callbacks).toBeDefined();
+    callbacks?.onResult({ translations: [{ cueId: 'cue', text: '测试译文。' }], retryCueIds: [] });
+    root.commit();
+    expect(visibility).toEqual(['hide']);
+
+    root.fail();
+    expect(visibility).toEqual(['hide', 'restore']);
+    expect(root.rendered.at(-1)).toBeNull();
+    const renderCount = root.rendered.filter((node) => node !== null).length;
+    controller.updateAppearance({ ...DEFAULT_SETTINGS.appearance, lineSpacingPx: 10 });
+    callbacks?.onResult({ translations: [{ cueId: 'cue', text: '迟到修订。' }], retryCueIds: [] });
+    root.commit();
+    expect(root.rendered.filter((node) => node !== null)).toHaveLength(renderCount);
+    expect(visibility).toEqual(['hide', 'restore']);
+    controller.dispose();
+    mount.dispose();
+  });
+
+  it('locks the cue on native when clearing the previous layer fails before waiting', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+    mount.setNativeSubtitlesHidden(true);
+    root.failNextClear = true;
+    let callbacks: TranslationTaskCallbacks | undefined;
+    const controller = createSubtitleSessionController({
+      sessionId: 'clear-session', episodeId: 'clear-episode', trackHash: 'clear-track',
+      episodeGeneration: 1, enabled: true,
+      englishTrack: {
+        id: 'english', language: { tag: 'en', kind: 'subtitles' }, format: 'webvtt',
+        cues: [{ id: 'cue', startMs: 0, endMs: 5_000, text: 'Synthetic English' }],
+      },
+      route: {
+        mode: 'deepseek', provider: 'deepseek', externalCallsAllowed: true,
+        schedulingScope: 'urgent-window', sourceMode: 'external-translation',
+      },
+      appearance: DEFAULT_SETTINGS.appearance,
+      tickSource: { currentTimeMs: () => 500, subscribe: () => () => undefined },
+      taskClient: { enqueue(_task, next) { callbacks = next; }, cancel() {} },
+      overlay: mount, status: { publish() {} },
+    });
+    expect(visibility).toEqual([]);
+    callbacks?.onResult({ translations: [{ cueId: 'cue', text: '测试译文。' }], retryCueIds: [] });
+    root.commit();
+    expect(root.rendered.filter((node) => node !== null)).toHaveLength(0);
+    expect(visibility).toEqual([]);
+    controller.dispose();
+    mount.dispose();
+  });
+
+  it('cancels pending native suppression when the extension is disabled', () => {
+    const document = new FakeDocument();
+    const root = new FakeRenderRoot();
+    const visibility: string[] = [];
+    const mount = mountSubtitleOverlay({
+      document,
+      createRenderRoot: () => root,
+      nativeVisibility: {
+        hide: () => visibility.push('hide'),
+        restore: () => visibility.push('restore'),
+      },
+    });
+
+    mount.setNativeSubtitlesHidden(true);
+    expect(mount.waitForTranslation).toBeTypeOf('function');
+    mount.waitForTranslation();
+    mount.setNativeSubtitlesHidden(false);
+    expect(visibility).toEqual(['hide', 'restore']);
+    mount.waitForTranslation();
+    mount.setNativeSubtitlesHidden(true);
+    expect(visibility).toEqual(['hide', 'restore']);
+    mount.dispose();
+  });
+
   it('restores native subtitles when an enabled replacement host is detached', () => {
     const document = new FakeDocument();
     const root = new FakeRenderRoot();
@@ -539,6 +707,7 @@ describe('subtitle overlay mount lifecycle', () => {
 class FakeRenderRoot implements SubtitleOverlayRenderRoot {
   readonly rendered: ReactNode[] = [];
   unmountCount = 0;
+  failNextClear = false;
   private currentLifecycle: SubtitleOverlayRenderLifecycle | undefined;
   private staleLifecycle: SubtitleOverlayRenderLifecycle | undefined;
 
@@ -549,6 +718,10 @@ class FakeRenderRoot implements SubtitleOverlayRenderRoot {
   }
 
   clear(): void {
+    if (this.failNextClear) {
+      this.failNextClear = false;
+      throw new Error('Synthetic clear failure');
+    }
     this.rendered.push(null);
     this.staleLifecycle = this.currentLifecycle;
     this.currentLifecycle = undefined;
