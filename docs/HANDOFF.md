@@ -53,3 +53,15 @@
 - 实测方法：在 Netflix 页面注入 50ms 采样器，记录 `.player-timedtext` 原字幕文字与 `#subtwin-subtitle-overlay` shadow root 里 `.subtwin-overlay__line` 的出现时间；播放器 API 为 `netflix.appContext.state.playerApp.getAPI().videoPlayer`。
 - 测试后把用户的 Netflix 字幕设置恢复原样（《星期三》为英文 CC，华语剧为繁体中文）。
 - 用户的 SubTwin 来源设置是 DeepSeek（`deepseek-v4-flash`）。
+
+## 下一步：开头"先英文后双语"（第四轮诊断，未修）
+
+用户反馈：开播时先出现几秒 Netflix 原生英文，紧接着才变成插件双语。以《掌舵少女》（`/watch/83078965`，有英文与英文 CC 两条英文轨）实测确认根因：
+
+- Netflix 自己下载的英文正文是**未绑定请求**，目录里同语言有两条英文轨，`observed-timed-text.ts` 的 `bind()` 因歧义返回 null（日志有 `timed-text body: ttml en`，但内容脚本没有 `timed_text_received`）。
+- 随后抓取切到"英文"时，目标正是当前已显示的轨，`switchTo` 不会真的切换，Netflix 不重新下载，于是两次 `timed_out en`。
+- 结果整集停在实时捕获模式：每句先空白约 0.5 秒 → Netflix 英文 → 插件英文 → 译文到后才双语。
+
+修复思路（已试做、未提交）：`bind()` 增加可选参数 `selectedTrackId`；同语言多条轨且请求未绑定时，用抓取前用户选中的轨（`trackCapture.originalTrackId`，或 `preparePlayerTrackCapture(...).originalTrackId`）消歧。问题：`tests/netflix/observed-track-binding.test.ts` 里 4 个测试要求插件**自己经 performance 条目重新下载**的未绑定正文不能被认领（可能是另一条英文轨的 URL）。需要只对 Netflix 页面自身发起的 fetch/XHR 正文用"选中轨"消歧，而 performance 重新下载的正文仍保持待定；同时补测试。
+
+可选的后续改进：英文正文解析后立即启用首选英文轨（不必等两次原字幕匹配），让开头几句也能提前翻译。
