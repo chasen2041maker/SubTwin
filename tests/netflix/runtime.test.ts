@@ -1018,6 +1018,66 @@ describe('isolated and MAIN-world Netflix runtimes', () => {
     runtime.dispose();
   });
 
+  it('ignores browse-page preview players so the watched title keeps its catalog and bodies', () => {
+    const window = new FakeWindow();
+    let poll: (() => void) | undefined;
+    const prepare = vi.fn(() => ok({
+      titleId: 'title-1',
+      originalTrackId: 'en-main',
+      switchTo: vi.fn(() => true),
+      restore: vi.fn(),
+    }));
+    const runtime = installMainWorldNetflixRuntime({
+      window,
+      readPlayerCatalog: () => ok(window.location.pathname.startsWith('/watch/')
+        ? {
+            type: 'catalog',
+            titleId: 'title-1',
+            authority: 'authoritative',
+            tracks: [{ id: 'en-main', language: 'en', kind: 'subtitle' }],
+          }
+        : {
+            type: 'catalog',
+            titleId: 'preview-title',
+            authority: 'authoritative',
+            tracks: [
+              { id: 'preview-en', language: 'en', kind: 'subtitle' },
+              { id: 'preview-zh', language: 'zh-Hans', kind: 'subtitle' },
+            ],
+          }),
+      preparePlayerTrackCapture: prepare,
+      scheduleCatalogPoll: (callback) => {
+        poll = callback;
+        return () => undefined;
+      },
+      scheduleTrackCaptureTimeout: () => () => undefined,
+      installFetch: () => ({ dispose: vi.fn() }),
+      installXhr: () => ({ dispose: vi.fn() }),
+      extractCatalogResources: () => ok([]),
+    });
+    window.emit({
+      protocol: 'subtwin.netflix.bridge',
+      version: 1,
+      source: NETFLIX_CONTROL_SOURCE,
+      type: 'connect',
+      nonce: NONCE,
+      generation: 1,
+    });
+    const catalogTitles = () => window.sent
+      .map(({ data }) => (data as { payload?: { type?: string; titleId?: string } }).payload)
+      .filter((payload) => payload?.type === 'catalog')
+      .map((payload) => payload?.titleId);
+    expect(catalogTitles()).toEqual(['title-1']);
+
+    window.location.pathname = '/browse';
+    poll?.();
+    poll?.();
+
+    expect(catalogTitles()).toEqual(['title-1']);
+    expect(prepare).not.toHaveBeenCalled();
+    runtime.dispose();
+  });
+
   it('captures official Traditional Chinese when the catalog has no Simplified Chinese', () => {
     const window = new FakeWindow();
     const switchTo = vi.fn(() => true);

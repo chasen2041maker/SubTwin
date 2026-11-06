@@ -706,10 +706,9 @@ export function installMainWorldNetflixRuntime(options: {
         const routeTitleId = readWatchRouteTitleId(
           options.window.location.pathname,
         );
-        if (
-          routeTitleId !== null &&
-          result.value.titleId !== routeTitleId
-        ) return;
+        // 只采用播放页里的影片目录：浏览页的预告片播放器不是字幕目标，采用它会把
+        // 刚看过的影片目录与已抓到的正文换掉，还会去切换预告片的字幕轨。
+        if (routeTitleId === null || result.value.titleId !== routeTitleId) return;
         if (result.value.tracks.length === 0) {
           playerCatalogUnavailable = true;
           return;
