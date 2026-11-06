@@ -223,6 +223,30 @@ describe('PageControlSurface', () => {
     expect(onProviderChange).not.toHaveBeenCalled();
   });
 
+  it('explains English-only native mode instead of asking to set a source', () => {
+    const markup = renderToStaticMarkup(
+      <PageControlSurface
+        expanded
+        model={{
+          ...model,
+          status: { mode: 'unset' },
+          settings: { ...model.settings, provider: 'unset' },
+          catalog: { ...model.catalog, chineseTrack: '未发现中文字幕', officialChinese: false },
+        }}
+        position={{ x: 1200, y: 600 }}
+        onAppearanceChange={vi.fn()}
+        onEnabledChange={vi.fn()}
+        onExpandedChange={vi.fn()}
+        onPausedChange={vi.fn()}
+        onPositionChange={vi.fn()}
+        onProviderChange={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain('仅显示英文');
+    expect(markup).not.toContain('等待设置');
+  });
+
   it('changes the pause button accessible name when the page is paused', () => {
     const markup = renderToStaticMarkup(
       <PageControlSurface

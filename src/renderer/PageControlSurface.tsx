@@ -169,10 +169,14 @@ export function PageControlSurface(props: PageControlSurfaceProps): ReactNode {
           >
             <span className="subtwin-controls__status-dot" />
             <div>
-              <strong>{props.model.paused ? '本页已暂停' : shortStatus(props.model.status)}</strong>
+              <strong>{props.model.paused
+                ? '本页已暂停'
+                : nativeEnglishOnly(props.model) ? '仅显示英文' : shortStatus(props.model.status)}</strong>
               <p>{props.model.paused
                 ? '已恢复 Netflix 原字幕，点击下方"继续当前页"重新显示双语。'
-                : runtimeStatusMessage(props.model.status)}</p>
+                : nativeEnglishOnly(props.model)
+                  ? '本片没有 Netflix 官方中文字幕，原生双语只能显示英文。'
+                  : runtimeStatusMessage(props.model.status)}</p>
             </div>
           </section>
 
@@ -736,6 +740,18 @@ function launcherState(model: PageControlSurfaceModel): string {
   if (!model.settings.enabled) return 'disabled';
   if (model.paused) return 'paused';
   return model.status.mode === 'error' ? 'error' : 'active';
+}
+
+/**
+ * 选了"原生双语"但本片没有官方中文时，运行状态与"尚未选择来源"同为 unset；
+ * 这里改说清楚原因，而不是让人以为还没设置。
+ */
+function nativeEnglishOnly(model: PageControlSurfaceModel): boolean {
+  return model.settings.enabled &&
+    model.settings.provider === 'unset' &&
+    model.status.mode === 'unset' &&
+    model.catalog.authority === 'authoritative' &&
+    !model.catalog.officialChinese;
 }
 
 function shortStatus(status: RuntimeStatus): string {
