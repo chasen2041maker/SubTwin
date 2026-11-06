@@ -23,8 +23,12 @@ import type {
   TranslationProviderId,
 } from '../translation/types';
 
-const URGENT_NEIGHBOR_RADIUS = 2;
+// 在线翻译往返常为数秒；只预取前后两句会让每句译文都比字幕晚到。
+// 预取当前句之后的多句，使译文在字幕出现前就绪。
+const URGENT_LOOKAHEAD = 6;
+const URGENT_LOOKBEHIND = 1;
 const CONTEXT_RADIUS = 3;
+const DEEPSEEK_URGENT_BATCH_SIZE = 4;
 const DEEPSEEK_BULK_BATCH_SIZE = 20;
 const RATE_LIMIT_COOLDOWN_MS = 30_000;
 
@@ -398,7 +402,7 @@ export function createSubtitleSessionController(
     const batches = provider === 'google-free'
       ? cues.map((cue) => [cue])
       : priority === 'urgent'
-        ? [cues.slice(0, 5)]
+        ? chunk(cues, DEEPSEEK_URGENT_BATCH_SIZE)
         : chunk(cues, DEEPSEEK_BULK_BATCH_SIZE);
     return batches.map((batch) => {
       const inputs = batch.map(toTranslationCue);
@@ -435,9 +439,13 @@ export function createSubtitleSessionController(
   };
 
   const urgentCuesAt = (index: number): readonly SubtitleCue[] => {
+    // 当前句与即将出现的句子排在最前，保证第一批请求最先返回当前句。
     const indexes = [index];
-    for (let distance = 1; distance <= URGENT_NEIGHBOR_RADIUS; distance += 1) {
-      indexes.push(index - distance, index + distance);
+    for (let distance = 1; distance <= URGENT_LOOKAHEAD; distance += 1) {
+      indexes.push(index + distance);
+    }
+    for (let distance = 1; distance <= URGENT_LOOKBEHIND; distance += 1) {
+      indexes.push(index - distance);
     }
     return indexes
       .map((candidate) => sortedEnglishCues[candidate])
@@ -458,14 +466,19 @@ export function createSubtitleSessionController(
   const scheduleInitialWork = (): void => {
     const provider = schedulableProvider();
     if (provider === null || sortedEnglishCues.length === 0) return;
-    const initialIndex = activeCueIndex ?? 0;
+    const initialIndex = activeCueIndex ?? upcomingCueIndex(sortedEnglishCues, lastTimeMs);
     const urgent = urgentCuesAt(initialIndex);
     for (const cue of urgent) promotedCueIds.add(cue.id);
     if (!enqueueCues(provider, urgent, 'urgent')) return;
     if (route.schedulingScope !== 'bulk') return;
 
+    // 从当前播放位置向后批量翻译，再回头补前面的句子；
+    // 中途续播时不必先翻译已经看过的整段开头。
     const urgentIds = new Set(urgent.map(({ id }) => id));
-    const bulk = sortedEnglishCues.filter(({ id }) => !urgentIds.has(id));
+    const bulk = [
+      ...sortedEnglishCues.slice(initialIndex),
+      ...sortedEnglishCues.slice(0, initialIndex),
+    ].filter(({ id }) => !urgentIds.has(id));
     enqueueCues(provider, bulk, 'bulk');
   };
 
@@ -520,6 +533,23 @@ export function createSubtitleSessionController(
     publishRouteStatus();
     renderActiveCue(true);
     scheduleInitialWork();
+  };
+
+  // Netflix 常从不同资源地址重复下发同一份字幕；内容哈希相同就不是新轨道，
+  // 不能因此取消在途翻译、清空已到的译文并让字幕闪一下。
+  const tracksDiffer = (update: SessionTrackUpdate): boolean => {
+    const sameEnglish = englishTrack === update.englishTrack || (
+      englishTrack !== null &&
+      update.englishTrack !== null &&
+      englishTrack.id === update.englishTrack.id &&
+      update.trackHash !== undefined &&
+      update.trackHash === trackHash
+    );
+    return !(
+      sameEnglish &&
+      officialChineseTrack === update.officialChineseTrack &&
+      (update.trackHash === undefined || update.trackHash === trackHash)
+    );
   };
 
   const invalidate = (
@@ -618,12 +648,7 @@ export function createSubtitleSessionController(
     },
 
     updateTracks(update) {
-      if (
-        disposed ||
-        (englishTrack === update.englishTrack &&
-          officialChineseTrack === update.officialChineseTrack &&
-          (update.trackHash === undefined || update.trackHash === trackHash))
-      ) return;
+      if (disposed || !tracksDiffer(update)) return;
       invalidate(
         update.officialChineseTrack === null
           ? 'provider-change'
@@ -638,11 +663,7 @@ export function createSubtitleSessionController(
 
     updateRouteAndTracks(nextRoute, update) {
       const routeChanged = !sameRoute(route, nextRoute);
-      const tracksChanged = !(
-        englishTrack === update.englishTrack &&
-        officialChineseTrack === update.officialChineseTrack &&
-        (update.trackHash === undefined || update.trackHash === trackHash)
-      );
+      const tracksChanged = tracksDiffer(update);
       if (disposed || (!routeChanged && !tracksChanged)) return;
       invalidate(
         routeChanged
@@ -748,18 +769,19 @@ function findCueByVisibleText(
   currentTimeMs: number | undefined,
   activeIndex: number | null,
 ): number | null {
+  const visibleKey = compactText(visibleText);
   const activeCue = activeIndex === null ? undefined : cues[activeIndex];
   if (
     activeIndex !== null &&
     activeCue !== undefined &&
-    normalizeDisplayText(activeCue.text) === visibleText &&
+    compactText(activeCue.text) === visibleKey &&
     (currentTimeMs === undefined ||
       (activeCue.startMs <= currentTimeMs && currentTimeMs < activeCue.endMs))
   ) return activeIndex;
 
   const matches: number[] = [];
   for (let index = 0; index < cues.length; index += 1) {
-    if (normalizeDisplayText(cues[index]?.text ?? '') === visibleText) {
+    if (compactText(cues[index]?.text ?? '') === visibleKey) {
       matches.push(index);
     }
   }
@@ -804,6 +826,16 @@ function findCueAtTime(
     if (cue !== undefined && currentTimeMs < cue.endMs) return index;
   }
   return null;
+}
+
+/** 播放停在两句之间时，返回下一句；没有可用时间时从头开始。 */
+function upcomingCueIndex(
+  cues: readonly SubtitleCue[],
+  currentTimeMs: number | undefined,
+): number {
+  if (currentTimeMs === undefined) return 0;
+  const index = cues.findIndex((cue) => cue.endMs > currentTimeMs);
+  return index < 0 ? 0 : index;
 }
 
 function contextFor(
@@ -932,6 +964,11 @@ function validTime(value: number | undefined): value is number {
 function normalizeDisplayText(value: string): string | null {
   const normalized = value.replace(/\s+/gu, ' ').trim();
   return normalized.length === 0 ? null : normalized;
+}
+
+/** 原字幕匹配忽略空白：Netflix 的换行和字幕文件的空格不保证一致。 */
+function compactText(value: string): string {
+  return value.replace(/\s+/gu, '');
 }
 
 function normalizeGeneration(value: number): number {

@@ -1,4 +1,6 @@
-export const CUE_TRANSLATION_WAIT_MS = 1_500;
+// 等待期间原字幕被隐藏、画面没有任何字幕；等待过长会让人感觉字幕"慢半拍"。
+// 预取正常时译文在字幕出现前已就绪，此等待只兜底首句、拖动进度等少数情况。
+export const CUE_TRANSLATION_WAIT_MS = 500;
 
 export interface CueDisplayPolicyOptions {
   readonly onWait: () => void;
@@ -8,14 +10,15 @@ export interface CueDisplayPolicyOptions {
 }
 
 /**
- * 一次字幕展示只允许等待后原子显示或回退原生；回退后的迟到译文留给重播。
+ * 一次字幕展示先限时等待中英同显；超时先回退原字幕，译文在本句内到达时再升级为双语。
+ * 翻译或渲染失败（fail）则本句固定保留原字幕，避免反复重试渲染。
  * reset 撤销当前展示及计时器，不操作字幕层；失效计时器不能影响下一句。
  */
 export function createCueDisplayPolicy(options: CueDisplayPolicyOptions) {
   const schedule = options.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
   const cancel = options.cancel ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
   let cueId: string | null = null;
-  let state: 'idle' | 'waiting' | 'ready' | 'native' = 'idle';
+  let state: 'idle' | 'waiting' | 'ready' | 'timed-out' | 'native' = 'idle';
   let timer: unknown;
   let version = 0;
 
@@ -31,11 +34,15 @@ export function createCueDisplayPolicy(options: CueDisplayPolicyOptions) {
     state = 'idle';
     return active;
   };
+  const fallBack = (next: 'timed-out' | 'native'): void => {
+    cancelTimer();
+    state = next;
+    options.onFallback();
+  };
   const fail = (candidate: string): void => {
     if (candidate !== cueId || state === 'idle' || state === 'native') return;
-    cancelTimer();
-    state = 'native';
-    options.onFallback();
+    if (state === 'timed-out') { state = 'native'; return; }
+    fallBack('native');
   };
 
   return {
@@ -43,14 +50,16 @@ export function createCueDisplayPolicy(options: CueDisplayPolicyOptions) {
       if (candidate !== cueId) { reset(); cueId = candidate; }
       if (state === 'native') return false;
       if (ready) { cancelTimer(); state = 'ready'; return true; }
-      if (state === 'waiting') return false;
+      if (state === 'waiting' || state === 'timed-out') return false;
       state = 'waiting';
       const currentVersion = version;
       try {
         options.onWait();
         if (currentVersion !== version) return false;
         timer = schedule(() => {
-          if (currentVersion === version && cueId === candidate) fail(candidate);
+          if (currentVersion === version && cueId === candidate && state === 'waiting') {
+            fallBack('timed-out');
+          }
         }, CUE_TRANSLATION_WAIT_MS);
       } catch {
         fail(candidate);

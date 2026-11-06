@@ -836,8 +836,9 @@ function findNativeCueMatch(
   visibleText: string,
   currentTimeMs: number | undefined,
 ): SubtitleCue | null {
+  const visibleKey = compactText(visibleText);
   return track.cues.find((cue) => {
-    if (normalizeVisibleText(cue.text) !== visibleText) return false;
+    if (compactText(cue.text) !== visibleKey) return false;
     if (currentTimeMs === undefined || !Number.isFinite(currentTimeMs)) return true;
     return cue.startMs - NATIVE_MATCH_TOLERANCE_MS <= currentTimeMs &&
       currentTimeMs < cue.endMs + NATIVE_MATCH_TOLERANCE_MS;
@@ -850,9 +851,15 @@ function isDistinctiveNativeCueEvidence(
   visibleText: string,
 ): boolean {
   if ([...visibleText].length < 4) return false;
+  const visibleKey = compactText(visibleText);
   return track.cues.filter(
-    (candidate) => normalizeVisibleText(candidate.text) === visibleText,
+    (candidate) => compactText(candidate.text) === visibleKey,
   ).length === 1 && cue.text.trim().length > 0;
+}
+
+/** 忽略空白差异比较原字幕：Netflix 换行与字幕文件的空格并不总一致。 */
+function compactText(value: string): string {
+  return value.replace(/\s+/gu, '');
 }
 
 function timedTextResourceQuality(

@@ -157,6 +157,91 @@ describe('subtitle session controller', () => {
     expect(first?.providerGeneration).toBe(1);
   });
 
+  it('prefetches upcoming cues and warms bulk from the playback position forward', () => {
+    const harness = createHarness({
+      englishTrack: numberedTrack(60),
+      route: route('deepseek', 'bulk'),
+      currentTimeMs: 30_100,
+    });
+
+    const urgentIds = harness.tasks.scheduled
+      .filter(({ task }) => task.priority === 'urgent')
+      .flatMap(({ task }) => task.cues.map(({ id }) => id));
+    expect(urgentIds[0]).toBe('cue-30');
+    for (let index = 30; index <= 36; index += 1) {
+      expect(urgentIds).toContain(`cue-${index}`);
+    }
+    expect(harness.tasks.scheduled[0]?.task.cues.length).toBeLessThanOrEqual(4);
+
+    const bulkIds = harness.tasks.scheduled
+      .filter(({ task }) => task.priority === 'bulk')
+      .flatMap(({ task }) => task.cues.map(({ id }) => id));
+    expect(bulkIds[0]).toBe('cue-37');
+    expect(bulkIds.indexOf('cue-59')).toBeLessThan(bulkIds.indexOf('cue-0'));
+    expect(bulkIds).not.toContain('cue-30');
+  });
+
+  it('starts prefetching at the next cue when playback sits in a subtitle gap', () => {
+    const englishTrack = track('english', 'en', Array.from({ length: 40 }, (_, index) =>
+      cue(`cue-${index}`, index * 2_000, index * 2_000 + 1_000, `Line ${index}`)));
+    const harness = createHarness({
+      englishTrack,
+      route: route('deepseek', 'bulk'),
+      currentTimeMs: 20_500,
+    });
+
+    const firstUrgent = harness.tasks.scheduled.find(({ task }) => task.priority === 'urgent');
+    expect(firstUrgent?.task.cues[0]?.id).toBe('cue-10');
+  });
+
+  it('keeps translations and in-flight work when Netflix re-delivers identical track content', () => {
+    const englishTrack = numberedTrack(12);
+    const harness = createHarness({
+      englishTrack,
+      route: route('deepseek', 'bulk'),
+      currentTimeMs: 100,
+    });
+    harness.tasks.find('deepseek', 'cue-0').callbacks.onResult(batch('cue-0', '第一句'));
+    const cancelled = harness.tasks.cancelled.length;
+    const clears = harness.overlay.clearCount;
+    const scheduled = harness.tasks.scheduled.length;
+
+    harness.controller.updateTracks({
+      englishTrack: { ...englishTrack, cues: [...englishTrack.cues] },
+      officialChineseTrack: null,
+      trackHash: 'track-hash-1',
+    });
+
+    expect(harness.tasks.cancelled).toHaveLength(cancelled);
+    expect(harness.overlay.clearCount).toBe(clears);
+    expect(harness.tasks.scheduled).toHaveLength(scheduled);
+    expect(harness.overlay.lastState()).toEqual({ english: 'Line 0', chinese: '第一句' });
+  });
+
+  it('matches a two-line native subtitle even when Netflix drops the line-break space', () => {
+    const harness = createHarness({
+      englishTrack: track('english', 'en', [
+        cue('en-1', 0, 1_000, 'One'),
+        cue('en-2', 5_000, 6_000, 'It was an emptier house\nwithout the boys.'),
+      ]),
+      officialChineseTrack: track('chinese', 'zh-Hans', [
+        cue('zh-1', 0, 1_000, '一'),
+        cue('zh-2', 5_000, 6_000, '没有男生，房子空了不少。'),
+      ]),
+      route: route('official'),
+    });
+
+    harness.controller.tick({
+      visibleText: 'It was an emptier housewithout the boys.',
+      currentTimeMs: 5_100,
+    });
+
+    expect(harness.overlay.lastState()).toEqual({
+      english: 'It was an emptier house without the boys.',
+      chinese: '没有男生，房子空了不少。',
+    });
+  });
+
   it('renders cache and provider results only while their generations are current', () => {
     const harness = createHarness({
       route: route('deepseek', 'bulk'),

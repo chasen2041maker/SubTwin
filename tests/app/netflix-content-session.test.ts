@@ -283,6 +283,12 @@ describe('Netflix isolated content session', () => {
         'The fourth subtitle line',
         'The fifth subtitle line',
         'The sixth subtitle line',
+        'The seventh subtitle line',
+        'The eighth subtitle line',
+        'The ninth subtitle line',
+        'The tenth subtitle line',
+        'The eleventh subtitle line',
+        'The twelfth subtitle line',
       ],
     ));
 
@@ -298,6 +304,38 @@ describe('Netflix isolated content session', () => {
     const beforeStrongConfirmation = harness.tasks.scheduled.length;
     harness.ticks.emit({
       visibleText: 'Another unmistakable English sentence',
+      currentTimeMs: 1_500,
+    });
+    expect(harness.tasks.scheduled.slice(beforeStrongConfirmation).some(
+      ({ task }) => task.priority === 'bulk',
+    )).toBe(true);
+  });
+
+  it('confirms the track from two-line cues whose native text lost the line-break space', () => {
+    const harness = createHarness(settings('google-free', false));
+    harness.session.handlePayload(catalog('title-2', 'authoritative', [
+      descriptor('en-main', 'en'),
+    ]));
+    harness.session.handlePayload(timedTextWithCues(
+      'title-2',
+      'tt_5555555555555555',
+      'en-main',
+      'en',
+      [
+        'Man, it was an emptier house\nwithout the boys.',
+        '-Missed you all.\n-Ladies, how are you doing?',
+        ...Array.from({ length: 12 }, (_, index) => `Filler subtitle line ${index}`),
+      ],
+    ));
+
+    harness.ticks.emit({
+      visibleText: 'Man, it was an emptier housewithout the boys.',
+      currentTimeMs: 500,
+    });
+    expect(harness.tasks.scheduled.length).toBeGreaterThan(0);
+    const beforeStrongConfirmation = harness.tasks.scheduled.length;
+    harness.ticks.emit({
+      visibleText: '-Missed you all.-Ladies, how are you doing?',
       currentTimeMs: 1_500,
     });
     expect(harness.tasks.scheduled.slice(beforeStrongConfirmation).some(
@@ -323,6 +361,12 @@ describe('Netflix isolated content session', () => {
         'Normal subtitle fourth',
         'Normal subtitle fifth',
         'Normal subtitle sixth',
+        'Normal subtitle seventh',
+        'Normal subtitle eighth',
+        'Normal subtitle ninth',
+        'Normal subtitle tenth',
+        'Normal subtitle eleventh',
+        'Normal subtitle twelfth',
       ],
     ));
     harness.session.handlePayload(timedTextWithCues(
@@ -337,6 +381,12 @@ describe('Netflix isolated content session', () => {
         'CC subtitle fourth',
         'CC subtitle fifth',
         'CC subtitle sixth',
+        'CC subtitle seventh',
+        'CC subtitle eighth',
+        'CC subtitle ninth',
+        'CC subtitle tenth',
+        'CC subtitle eleventh',
+        'CC subtitle twelfth',
       ],
     ));
     expect(harness.tasks.scheduled).toHaveLength(0);
@@ -384,6 +434,12 @@ describe('Netflix isolated content session', () => {
         'Normal subtitle fourth',
         'Normal subtitle fifth',
         'Normal subtitle sixth',
+        'Normal subtitle seventh',
+        'Normal subtitle eighth',
+        'Normal subtitle ninth',
+        'Normal subtitle tenth',
+        'Normal subtitle eleventh',
+        'Normal subtitle twelfth',
       ],
     ));
     harness.session.handlePayload(timedTextWithCues(
@@ -398,6 +454,12 @@ describe('Netflix isolated content session', () => {
         'CC subtitle fourth',
         'CC subtitle fifth',
         'CC subtitle sixth',
+        'CC subtitle seventh',
+        'CC subtitle eighth',
+        'CC subtitle ninth',
+        'CC subtitle tenth',
+        'CC subtitle eleventh',
+        'CC subtitle twelfth',
       ],
     ));
 

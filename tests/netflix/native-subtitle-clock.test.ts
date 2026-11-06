@@ -6,6 +6,7 @@ import {
   type NativeSubtitleClockScheduler,
   type NativeSubtitleDocument,
   type NativeSubtitleMutationObserver,
+  readNativeSubtitleText,
   type NativeSubtitleNode,
 } from '../../src/netflix/native-subtitle-clock';
 
@@ -72,6 +73,60 @@ function node(
     innerHTML: `<span data-secret="do-not-emit">${text}</span>`,
   };
 }
+
+function element(name: string, children: readonly NativeSubtitleNode[]): NativeSubtitleNode {
+  return {
+    nodeType: 1,
+    nodeName: name,
+    childNodes: children,
+    textContent: children.map(({ textContent }) => textContent ?? '').join(''),
+  };
+}
+
+function text(value: string): NativeSubtitleNode {
+  return { nodeType: 3, nodeName: '#text', textContent: value };
+}
+
+describe('native subtitle text extraction', () => {
+  it('separates <br> lines and text regions that textContent would glue together', () => {
+    const root = element('DIV', [
+      element('DIV', [element('SPAN', [
+        element('SPAN', [text('-[all cheering]')]),
+        element('SPAN', [element('BR', []), text('-Who can stand me?')]),
+      ])]),
+      element('DIV', [element('SPAN', [text('Second region')])]),
+    ]);
+
+    expect(root.textContent).toBe('-[all cheering]-Who can stand me?Second region');
+    expect(readNativeSubtitleText(root).replace(/\s+/gu, ' ').trim())
+      .toBe('-[all cheering] -Who can stand me? Second region');
+  });
+
+  it('emits the separated text through the clock', () => {
+    const document = new FakeDocument();
+    document.container = element('DIV', [element('SPAN', [
+      text('It was an emptier house'), element('BR', []), text('without the boys.'),
+    ])]);
+    const scheduler = new FakeScheduler();
+    const ticks: string[] = [];
+    const clock = createNativeSubtitleClock({
+      document,
+      scheduler,
+      createObserver: (callback) => new FakeObserver(callback),
+      sessionId: 'line-break-session',
+      generation: 1,
+      onTick: (tick) => ticks.push(tick.visibleText),
+    });
+    clock.start();
+    scheduler.flush();
+
+    expect(ticks).toEqual(['It was an emptier house without the boys.']);
+  });
+
+  it('falls back to textContent for nodes without children', () => {
+    expect(readNativeSubtitleText({ textContent: 'Plain line' })).toBe('Plain line');
+  });
+});
 
 function microtaskHarness(isGenerationCurrent?: (generation: number) => boolean) {
   const document = new FakeDocument();

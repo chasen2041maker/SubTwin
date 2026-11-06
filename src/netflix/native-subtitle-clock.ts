@@ -1,13 +1,17 @@
 import { err, ok, type AppError, type Result } from '../shared/result';
 
+// 优先绑定常驻的字幕根节点：它包含所有文本区域，且不会随每句字幕重建。
 const NATIVE_SUBTITLE_SELECTORS = [
-  '.player-timedtext-text-container',
-  '[data-uia="player-subtitle"]',
   '.player-timedtext',
+  '[data-uia="player-subtitle"]',
+  '.player-timedtext-text-container',
 ] as const;
 
 export interface NativeSubtitleNode {
   textContent: string | null;
+  readonly nodeType?: number;
+  readonly nodeName?: string;
+  readonly childNodes?: ArrayLike<NativeSubtitleNode>;
 }
 
 export interface NativeSubtitleDocument {
@@ -163,7 +167,7 @@ export function createNativeSubtitleClock(
         sessionId: options.sessionId,
         generation: options.generation,
         sequence: ++sequence,
-        visibleText: normalizeVisibleText(observedContainer.textContent),
+        visibleText: normalizeVisibleText(readNativeSubtitleText(observedContainer)),
       };
 
       options.onTick(
@@ -258,6 +262,46 @@ function findNativeSubtitleContainer(
   }
 
   return null;
+}
+
+const TEXT_NODE = 3;
+const ELEMENT_NODE = 1;
+const BLOCK_ELEMENTS = new Set(['DIV', 'P', 'LI', 'SECTION']);
+
+/**
+ * Netflix 用 <br> 和多个文本区域分行；textContent 会把相邻两行直接粘连
+ * （"house" + "without" → "housewithout"），导致与字幕文件匹配失败。
+ * 这里按行边界插入换行，原字幕被隐藏时同样可读。
+ */
+export function readNativeSubtitleText(node: NativeSubtitleNode): string {
+  if (node.childNodes === undefined) return node.textContent ?? '';
+  const parts: string[] = [];
+  const visit = (current: NativeSubtitleNode): void => {
+    if (current.nodeType === TEXT_NODE) {
+      parts.push(current.textContent ?? '');
+      return;
+    }
+    const name = (current.nodeName ?? '').toUpperCase();
+    if (name === 'BR') {
+      parts.push('\n');
+      return;
+    }
+    if (current.nodeType !== undefined && current.nodeType !== ELEMENT_NODE) return;
+    const block = BLOCK_ELEMENTS.has(name);
+    if (block) parts.push('\n');
+    const children = current.childNodes;
+    if (children === undefined) {
+      parts.push(current.textContent ?? '');
+    } else {
+      for (let index = 0; index < children.length; index += 1) {
+        const child = children[index];
+        if (child !== undefined) visit(child);
+      }
+    }
+    if (block) parts.push('\n');
+  };
+  visit(node);
+  return parts.join('');
 }
 
 function normalizeVisibleText(value: string | null): string {

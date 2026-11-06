@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { CUE_TRANSLATION_WAIT_MS } from '../../src/app/cue-display-policy';
 import type { LanguageRoute } from '../../src/app/language-router';
 import {
   createSubtitleSessionController,
@@ -10,7 +11,7 @@ import { DEFAULT_SETTINGS } from '../../src/storage/schema';
 import type { SubtitleTrack } from '../../src/subtitles/types';
 import type { ScheduledTranslationTask } from '../../src/translation/scheduler';
 
-const WAIT_MS = 1_500;
+const WAIT_MS = CUE_TRANSLATION_WAIT_MS;
 const ROUTE: LanguageRoute = {
   mode: 'deepseek', provider: 'deepseek', externalCallsAllowed: true,
   schedulingScope: 'urgent-window', sourceMode: 'external-translation',
@@ -90,16 +91,18 @@ describe('bounded atomic bilingual cue display', () => {
     expect(h.clear).not.toHaveBeenCalled();
   });
 
-  it('falls back once at the deadline and keeps late results out of this cue', () => {
+  it('falls back once at the deadline, then upgrades the same cue when its late result lands', () => {
     const h = harness();
     vi.advanceTimersByTime(WAIT_MS);
     expect(h.clear).toHaveBeenCalledOnce();
+    expect(h.render).not.toHaveBeenCalled();
     h.result();
-    expect(h.render).not.toHaveBeenCalled();
-    h.controller.tick({ currentTimeMs: 1_100 });
-    expect(h.render).not.toHaveBeenCalled();
-    h.controller.seek(1_000);
+    expect(h.render).toHaveBeenCalledOnce();
     expect(h.render).toHaveBeenLastCalledWith({ english: 'First line', chinese: '测试译文' }, h.appearance);
+    h.controller.tick({ currentTimeMs: 1_100 });
+    vi.advanceTimersByTime(WAIT_MS);
+    expect(h.render).toHaveBeenCalledOnce();
+    expect(h.clear).toHaveBeenCalledOnce();
   });
 
   it('locks a failed cue to native while allowing a late result to warm replay', () => {
@@ -112,17 +115,17 @@ describe('bounded atomic bilingual cue display', () => {
     expect(h.render).toHaveBeenCalledOnce();
   });
 
-  it('reopens cached bilingual display after a real seek tick within the same cue', () => {
+  it('keeps a late bilingual upgrade through a real seek tick within the same cue', () => {
     const h = harness();
     vi.advanceTimersByTime(WAIT_MS);
     h.result();
-    expect(h.render).not.toHaveBeenCalled();
+    expect(h.render).toHaveBeenLastCalledWith({ english: 'First line', chinese: '测试译文' }, h.appearance);
 
     h.controller.tick({ seeking: true, currentTimeMs: 1_000 });
-    expect(h.render).toHaveBeenLastCalledWith({ english: 'First line', chinese: '测试译文' }, h.appearance);
     const clears = h.clear.mock.calls.length;
     vi.advanceTimersByTime(WAIT_MS);
     expect(h.clear).toHaveBeenCalledTimes(clears);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it.each([
@@ -206,13 +209,13 @@ describe('bounded atomic bilingual cue display', () => {
 
   it('cancels the previous cue deadline before waiting for the next cue', () => {
     const h = harness();
-    vi.advanceTimersByTime(1_000);
+    vi.advanceTimersByTime(WAIT_MS - 100);
     h.controller.tick({ visibleText: 'Second line', currentTimeMs: 5_100 });
     const clears = h.clear.mock.calls.length;
-    vi.advanceTimersByTime(500);
+    vi.advanceTimersByTime(200);
     expect(h.clear).toHaveBeenCalledTimes(clears);
     h.result('second');
-    vi.advanceTimersByTime(1_000);
+    vi.advanceTimersByTime(WAIT_MS);
     expect(h.clear).toHaveBeenCalledTimes(clears);
     expect(h.render).toHaveBeenLastCalledWith({ english: 'Second line', chinese: '测试译文' }, h.appearance);
   });
@@ -230,10 +233,10 @@ describe('bounded atomic bilingual cue display', () => {
     ['dispose', (c: SubtitleSessionController) => c.dispose()],
   ] as const)('revokes the old deadline on %s', (_name, operation) => {
     const h = harness();
-    vi.advanceTimersByTime(1_000);
+    vi.advanceTimersByTime(WAIT_MS - 100);
     operation(h.controller);
     const clears = h.clear.mock.calls.length;
-    vi.advanceTimersByTime(500);
+    vi.advanceTimersByTime(200);
     expect(h.clear).toHaveBeenCalledTimes(clears);
   });
 
