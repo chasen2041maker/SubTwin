@@ -7,6 +7,7 @@ import {
 import { extractNetflixCatalogDownloadResources } from '../../src/netflix/catalog-download';
 
 interface PlayerFixtureOptions {
+  readonly audioTracks?: unknown;
   readonly internalManifest?: unknown;
   readonly manifest?: unknown;
   readonly movieId?: unknown;
@@ -63,6 +64,11 @@ function playerFixture(options: PlayerFixtureOptions = {}) {
   }
   if (options.internalManifest !== undefined) {
     player.getInternalPlayer = getInternalPlayer;
+  }
+  if (options.audioTracks !== undefined) {
+    player.getAudioTrackList = typeof options.audioTracks === 'function'
+      ? options.audioTracks
+      : vi.fn(() => options.audioTracks);
   }
   const getVideoPlayerBySessionId = vi.fn(() => player);
   const getAPI = vi.fn(() => ({
@@ -164,6 +170,34 @@ describe('authoritative Netflix player catalog reader', () => {
     expect(fixture.setTextTrack).not.toHaveBeenCalled();
     expect(fixture.seek).not.toHaveBeenCalled();
     expect(fixture.play).not.toHaveBeenCalled();
+  });
+
+  it('records the Netflix-native audio language so Chinese originals can be left alone', () => {
+    const result = readNetflixPlayerCatalog(playerFixture({
+      audioTracks: [
+        { bcp47: 'en', displayName: 'English', isNative: false },
+        { bcp47: 'zh', displayName: '國語 [原始]', isNative: true },
+      ],
+    }).target);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.originalLanguage).toBe('zh');
+    expect(result.value.tracks).toHaveLength(2);
+  });
+
+  it.each([
+    ['no native audio track', [{ bcp47: 'en', isNative: false }]],
+    ['an unsafe language tag', [{ bcp47: 'zh<script>', isNative: true }]],
+    ['a non-array audio list', { bcp47: 'zh', isNative: true }],
+    ['a throwing audio getter', () => { throw new Error('private API changed'); }],
+  ])('omits the original language for %s without failing the catalog', (_name, audioTracks) => {
+    const result = readNetflixPlayerCatalog(playerFixture({ audioTracks }).target);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value).not.toHaveProperty('originalLanguage');
+    expect(result.value.tracks).toHaveLength(2);
   });
 
   it('optionally exposes raw player track metadata only to a MAIN-world callback', () => {

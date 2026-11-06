@@ -9,6 +9,12 @@ describe('runtime status boundary', () => {
     expect(status && runtimeStatusMessage(status)).toContain('Netflix');
   });
 
+  it('accepts the Chinese-original passthrough mode with its own copy', () => {
+    const status = parseRuntimeStatus({ mode: 'chinese-original' });
+    expect(status).toEqual({ mode: 'chinese-original' });
+    expect(status && runtimeStatusMessage(status)).toContain('保留 Netflix 原字幕');
+  });
+
   it('accepts only allowlisted error codes', () => {
     const status = parseRuntimeStatus({
       mode: 'error',

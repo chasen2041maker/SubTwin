@@ -1,6 +1,7 @@
 export const RUNTIME_STATUS_STORAGE_KEY = 'subtwinRuntimeStatus' as const;
 
 export type RuntimeMode =
+  | 'chinese-original'
   | 'deepseek'
   | 'discovering'
   | 'error'
@@ -38,10 +39,11 @@ const ERROR_MESSAGES: Readonly<Record<RuntimeErrorCode, string>> = {
 };
 
 const MODE_MESSAGES: Readonly<Record<Exclude<RuntimeMode, 'error'>, string>> = {
+  'chinese-original': '保留 Netflix 原字幕，SubTwin 不做任何处理。',
   deepseek: '已选择 DeepSeek 上下文翻译，译文就绪后显示双语字幕。',
   discovering: '正在确认 Netflix 官方字幕轨道；确认前不会调用外部翻译。',
   'google-free': '已选择实验性的 Google 免费翻译，译文就绪后显示双语字幕。',
-  official: '已发现 Netflix 官方英文与简体中文字幕，不会调用外部翻译。',
+  official: '已发现 Netflix 官方英文与中文字幕，不会调用外部翻译。',
   unset: '尚未选择翻译方式，任何字幕都不会发送给外部服务。',
 };
 
@@ -49,6 +51,7 @@ const ERROR_CODES = new Set<RuntimeErrorCode>(
   Object.keys(ERROR_MESSAGES) as RuntimeErrorCode[],
 );
 const NON_ERROR_MODES = new Set<Exclude<RuntimeMode, 'error'>>([
+  'chinese-original',
   'deepseek',
   'discovering',
   'google-free',

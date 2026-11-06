@@ -327,7 +327,44 @@ describe('Netflix catalog download resource extraction', () => {
         trackId: 'z-English',
         language: 'en-GB',
       }),
+      // 没有简体中文时，繁体中文作为官方中文行的后备一并下载。
+      expect.objectContaining({
+        url: ZH_URL,
+        titleId: 'title-2',
+        trackId: 'zh-hant',
+        language: 'zh-Hant',
+      }),
     ]);
+  });
+
+  it('skips Traditional Chinese resources for titles that also offer Simplified Chinese', () => {
+    const result = extractNetflixCatalogDownloadResources({
+      titleId: 'title-3',
+      textTracks: [
+        {
+          trackId: 'en-main',
+          language: 'en',
+          kind: 'SUBTITLE',
+          downloadables: { webvtt: { urls: [EN_URL] } },
+        },
+        {
+          trackId: 'zh-hant',
+          language: 'zh-Hant',
+          kind: 'SUBTITLE',
+          downloadables: { webvtt: { urls: [EN_ALT_URL] } },
+        },
+        {
+          trackId: 'zh-hans',
+          language: 'zh-Hans',
+          kind: 'SUBTITLE',
+          downloadables: { webvtt: { urls: [ZH_URL] } },
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.map(({ trackId }) => trackId)).toEqual(['en-main', 'zh-hans']);
   });
 
   it('bounds retained resources to eight tracks per category independently of profiles', () => {

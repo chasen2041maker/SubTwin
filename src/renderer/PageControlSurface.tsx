@@ -10,6 +10,7 @@ import type {
   TranslationProviderSetting,
 } from '../storage/schema';
 import controlCss from './page-control-surface.css?raw';
+import { SUBTITLE_FONT_OPTIONS } from './subtitle-fonts';
 
 export const PAGE_CONTROL_SURFACE_HOST_ID = 'subtwin-page-controls';
 const POSITION_STORAGE_KEY = 'subtwin.page-controls.position.v1';
@@ -33,6 +34,8 @@ export interface PageCatalogSummary {
   readonly englishTrack: string;
   readonly chineseTrack: string;
   readonly officialChinese: boolean;
+  /** 官方中文的字形；没有简体中文时会用繁体中文作为中文行。 */
+  readonly officialChineseScript?: 'simplified' | 'traditional';
 }
 
 export interface PageControlSurfaceModel {
@@ -296,8 +299,8 @@ export function PageControlSurface(props: PageControlSurfaceProps): ReactNode {
               <Metadata
                 label="官方中文"
                 value={props.model.catalog.officialChinese
-                  ? 'Netflix 官方简体中文'
-                  : '未发现官方简体中文'}
+                  ? `Netflix ${officialChineseLabel(props.model.catalog)}`
+                  : '未发现官方中文'}
               />
               <Metadata label="字幕链路" value={props.model.pipeline} />
             </dl>
@@ -393,7 +396,7 @@ function LanguageControls(props: {
             ...props.appearance,
             fontFamily: event.currentTarget.value as SubtitleFontFamily,
           })}>
-          {FONT_OPTIONS.map(([value, label]) => (
+          {SUBTITLE_FONT_OPTIONS.map(([value, label]) => (
             <option key={value} value={value}>{label}</option>
           ))}
         </select>
@@ -416,14 +419,6 @@ function LanguageControls(props: {
     </section>
   );
 }
-
-const FONT_OPTIONS: readonly (readonly [SubtitleFontFamily, string])[] = [
-  ['sans', '清晰无衬线'],
-  ['rounded', '圆体'],
-  ['system', '系统字体'],
-  ['serif', '衬线体'],
-  ['mono', '等宽体'],
-];
 
 function RangeField(props: {
   readonly label: string;
@@ -455,6 +450,7 @@ function Metadata(props: { readonly label: string; readonly value: string }): Re
 function statusTone(model: PageControlSurfaceModel): string {
   if (!model.settings.enabled || model.paused) return 'idle';
   if (model.status.mode === 'error') return 'error';
+  if (model.status.mode === 'chinese-original') return 'idle';
   if (model.status.mode === 'discovering' || model.status.mode === 'unset') return 'pending';
   return 'active';
 }
@@ -463,18 +459,25 @@ function providerHint(
   model: PageControlSurfaceModel,
 ): { readonly tone: 'info' | 'warn'; readonly text: string } | null {
   if (model.catalog.authority !== 'authoritative') return null;
+  // 华语原声影片不做处理，来源提示没有意义。
+  if (model.status.mode === 'chinese-original') return null;
   const provider = model.settings.provider;
+  const official = officialChineseLabel(model.catalog);
   if (provider === 'unset') {
     return model.catalog.officialChinese
-      ? { tone: 'info', text: '本片有 Netflix 官方简体中文，双语字幕无需调用翻译。' }
-      : { tone: 'warn', text: '本片没有官方简体中文，原生双语只能显示英文；改用 Google 或 DeepSeek 即可显示中英双语。' };
+      ? { tone: 'info', text: `本片有 Netflix ${official}，双语字幕无需调用翻译。` }
+      : { tone: 'warn', text: '本片没有官方中文字幕，原生双语只能显示英文；改用 Google 或 DeepSeek 即可显示中英双语。' };
   }
   if (provider === 'deepseek' && !model.settings.deepseekKeyReady) {
     return { tone: 'warn', text: '还没有配置 DeepSeek API Key，请在扩展设置页填写。' };
   }
   return model.catalog.officialChinese
-    ? { tone: 'info', text: '本片也有官方简体中文，可切换到"原生双语"免去翻译。' }
+    ? { tone: 'info', text: `本片也有${official}，可切换到"原生双语"免去翻译。` }
     : null;
+}
+
+function officialChineseLabel(catalog: PageCatalogSummary): string {
+  return catalog.officialChineseScript === 'traditional' ? '官方繁体中文' : '官方简体中文';
 }
 
 export function clampFloatingPosition(
@@ -738,6 +741,7 @@ function launcherState(model: PageControlSurfaceModel): string {
 function shortStatus(status: RuntimeStatus): string {
   if (status.mode === 'error') return '需要处理';
   if (status.mode === 'official') return '官方双语';
+  if (status.mode === 'chinese-original') return '华语原声';
   if (status.mode === 'discovering') return '正在识别';
   if (status.mode === 'deepseek') return 'DeepSeek 翻译';
   if (status.mode === 'google-free') return 'Google 翻译';

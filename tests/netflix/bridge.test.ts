@@ -193,6 +193,41 @@ describe('Netflix MAIN-world bridge', () => {
     ]);
   });
 
+  it('carries an optional original audio language on catalogs and rejects unsafe values', () => {
+    const catalog = {
+      type: 'catalog',
+      titleId: 'title-1',
+      authority: 'authoritative',
+      tracks: [{ id: 'zh-main', language: 'zh-Hant', kind: 'subtitle' }],
+    } as const;
+    const roundTrip = (payload: unknown) => {
+      const created = createNetflixBridgeEnvelope({
+        nonce: NONCE,
+        generation: 1,
+        payload: payload as NetflixBridgePayload,
+      });
+      if (!created.ok) return created;
+      return parseNetflixBridgeEvent(
+        { origin: 'https://www.netflix.com', source: WINDOW_SOURCE, data: created.value },
+        { nonce: NONCE, generation: 1, source: WINDOW_SOURCE },
+      );
+    };
+
+    const accepted = roundTrip({ ...catalog, originalLanguage: 'zh' });
+    expect(accepted.ok).toBe(true);
+    if (accepted.ok) {
+      expect(accepted.value.payload).toEqual({ ...catalog, originalLanguage: 'zh' });
+    }
+    const withoutLanguage = roundTrip(catalog);
+    expect(withoutLanguage.ok).toBe(true);
+    if (withoutLanguage.ok) {
+      expect(withoutLanguage.value.payload).not.toHaveProperty('originalLanguage');
+    }
+    expect(roundTrip({ ...catalog, originalLanguage: 'https://evil.example' }).ok).toBe(false);
+    expect(roundTrip({ ...catalog, originalLanguage: 42 }).ok).toBe(false);
+    expect(roundTrip({ ...catalog, originalLanguage: 'zh', extra: true }).ok).toBe(false);
+  });
+
   it('never lets diagnostics evict catalog or timed-text payloads from the early queue', () => {
     const queue = createEarlyBridgeQueue({
       nonce: NONCE,

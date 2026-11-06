@@ -196,7 +196,9 @@ export function createSubtitleSessionController(
     }
   };
 
-  const isSessionEnabled = (): boolean => enabled && route.mode !== 'disabled';
+  // 华语原声影片与关闭一样不渲染任何字幕层，Netflix 原字幕保持原样。
+  const isSessionEnabled = (): boolean =>
+    enabled && route.mode !== 'disabled' && route.mode !== 'chinese-original';
 
   const effectiveOfficial = (): boolean =>
     isSessionEnabled() &&
@@ -231,6 +233,10 @@ export function createSubtitleSessionController(
   };
 
   const publishRouteStatus = (): void => {
+    if (enabled && route.mode === 'chinese-original') {
+      publish({ mode: 'chinese-original' });
+      return;
+    }
     if (effectiveOfficial()) {
       publish({ mode: 'official' });
       return;
@@ -939,7 +945,7 @@ function sameRoute(left: LanguageRoute, right: LanguageRoute): boolean {
 function cancellationReasonForRoute(
   route: LanguageRoute,
 ): SessionCancellationReason {
-  if (route.mode === 'disabled') return 'disabled';
+  if (route.mode === 'disabled' || route.mode === 'chinese-original') return 'disabled';
   if (route.mode === 'official' || route.sourceMode === 'official-alignment') {
     return 'official-track';
   }

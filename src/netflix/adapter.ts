@@ -74,7 +74,34 @@ export function normalizeNetflixLanguageTag(raw: unknown): NetflixLanguage | nul
     });
   }
 
+  // 繁体中文只在影片没有简体中文官方字幕时作为中文行的后备来源。
+  if (
+    primary === 'zh' &&
+    (lowerParts.includes('hant') ||
+      lowerParts.includes('tw') ||
+      lowerParts.includes('hk') ||
+      lowerParts.includes('mo'))
+  ) {
+    return Object.freeze({
+      category: 'traditional-chinese',
+      sourceTag,
+      tag: 'zh-Hant',
+    });
+  }
+
   return Object.freeze({ category: 'other', sourceTag, tag: sourceTag });
+}
+
+/**
+ * 影片原声是否为华语（普通话、粤语等）。华语原声影片由 Netflix 原字幕负责，
+ * SubTwin 不切换字幕轨、不渲染、不翻译。读不到原声语言时返回 false。
+ */
+export function isChineseOriginalLanguage(raw: unknown): boolean {
+  if (typeof raw !== 'string') return false;
+  const trimmed = raw.trim();
+  if (!LANGUAGE_TAG.test(trimmed)) return false;
+  const primary = trimmed.replaceAll('_', '-').split('-')[0]?.toLowerCase();
+  return primary === 'zh' || primary === 'yue' || primary === 'cmn';
 }
 
 export function canonicalizeTimedTextResource(

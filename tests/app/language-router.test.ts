@@ -77,6 +77,25 @@ describe('language routing', () => {
       },
       mode: 'missing-key',
     },
+    {
+      name: 'Chinese-original title with a ready DeepSeek key',
+      input: {
+        ...READY_ENGLISH_CATALOG,
+        provider: 'deepseek',
+        deepseekKeyReady: true,
+        chineseOriginal: true,
+      },
+      mode: 'chinese-original',
+    },
+    {
+      name: 'Chinese-original title with official Chinese',
+      input: {
+        ...READY_ENGLISH_CATALOG,
+        simplifiedChineseAvailable: true,
+        chineseOriginal: true,
+      },
+      mode: 'chinese-original',
+    },
   ] satisfies ReadonlyArray<{
     readonly name: string;
     readonly input: LanguageRoutingInput;
@@ -88,6 +107,14 @@ describe('language routing', () => {
       mode,
       sourceMode: sourceMode ?? NATIVE_ONLY_ROUTE.sourceMode,
     });
+  });
+
+  it('still reports disabled before Chinese-original when the extension is off', () => {
+    expect(routeLanguages({
+      ...READY_ENGLISH_CATALOG,
+      enabled: false,
+      chineseOriginal: true,
+    }).mode).toBe('disabled');
   });
 
   it('routes an authoritative English-only catalog to Google Free only', () => {
@@ -199,6 +226,10 @@ describe('language routing', () => {
     {
       name: 'DeepSeek key missing',
       patch: { provider: 'deepseek', deepseekKeyReady: false } as const,
+    },
+    {
+      name: 'Chinese original with Google selected',
+      patch: { provider: 'google-free', chineseOriginal: true } as const,
     },
   ])('keeps the $name branch outside external scheduling', ({ patch }) => {
     const route = routeLanguages({ ...READY_ENGLISH_CATALOG, ...patch });

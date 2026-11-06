@@ -8,6 +8,7 @@ import type {
 } from '../translation/types';
 
 export type LanguageRouteMode =
+  | 'chinese-original'
   | 'deepseek'
   | 'disabled'
   | 'discovering'
@@ -30,6 +31,8 @@ export interface LanguageRoutingInput {
   readonly provider: TranslationProviderSelection;
   readonly deepseekKeyReady: boolean;
   readonly schedulingScope: SubtitleSchedulingScope;
+  /** 权威目录确认影片原声为华语：保留 Netflix 原字幕，SubTwin 完全不处理。 */
+  readonly chineseOriginal?: boolean;
 }
 
 export interface LanguageRoute {
@@ -42,6 +45,7 @@ export interface LanguageRoute {
 
 export function routeLanguages(input: LanguageRoutingInput): LanguageRoute {
   if (!input.enabled) return nativeOnly('disabled');
+  if (input.chineseOriginal === true) return nativeOnly('chinese-original');
   if (input.catalogAuthority !== 'authoritative') {
     return nativeOnly('discovering');
   }

@@ -153,8 +153,56 @@ describe('PageControlSurface', () => {
     );
 
     expect(markup).toMatch(/aria-checked="true" aria-label="Netflix 原生双语"/u);
-    expect(markup).toContain('本片没有官方简体中文');
+    expect(markup).toContain('本片没有官方中文字幕');
     expect(markup).not.toContain('等待 Netflix 影片');
+  });
+
+  it('names official Traditional Chinese when it is the native-mode Chinese line', () => {
+    const markup = renderToStaticMarkup(
+      <PageControlSurface
+        expanded
+        model={{
+          ...model,
+          settings: { ...model.settings, provider: 'unset' },
+          catalog: {
+            ...model.catalog,
+            chineseTrack: 'zh-Hant · subtitle',
+            officialChinese: true,
+            officialChineseScript: 'traditional',
+          },
+        }}
+        position={{ x: 1200, y: 600 }}
+        onAppearanceChange={vi.fn()}
+        onEnabledChange={vi.fn()}
+        onExpandedChange={vi.fn()}
+        onPausedChange={vi.fn()}
+        onPositionChange={vi.fn()}
+        onProviderChange={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain('本片有 Netflix 官方繁体中文');
+    expect(markup).toContain('Netflix 官方繁体中文');
+  });
+
+  it('shows the Chinese-original passthrough state without a source hint', () => {
+    const markup = renderToStaticMarkup(
+      <PageControlSurface
+        expanded
+        model={{ ...model, status: { mode: 'chinese-original' } }}
+        position={{ x: 1200, y: 600 }}
+        onAppearanceChange={vi.fn()}
+        onEnabledChange={vi.fn()}
+        onExpandedChange={vi.fn()}
+        onPausedChange={vi.fn()}
+        onPositionChange={vi.fn()}
+        onProviderChange={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain('华语原声');
+    expect(markup).toContain('SubTwin 不做任何处理');
+    expect(markup).not.toContain('subtwin-controls__hint');
   });
 
   it('does not re-emit the source that is already selected', () => {

@@ -1,6 +1,7 @@
 import {
   applyNetflixAdapterEvent,
   createNetflixAdapterState,
+  isChineseOriginalLanguage,
   normalizeNetflixLanguageTag,
 } from '../netflix/adapter';
 import type {
@@ -40,6 +41,9 @@ const CJK_TEXT = /[぀-ヿ㐀-鿿가-힯]/u;
 const SILENT_NATIVE_SETTLE_MS = 600;
 
 export type NetflixContentRestartReason = 'episode-change' | 'player-remount';
+
+type OfficialChineseCategory = 'simplified-chinese' | 'traditional-chinese';
+type SelectableTrackCategory = 'english' | OfficialChineseCategory;
 
 export interface NetflixContentSessionState {
   readonly sessionId: string;
@@ -176,6 +180,8 @@ export function createNetflixContentSession(
   let controller: SubtitleSessionController | undefined;
   let liveCueSequence = 0;
   let lastLiveCueText: string | null = null;
+  // 只由权威目录确认；之后同一部影片的目录没带原声语言时不推翻（视为未知）。
+  let chineseOriginal = false;
   let disposed = false;
 
   const safeStatus = (status: Parameters<SessionStatusSink['publish']>[0]): void => {
@@ -186,38 +192,8 @@ export function createNetflixContentSession(
     }
   };
 
-  const route = (): LanguageRoute => {
-    const authority = adapter?.catalog.authority ?? 'provisional';
-    const catalogTracks = adapter?.catalog.tracks ?? [];
-    const decision = routeLanguages({
-      enabled: settings.enabled,
-      catalogAuthority: authority,
-      englishAvailable: catalogTracks.some(
-        ({ language }) => language.category === 'english',
-      ),
-      simplifiedChineseAvailable: catalogTracks.some(
-        ({ language }) => language.category === 'simplified-chinese',
-      ),
-      provider: settings.provider,
-      deepseekKeyReady: settings.deepseekKeyReady,
-      schedulingScope: effectiveSchedulingScope(
-        adapter,
-        stronglyConfirmedTrackId,
-      ),
-    });
-    if (decision.externalCallsAllowed && adapter?.externalTranslationAllowed !== true) {
-      return routeLanguages({
-        enabled: settings.enabled,
-        catalogAuthority: 'provisional',
-        englishAvailable: false,
-        simplifiedChineseAvailable: false,
-        provider: settings.provider,
-        deepseekKeyReady: settings.deepseekKeyReady,
-        schedulingScope: 'none',
-      });
-    }
-    return decision;
-  };
+  const route = (): LanguageRoute =>
+    routeFor(settings, adapter, stronglyConfirmedTrackId, chineseOriginal);
 
   const applyEvent = (event: NetflixAdapterEvent): boolean => {
     if (adapter === null) return false;
@@ -233,8 +209,15 @@ export function createNetflixContentSession(
     generation: adapter.session.generation,
   } as const);
 
+  // 官方中文行优先用简体中文；目录里没有简体中文时才用繁体中文。
+  const officialChineseCategory = (): OfficialChineseCategory =>
+    descriptors.some((descriptor) =>
+      normalizeNetflixLanguageTag(descriptor.language)?.category === 'simplified-chinese')
+      ? 'simplified-chinese'
+      : 'traditional-chinese';
+
   const parsedTrackCandidates = (
-    category: 'english' | 'simplified-chinese',
+    category: SelectableTrackCategory,
   ): SubtitleTrack[] => descriptors
     .filter((descriptor) =>
       normalizeNetflixLanguageTag(descriptor.language)?.category === category)
@@ -245,7 +228,7 @@ export function createNetflixContentSession(
     });
 
   const selectParsedTrack = (
-    category: 'english' | 'simplified-chinese',
+    category: SelectableTrackCategory,
   ): SubtitleTrack | null => {
     const candidates = descriptors
       .filter((descriptor) =>
@@ -308,7 +291,7 @@ export function createNetflixContentSession(
   const reconcile = (): void => {
     if (disposed || adapter === null || episodeId === null) return;
     const englishTrack = selectParsedTrack('english');
-    const officialChineseTrack = selectParsedTrack('simplified-chinese');
+    const officialChineseTrack = selectParsedTrack(officialChineseCategory());
     const decision = route();
     const trackHash = currentTrackHash(englishTrack);
     const routeSignature = [
@@ -394,6 +377,7 @@ export function createNetflixContentSession(
     silentNativeCueIds = new Set();
     liveCueSequence = 0;
     lastLiveCueText = null;
+    chineseOriginal = false;
     pendingTimedText = initialPending;
     applyCatalog(catalog);
     drainPendingTimedText();
@@ -422,6 +406,12 @@ export function createNetflixContentSession(
       catalog.authority === 'provisional'
     ) {
       return;
+    }
+    if (
+      catalog.authority === 'authoritative' &&
+      catalog.originalLanguage !== undefined
+    ) {
+      chineseOriginal = isChineseOriginalLanguage(catalog.originalLanguage);
     }
     descriptors = catalog.authority === 'authoritative'
       ? [...catalog.tracks]
@@ -538,7 +528,7 @@ export function createNetflixContentSession(
     if (!parsed.ok) {
       const category = normalizeNetflixLanguageTag(descriptor.language)?.category;
       if (
-        (category === 'english' || category === 'simplified-chinese') &&
+        (category === 'english' || category === officialChineseCategory()) &&
         parsedTrackCandidates(category).length === 0
       ) {
         safeDiagnostic({
@@ -566,7 +556,7 @@ export function createNetflixContentSession(
       code: 'timed_text_accepted',
       detail:
         parsedTrackCandidates('english').length > 0 &&
-          parsedTrackCandidates('simplified-chinese').length > 0
+          parsedTrackCandidates(officialChineseCategory()).length > 0
           ? 'dual'
           : 'partial',
     });
@@ -645,7 +635,7 @@ export function createNetflixContentSession(
   }
 
   function confirmActiveTrack(tick: SubtitleSessionTick): void {
-    if (adapter === null) return;
+    if (adapter === null || chineseOriginal) return;
     const visibleText = normalizeVisibleText(tick.visibleText);
     if (visibleText === null) {
       noteSilentNative(tick);
@@ -709,6 +699,7 @@ export function createNetflixContentSession(
     if (
       controller === undefined ||
       adapter === null ||
+      chineseOriginal ||
       adapter.catalog.authority !== 'authoritative' ||
       (settings.provider !== 'google-free' && settings.provider !== 'deepseek') ||
       parsedTrackCandidates('english').length > 0
@@ -782,6 +773,7 @@ export function createNetflixContentSession(
         // 只是某条辅助字幕（如官方中文）捕获超时；英文轨已经可用时不算故障。
         if (
           payload.code === 'display_unavailable' &&
+          !chineseOriginal &&
           parsedTrackCandidates('english').length === 0
         ) {
           safeStatus({ mode: 'error', code: 'netflix_unavailable' });
@@ -795,7 +787,7 @@ export function createNetflixContentSession(
       const previous = settings;
       settings = nextSettings;
       controller?.updateAppearance(nextSettings.appearance);
-      const before = routeFor(previous, adapter, stronglyConfirmedTrackId);
+      const before = routeFor(previous, adapter, stronglyConfirmedTrackId, chineseOriginal);
       const after = route();
       controller?.updateRoute(after);
       if (
@@ -861,18 +853,23 @@ function routeFor(
   settings: RuntimeSettingsState,
   adapter: NetflixAdapterState | null,
   stronglyConfirmedTrackId: string | null,
+  chineseOriginal: boolean,
 ): LanguageRoute {
   const catalog = adapter?.catalog.tracks ?? [];
   const decision = routeLanguages({
     enabled: settings.enabled,
     catalogAuthority: adapter?.catalog.authority ?? 'provisional',
     englishAvailable: catalog.some(({ language }) => language.category === 'english'),
+    // 繁体中文官方字幕同样可以作为原生双语的中文行（只在没有简体中文时选用）。
     simplifiedChineseAvailable: catalog.some(
-      ({ language }) => language.category === 'simplified-chinese',
+      ({ language }) =>
+        language.category === 'simplified-chinese' ||
+        language.category === 'traditional-chinese',
     ),
     provider: settings.provider,
     deepseekKeyReady: settings.deepseekKeyReady,
     schedulingScope: effectiveSchedulingScope(adapter, stronglyConfirmedTrackId),
+    chineseOriginal,
   });
   return decision.externalCallsAllowed && adapter?.externalTranslationAllowed !== true
     ? routeLanguages({

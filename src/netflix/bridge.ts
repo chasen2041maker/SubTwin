@@ -20,6 +20,8 @@ export interface NetflixCatalogPayload {
   readonly titleId: string;
   readonly authority: 'authoritative' | 'provisional';
   readonly tracks: readonly NetflixCatalogTrackDescriptor[];
+  /** 影片原声音轨的语言（Netflix 标记为 isNative 的音轨），用于识别华语原声影片。 */
+  readonly originalLanguage?: string;
 }
 
 export interface NetflixTimedTextPayload {
@@ -322,7 +324,9 @@ function parsePayload(
 
   if (
     value.type === 'catalog' &&
-    hasExactlyKeys(value, ['authority', 'titleId', 'tracks', 'type']) &&
+    (hasExactlyKeys(value, ['authority', 'titleId', 'tracks', 'type']) ||
+      (hasExactlyKeys(value, ['authority', 'originalLanguage', 'titleId', 'tracks', 'type']) &&
+        isLanguage(value.originalLanguage))) &&
     isOpaqueId(value.titleId) &&
     (value.authority === 'authoritative' || value.authority === 'provisional') &&
     Array.isArray(value.tracks) &&
@@ -336,6 +340,9 @@ function parsePayload(
       tracks: (value.tracks as NetflixCatalogTrackDescriptor[]).map(
         ({ id, language, kind }) => ({ id, language, kind }),
       ),
+      ...(typeof value.originalLanguage === 'string'
+        ? { originalLanguage: value.originalLanguage }
+        : {}),
     });
   }
 

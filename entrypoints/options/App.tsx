@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 
 import {
   createMessage,
@@ -12,8 +12,14 @@ import {
 } from '../../src/storage/action-client';
 import {
   normalizeSettings,
+  type SubtitleFontFamily,
   type SubTwinSettings,
+  type TranslationProviderSetting,
 } from '../../src/storage/schema';
+import {
+  SUBTITLE_FONT_OPTIONS,
+  subtitleFontStack,
+} from '../../src/renderer/subtitle-fonts';
 
 type SaveState = 'error' | 'idle' | 'saved' | 'saving';
 type CacheScope = 'all' | 'episode';
@@ -118,11 +124,10 @@ export default function App() {
 
   if (!settings) {
     return (
-      <main className="options-shell" aria-busy="true">
-        <p className="page-kicker">SUBTITLE WORKROOM</p>
-        <h1>正在准备设置台…</h1>
-        <div className="loading-frame" />
-        {loadError ? <p className="inline-error" role="alert">{loadError}</p> : null}
+      <main className="options" aria-busy="true">
+        <OptionsHeader saveLabel="正在读取设置…" saveState="idle" />
+        <div className="options__loading" />
+        {loadError ? <p className="st-note" data-tone="error" role="alert">{loadError}</p> : null}
       </main>
     );
   }
@@ -197,277 +202,260 @@ export default function App() {
     }
   };
 
+  const setProvider = (provider: TranslationProviderSetting) =>
+    updateSettings('provider', (current) => ({ ...current, provider }));
+
   return (
-    <main className="options-shell">
-      <header className="page-header">
-        <div>
-          <p className="page-kicker">SUBTITLE WORKROOM</p>
-          <h1>把双语字幕调成你的样子</h1>
-          <p className="page-intro">
-            Netflix 官方简体中文字幕始终优先；只有官方缺失且你明确选择服务时，
-            SubTwin 才会发送英文字幕进行翻译。
-          </p>
-        </div>
-        <div className={`save-state save-state--${saveState}`} role="status">
-          {saveState === 'saving' ? '正在保存' : null}
-          {saveState === 'saved' ? '已保存到本机' : null}
-          {saveState === 'error' ? '保存失败，请重试' : null}
-          {saveState === 'idle' ? '设置仅保存在本机' : null}
-        </div>
-      </header>
+    <main className="options">
+      <OptionsHeader saveLabel={saveLabel(saveState)} saveState={saveState} />
 
-      <div className="workspace-grid">
-        <div className="settings-column">
-          <section className="settings-section" aria-labelledby="general-title">
-            <div className="section-heading">
-              <span>01</span>
+      <div className="options__layout">
+        <div className="options__main">
+          <section className="options-panel" aria-labelledby="source-title">
+            <header className="options-panel__header">
               <div>
-                <h2 id="general-title">启用与翻译方式</h2>
-                <p>新安装默认不选择外部服务。</p>
+                <h2 id="source-title">字幕来源</h2>
+                <p>
+                  Netflix 官方中文始终优先（简体优先，没有时用繁体）；只有你明确选择翻译服务时，
+                  SubTwin 才会发送英文字幕。华语原声影片保留 Netflix 原字幕，不做处理。
+                </p>
               </div>
-            </div>
+              <label className="st-switch" title="开启或关闭双语字幕">
+                <input
+                  aria-label="启用 SubTwin 双语字幕"
+                  checked={settings.enabled}
+                  role="switch"
+                  type="checkbox"
+                  onChange={(event) => updateSettings('enabled', (current) => ({
+                    ...current,
+                    enabled: event.currentTarget.checked,
+                  }))}
+                />
+                <span aria-hidden="true" />
+              </label>
+            </header>
 
-            <label className="toggle-row">
-              <span>
-                <strong>启用 SubTwin</strong>
-                <small>关闭后保留 Netflix 原生字幕。</small>
-              </span>
-              <input
-                type="checkbox"
-                checked={settings.enabled}
-                onChange={(event) => updateSettings('enabled', (current) => ({
-                  ...current,
-                  enabled: event.currentTarget.checked,
-                }))}
+            <fieldset className="source-options">
+              <legend className="visually-hidden">选择字幕来源</legend>
+              <SourceOption
+                checked={settings.provider === 'unset'}
+                detail="只使用 Netflix 官方英文与中文字幕，不发送给任何外部服务。"
+                badge="推荐"
+                name="Netflix 原生双语"
+                onSelect={() => setProvider('unset')}
+                value="unset"
               />
-            </label>
-
-            <fieldset className="provider-fieldset">
-              <legend>选择字幕来源</legend>
-              <label className={`provider-card ${settings.provider === 'unset' ? 'is-selected' : ''}`}>
-                <input
-                  type="radio"
-                  name="provider"
-                  value="unset"
-                  checked={settings.provider === 'unset'}
-                  onChange={() => updateSettings('provider', (current) => ({
-                    ...current,
-                    provider: 'unset',
-                  }))}
-                />
-                <span>
-                  <strong>Netflix 原生双语</strong>
-                  <small>只使用 Netflix 官方英文与简体中文字幕，不发送给外部翻译。</small>
-                </span>
-              </label>
-              <label className={`provider-card ${settings.provider === 'google-free' ? 'is-selected' : ''}`}>
-                <input
-                  type="radio"
-                  name="provider"
-                  value="google-free"
-                  checked={settings.provider === 'google-free'}
-                  onChange={() => updateSettings('provider', (current) => ({
-                    ...current,
-                    provider: 'google-free',
-                  }))}
-                />
-                <span>
-                  <strong>Google 翻译 <em>实验性 · 免 Key</em></strong>
-                  <small>逐句响应快，但属于非保证接口，可能随时限流或失效。</small>
-                </span>
-              </label>
-              <div className="privacy-note">
-                Google Free 使用 GET 查询。单句英文字幕会出现在发送给 Google 的 URL 中，
-                也可能出现在网络设备或浏览器诊断记录里。
-              </div>
-              <label className={`provider-card ${settings.provider === 'deepseek' ? 'is-selected' : ''}`}>
-                <input
-                  type="radio"
-                  name="provider"
-                  value="deepseek"
-                  checked={settings.provider === 'deepseek'}
-                  onChange={() => updateSettings('provider', (current) => ({
-                    ...current,
-                    provider: 'deepseek',
-                  }))}
-                />
-                <span>
-                  <strong>DeepSeek <em>上下文感知 · 自备 Key</em></strong>
-                  <small>批量参考前后文，适合对白与专有名词。</small>
-                </span>
-              </label>
+              <SourceOption
+                checked={settings.provider === 'google-free'}
+                detail="逐句翻译、响应快；非官方接口，可能随时限流或失效。"
+                badge="免 Key · 实验性"
+                name="Google 翻译"
+                onSelect={() => setProvider('google-free')}
+                value="google-free"
+              />
+              <SourceOption
+                checked={settings.provider === 'deepseek'}
+                detail="批量参考前后文翻译，对白与专有名词更自然。"
+                badge="自备 Key"
+                name="DeepSeek"
+                onSelect={() => setProvider('deepseek')}
+                value="deepseek"
+              />
             </fieldset>
+            {settings.provider === 'google-free' ? (
+              <p className="st-note" data-tone="warn">
+                Google 翻译使用 GET 查询：单句英文字幕会出现在发送给 Google 的地址里，
+                也可能留在网络设备或浏览器诊断记录中。
+              </p>
+            ) : null}
+          </section>
 
-            <div className="deepseek-panel">
-              <label className="field-label" htmlFor="deepseek-key">DeepSeek API Key</label>
-              <div className="key-field">
-                <input
-                  id="deepseek-key"
-                  type={showKey ? 'text' : 'password'}
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={settings.deepseek.apiKey}
+          <section
+            className="options-panel"
+            aria-labelledby="deepseek-title"
+            data-dimmed={settings.provider !== 'deepseek'}
+          >
+            <header className="options-panel__header">
+              <div>
+                <h2 id="deepseek-title">DeepSeek 连接</h2>
+                <p>
+                  {settings.provider === 'deepseek'
+                    ? '当前正在使用 DeepSeek。Key 只保存在扩展本地存储，不进入页面消息或诊断信息。'
+                    : '可以先填好 Key，之后在字幕来源里切换到 DeepSeek。'}
+                </p>
+              </div>
+            </header>
+            <div className="field-grid">
+              <div className="field field--wide">
+                <label htmlFor="deepseek-key">API Key</label>
+                <div className="key-field">
+                  <input
+                    id="deepseek-key"
+                    autoComplete="off"
+                    placeholder="sk-…"
+                    spellCheck={false}
+                    type={showKey ? 'text' : 'password'}
+                    value={settings.deepseek.apiKey}
+                    onChange={(event) => updateSettings('deepseek', (current) => ({
+                      ...current,
+                      deepseek: {
+                        ...current.deepseek,
+                        apiKey: event.currentTarget.value,
+                      },
+                    }))}
+                  />
+                  <button
+                    aria-label={showKey ? '隐藏 API Key' : '显示 API Key'}
+                    className="st-button"
+                    type="button"
+                    onClick={() => setShowKey((visible) => !visible)}
+                  >
+                    {showKey ? '隐藏' : '显示'}
+                  </button>
+                </div>
+              </div>
+              <label className="field" htmlFor="deepseek-model">
+                <span>模型</span>
+                <select
+                  id="deepseek-model"
+                  value={settings.deepseek.model}
                   onChange={(event) => updateSettings('deepseek', (current) => ({
                     ...current,
                     deepseek: {
                       ...current.deepseek,
-                      apiKey: event.currentTarget.value,
+                      model: event.currentTarget.value as SubTwinSettings['deepseek']['model'],
                     },
                   }))}
-                />
-                <button type="button" onClick={() => setShowKey((visible) => !visible)}>
-                  {showKey ? '隐藏' : '显示'}
+                >
+                  <option value="deepseek-v4-flash">DeepSeek V4 Flash（快）</option>
+                  <option value="deepseek-v4-pro">DeepSeek V4 Pro（更准）</option>
+                </select>
+              </label>
+              <div className="field field--action">
+                <button
+                  className="st-button"
+                  disabled={testState.kind === 'working'}
+                  type="button"
+                  onClick={() => void testDeepSeek()}
+                >
+                  {testState.kind === 'working' ? '正在测试…' : '保存后测试连接'}
                 </button>
               </div>
-              <p className="field-help">Key 只保存在浏览器扩展本地存储，不进入页面消息或诊断信息。</p>
+            </div>
+            {testState.message ? (
+              <p className="st-note" data-tone={noteTone(testState.kind)} role="status">
+                {testState.message}
+              </p>
+            ) : null}
+          </section>
 
-              <label className="field-label" htmlFor="deepseek-model">模型</label>
-              <select
-                id="deepseek-model"
-                value={settings.deepseek.model}
-                onChange={(event) => updateSettings('deepseek', (current) => ({
-                  ...current,
-                  deepseek: {
-                    ...current.deepseek,
-                    model: event.currentTarget.value as SubTwinSettings['deepseek']['model'],
-                  },
-                }))}
-              >
-                <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
-                <option value="deepseek-v4-pro">DeepSeek V4 Pro</option>
-              </select>
-              <button
-                className="secondary-action"
-                type="button"
-                disabled={testState.kind === 'working'}
-                onClick={() => void testDeepSeek()}
-              >
-                保存后测试连接
+          <section className="options-panel" aria-labelledby="appearance-title">
+            <header className="options-panel__header">
+              <div>
+                <h2 id="appearance-title">字幕样式</h2>
+                <p>英文和中文分别设置；修改会自动保存，并在播放页下一句字幕时生效。</p>
+              </div>
+            </header>
+
+            <div className="language-grid">
+              <LanguageControls
+                label="英文"
+                line={settings.appearance.english}
+                onChange={(patch) => updateLine('english', patch)}
+              />
+              <LanguageControls
+                label="中文"
+                line={settings.appearance.chinese}
+                onChange={(patch) => updateLine('chinese', patch)}
+              />
+            </div>
+
+            <div className="layout-grid">
+              <Segmented
+                label="上下顺序"
+                options={[['english-first', '英文在上'], ['chinese-first', '中文在上']]}
+                value={settings.appearance.order}
+                onChange={(order) => updateAppearance('order', order)}
+              />
+              <Segmented
+                label="文字阴影"
+                options={[['none', '无'], ['soft', '柔和'], ['strong', '强']]}
+                value={settings.appearance.shadow}
+                onChange={(shadow) => updateAppearance('shadow', shadow)}
+              />
+              <RangeControl
+                label="垂直位置"
+                max={80}
+                min={0}
+                suffix="%"
+                value={settings.appearance.verticalOffsetPercent}
+                onChange={(value) => updateAppearance('verticalOffsetPercent', value)}
+              />
+              <RangeControl
+                label="两行间距"
+                max={48}
+                min={0}
+                suffix="px"
+                value={settings.appearance.lineSpacingPx}
+                onChange={(value) => updateAppearance('lineSpacingPx', value)}
+              />
+              <RangeControl
+                label="单行长度"
+                max={100}
+                min={50}
+                suffix="%"
+                value={settings.appearance.maxLineWidthPercent}
+                onChange={(value) => updateAppearance('maxLineWidthPercent', value)}
+              />
+              <RangeControl
+                label="背景不透明度"
+                max={100}
+                min={0}
+                step={5}
+                suffix="%"
+                value={Math.round(settings.appearance.backgroundOpacity * 100)}
+                onChange={(value) => updateAppearance('backgroundOpacity', value / 100)}
+              />
+            </div>
+          </section>
+
+          <section className="options-panel" aria-labelledby="cache-title">
+            <header className="options-panel__header">
+              <div>
+                <h2 id="cache-title">翻译缓存</h2>
+                <p>译文按影片、字幕轨、翻译服务与模型分别缓存在本机，重看时不必重新翻译。</p>
+              </div>
+            </header>
+            <div className="button-row">
+              <button className="st-button" type="button" onClick={() => requestClear('episode')}>
+                清理当前剧集
               </button>
-              {testState.message ? (
-                <p className={`action-message action-message--${testState.kind}`} role="status">
-                  {testState.message}
-                </p>
-              ) : null}
-            </div>
-          </section>
-
-          <section className="settings-section" aria-labelledby="appearance-title">
-            <div className="section-heading">
-              <span>02</span>
-              <div>
-                <h2 id="appearance-title">字幕排版</h2>
-                <p>英语和中文可以分别显示和调整。</p>
-              </div>
-            </div>
-
-            <LanguageControls
-              label="English"
-              language="english"
-              line={settings.appearance.english}
-              onChange={(patch) => updateLine('english', patch)}
-            />
-            <LanguageControls
-              label="简体中文"
-              language="chinese"
-              line={settings.appearance.chinese}
-              onChange={(patch) => updateLine('chinese', patch)}
-            />
-
-            <div className="control-grid">
-              <label>
-                <span>上下顺序</span>
-                <select
-                  value={settings.appearance.order}
-                  onChange={(event) => updateAppearance(
-                    'order',
-                    event.currentTarget.value as SubTwinSettings['appearance']['order'],
-                  )}
-                >
-                  <option value="english-first">英语在上</option>
-                  <option value="chinese-first">中文在上</option>
-                </select>
-              </label>
-              <label>
-                <span>文字阴影</span>
-                <select
-                  value={settings.appearance.shadow}
-                  onChange={(event) => updateAppearance(
-                    'shadow',
-                    event.currentTarget.value as SubTwinSettings['appearance']['shadow'],
-                  )}
-                >
-                  <option value="none">关闭</option>
-                  <option value="soft">柔和</option>
-                  <option value="strong">清晰</option>
-                </select>
-              </label>
-            </div>
-
-            <RangeControl
-              label="两行间距"
-              value={settings.appearance.lineSpacingPx}
-              min={0}
-              max={28}
-              suffix="px"
-              onChange={(value) => updateAppearance('lineSpacingPx', value)}
-            />
-            <RangeControl
-              label="单行长度"
-              value={settings.appearance.maxLineWidthPercent}
-              min={50}
-              max={100}
-              suffix="%"
-              onChange={(value) => updateAppearance('maxLineWidthPercent', value)}
-            />
-            <RangeControl
-              label="距画面底部"
-              value={settings.appearance.verticalOffsetPercent}
-              min={0}
-              max={80}
-              suffix="%"
-              onChange={(value) => updateAppearance('verticalOffsetPercent', value)}
-            />
-            <RangeControl
-              label="字幕背景透明度"
-              value={Math.round(settings.appearance.backgroundOpacity * 100)}
-              min={0}
-              max={90}
-              suffix="%"
-              onChange={(value) => updateAppearance('backgroundOpacity', value / 100)}
-            />
-          </section>
-
-          <section className="settings-section" aria-labelledby="cache-title">
-            <div className="section-heading">
-              <span>03</span>
-              <div>
-                <h2 id="cache-title">本地翻译缓存</h2>
-                <p>缓存按影片、字幕轨、翻译服务与模型隔离。</p>
-              </div>
-            </div>
-            <div className="cache-actions">
-              <button type="button" onClick={() => requestClear('episode')}>清理当前剧集</button>
-              <button className="danger-action" type="button" onClick={() => requestClear('all')}>
+              <button
+                className="st-button st-button--danger"
+                type="button"
+                onClick={() => requestClear('all')}
+              >
                 清理全部缓存
               </button>
             </div>
             {cacheState.message ? (
-              <p className={`action-message action-message--${cacheState.kind}`} role="status">
+              <p className="st-note" data-tone={noteTone(cacheState.kind)} role="status">
                 {cacheState.message}
               </p>
             ) : null}
           </section>
         </div>
 
-        <aside className="preview-column" aria-label="实时字幕预览">
-          <div className="preview-sticky">
-            <div className="preview-heading">
-              <p>LIVE TYPE PREVIEW</p>
+        <aside className="options__preview" aria-label="实时字幕预览">
+          <div className="preview-card">
+            <div className="preview-card__heading">
+              <h2>实时预览</h2>
               <span>16:9</span>
             </div>
             <SubtitlePreview settings={settings} />
-            <p className="preview-caption">调整会立即保存，并在 Netflix 字幕层下一次渲染时生效。</p>
+            <p className="preview-card__caption">
+              在 Netflix 播放页点右下角的「双」按钮，也可以边看边调，还能直接拖动字幕位置。
+            </p>
           </div>
         </aside>
       </div>
@@ -479,9 +467,15 @@ export default function App() {
             ? '所有已翻译字幕都会从本机删除，之后观看时需要重新翻译。'
             : '当前正在播放剧集的翻译会从本机删除。'}
         </p>
-        <div className="dialog-actions">
-          <button type="button" onClick={() => clearDialog.current?.close()}>取消</button>
-          <button className="danger-action" type="button" onClick={() => void clearCache()}>
+        <div className="button-row button-row--end">
+          <button className="st-button" type="button" onClick={() => clearDialog.current?.close()}>
+            取消
+          </button>
+          <button
+            className="st-button st-button--danger"
+            type="button"
+            onClick={() => void clearCache()}
+          >
             确认清理
           </button>
         </div>
@@ -490,138 +484,253 @@ export default function App() {
   );
 }
 
+function OptionsHeader(props: {
+  readonly saveLabel: string;
+  readonly saveState: SaveState;
+}) {
+  return (
+    <header className="options__header">
+      <div className="st-brand">
+        <span className="st-mark" aria-hidden="true">双</span>
+        <div>
+          <h1>SubTwin 设置</h1>
+          <p>Netflix 中英双语字幕</p>
+        </div>
+      </div>
+      <p className="save-pill" data-state={props.saveState} role="status">
+        <span aria-hidden="true" />
+        {props.saveLabel}
+      </p>
+    </header>
+  );
+}
+
+function SourceOption(props: {
+  readonly badge: string;
+  readonly checked: boolean;
+  readonly detail: string;
+  readonly name: string;
+  readonly onSelect: () => void;
+  readonly value: TranslationProviderSetting;
+}) {
+  return (
+    <label className="source-option" data-checked={props.checked}>
+      <input
+        checked={props.checked}
+        name="provider"
+        type="radio"
+        value={props.value}
+        onChange={props.onSelect}
+      />
+      <span className="source-option__body">
+        <span className="source-option__title">
+          <strong>{props.name}</strong>
+          <em>{props.badge}</em>
+        </span>
+        <small>{props.detail}</small>
+      </span>
+    </label>
+  );
+}
+
+function Segmented<Value extends string>(props: {
+  readonly label: string;
+  readonly onChange: (value: Value) => void;
+  readonly options: readonly (readonly [Value, string])[];
+  readonly value: Value;
+}) {
+  return (
+    <fieldset className="segmented-field">
+      <legend>{props.label}</legend>
+      <div className="segmented" style={{ '--segments': props.options.length } as CSSProperties}>
+        {props.options.map(([value, text]) => (
+          <label key={value} data-checked={props.value === value}>
+            <input
+              checked={props.value === value}
+              name={props.label}
+              type="radio"
+              value={value}
+              onChange={() => props.onChange(value)}
+            />
+            <span>{text}</span>
+          </label>
+        ))}
+      </div>
+    </fieldset>
+  );
+}
+
 function LanguageControls({
   label,
-  language,
   line,
   onChange,
 }: {
   readonly label: string;
-  readonly language: 'chinese' | 'english';
   readonly line: SubTwinSettings['appearance']['english'];
   readonly onChange: (patch: Partial<SubTwinSettings['appearance']['english']>) => void;
 }) {
   return (
-    <fieldset className="language-controls">
-      <legend>{label}</legend>
-      <label className="compact-toggle">
-        <input
-          type="checkbox"
-          checked={line.visible}
-          onChange={(event) => onChange({ visible: event.currentTarget.checked })}
-        />
-        显示{language === 'english' ? '英语' : '中文'}
-      </label>
-      <label>
-        <span>颜色</span>
-        <input
-          type="color"
-          value={line.color}
-          onChange={(event) => onChange({ color: event.currentTarget.value })}
-        />
-      </label>
-      <label>
-        <span>字号</span>
+    <fieldset className="language-card" data-hidden={!line.visible}>
+      <legend className="visually-hidden">{label}字幕样式</legend>
+      <div className="language-card__header">
+        <h3>{label}</h3>
+        <label className="st-switch" title={`显示${label}字幕`}>
+          <input
+            aria-label={`显示${label}字幕`}
+            checked={line.visible}
+            role="switch"
+            type="checkbox"
+            onChange={(event) => onChange({ visible: event.currentTarget.checked })}
+          />
+          <span aria-hidden="true" />
+        </label>
+      </div>
+      <label className="field">
+        <span>字体</span>
         <select
-          value={line.fontSizePx}
-          onChange={(event) => onChange({ fontSizePx: Number(event.currentTarget.value) })}
+          aria-label={`${label}字体`}
+          value={line.fontFamily}
+          onChange={(event) => onChange({
+            fontFamily: event.currentTarget.value as SubtitleFontFamily,
+          })}
         >
-          {[22, 26, 30, 34, 38, 42, 48, 54, 60].map((size) => (
-            <option key={size} value={size}>{size}px</option>
+          {SUBTITLE_FONT_OPTIONS.map(([value, text]) => (
+            <option key={value} value={value}>{text}</option>
           ))}
         </select>
       </label>
-      <label>
-        <span>字重</span>
-        <select
-          value={line.fontWeight}
-          onChange={(event) => onChange({ fontWeight: Number(event.currentTarget.value) })}
-        >
-          <option value={400}>常规</option>
-          <option value={500}>中等</option>
-          <option value={600}>半粗</option>
-          <option value={700}>粗体</option>
-        </select>
+      <RangeControl
+        ariaLabel={`${label}字号`}
+        label="字号"
+        max={72}
+        min={12}
+        suffix="px"
+        value={line.fontSizePx}
+        onChange={(fontSizePx) => onChange({ fontSizePx })}
+      />
+      <RangeControl
+        ariaLabel={`${label}粗细`}
+        label="粗细"
+        max={900}
+        min={100}
+        step={100}
+        suffix=""
+        value={line.fontWeight}
+        onChange={(fontWeight) => onChange({ fontWeight })}
+      />
+      <label className="color-field">
+        <span>颜色</span>
+        <input
+          aria-label={`${label}颜色`}
+          type="color"
+          value={line.color}
+          onChange={(event) => onChange({ color: event.currentTarget.value.toUpperCase() })}
+        />
+        <code>{line.color.toUpperCase()}</code>
       </label>
     </fieldset>
   );
 }
 
 function RangeControl({
+  ariaLabel,
   label,
   value,
   min,
   max,
+  step = 1,
   suffix,
   onChange,
 }: {
+  readonly ariaLabel?: string;
   readonly label: string;
   readonly value: number;
   readonly min: number;
   readonly max: number;
+  readonly step?: number;
   readonly suffix: string;
   readonly onChange: (value: number) => void;
 }) {
   return (
-    <label className="range-control">
+    <label className="range-field">
       <span>{label}</span>
+      <output>{value}{suffix}</output>
       <input
-        type="range"
-        min={min}
+        aria-label={ariaLabel ?? label}
         max={max}
+        min={min}
+        step={step}
+        type="range"
         value={value}
         onChange={(event) => onChange(Number(event.currentTarget.value))}
       />
-      <output>{value}{suffix}</output>
     </label>
   );
 }
 
 function SubtitlePreview({ settings }: { readonly settings: SubTwinSettings }) {
   const { appearance } = settings;
-  const ordered = appearance.order === 'english-first'
-    ? [
-        { key: 'english', text: 'Some stories deserve a second voice.', line: appearance.english },
-        { key: 'chinese', text: '有些故事，值得拥有第二种声音。', line: appearance.chinese },
-      ]
-    : [
-        { key: 'chinese', text: '有些故事，值得拥有第二种声音。', line: appearance.chinese },
-        { key: 'english', text: 'Some stories deserve a second voice.', line: appearance.english },
-      ];
+  const lines = [
+    { key: 'english', text: 'Some stories deserve a second voice.', line: appearance.english },
+    { key: 'chinese', text: '有些故事，值得拥有第二种声音。', line: appearance.chinese },
+  ] as const;
+  const ordered = appearance.order === 'english-first' ? lines : [lines[1], lines[0]];
   const shadow = appearance.shadow === 'none'
     ? 'none'
     : appearance.shadow === 'strong'
-      ? '0 2px 2px #000, 0 0 4px #000'
-      : '0 1px 3px rgb(0 0 0 / 85%)';
+      ? '0 2px 5px rgb(0 0 0 / 1), 0 0 2px rgb(0 0 0 / 1)'
+      : '0 1px 2px rgb(0 0 0 / 0.9)';
+  const visible = ordered.filter(({ line }) => line.visible);
   return (
     <div className="preview-frame">
-      <div className="preview-film-mark">SUBTWIN · PREVIEW</div>
-      <div
-        className="preview-subtitles"
-        style={{
-          bottom: `${appearance.verticalOffsetPercent}%`,
-          gap: `${appearance.lineSpacingPx}px`,
-          maxWidth: `${appearance.maxLineWidthPercent}%`,
-          background: `rgb(0 0 0 / ${appearance.backgroundOpacity})`,
-          textShadow: shadow,
-        }}
-      >
-        {ordered.map(({ key, text, line }) => line.visible ? (
-          <div
-            key={key}
-            lang={key === 'english' ? 'en' : 'zh-Hans'}
-            style={{
-              color: line.color,
-              fontSize: `${Math.max(14, Math.round(line.fontSizePx * 0.48))}px`,
-              fontWeight: line.fontWeight,
-            }}
-          >
-            {text}
-          </div>
-        ) : null)}
-      </div>
+      <div className="preview-frame__scene" aria-hidden="true" />
+      {visible.length === 0 ? (
+        <p className="preview-frame__empty">英文和中文字幕都已隐藏</p>
+      ) : (
+        <div
+          className="preview-frame__subtitles"
+          style={{
+            bottom: `${appearance.verticalOffsetPercent}%`,
+            gap: `${Math.round(appearance.lineSpacingPx * PREVIEW_SCALE)}px`,
+            maxWidth: `${appearance.maxLineWidthPercent}%`,
+            textShadow: shadow,
+          }}
+        >
+          {visible.map(({ key, text, line }) => (
+            <span
+              key={key}
+              lang={key === 'english' ? 'en' : 'zh-Hans'}
+              style={{
+                background: `rgb(0 0 0 / ${appearance.backgroundOpacity})`,
+                color: line.color,
+                fontFamily: subtitleFontStack(line.fontFamily),
+                fontSize: `${Math.max(10, Math.round(line.fontSizePx * PREVIEW_SCALE))}px`,
+                fontWeight: line.fontWeight,
+              }}
+            >
+              {text}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
+}
+
+/** 预览画面约为 1280px 宽播放器的一半大小，字号与间距按同一比例缩放。 */
+const PREVIEW_SCALE = 0.5;
+
+function saveLabel(state: SaveState): string {
+  if (state === 'saving') return '正在保存…';
+  if (state === 'saved') return '已保存到本机';
+  if (state === 'error') return '保存失败，请重试';
+  return '设置仅保存在本机';
+}
+
+function noteTone(kind: ActionState['kind']): string {
+  if (kind === 'success') return 'success';
+  if (kind === 'error') return 'error';
+  return 'info';
 }
 
 function createDeepSeekTestMessage() {

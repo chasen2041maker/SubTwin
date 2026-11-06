@@ -16,6 +16,7 @@ import type {
   SubtitleLanguageAppearance,
 } from '../storage/schema';
 import overlayCss from './subtitle-overlay.css?raw';
+import { subtitleFontStack } from './subtitle-fonts';
 
 export const SUBTITLE_OVERLAY_HOST_ID = 'subtwin-subtitle-overlay';
 
@@ -98,11 +99,11 @@ export function SubtitleOverlay({
 
   const style: OverlayCssProperties = {
     '--subtwin-en-color': safeColor(appearance.english.color, '#FFFFFF'),
-    '--subtwin-en-font': fontFamilyValue(appearance.english.fontFamily),
+    '--subtwin-en-font': subtitleFontStack(appearance.english.fontFamily),
     '--subtwin-en-size': `${clamp(appearance.english.fontSizePx, 12, 72)}px`,
     '--subtwin-en-weight': clamp(appearance.english.fontWeight, 100, 900),
     '--subtwin-zh-color': safeColor(appearance.chinese.color, '#FFFFFF'),
-    '--subtwin-zh-font': fontFamilyValue(appearance.chinese.fontFamily),
+    '--subtwin-zh-font': subtitleFontStack(appearance.chinese.fontFamily),
     '--subtwin-zh-size': `${clamp(appearance.chinese.fontSizePx, 12, 72)}px`,
     '--subtwin-zh-weight': clamp(appearance.chinese.fontWeight, 100, 900),
     '--subtwin-line-spacing': `${clamp(appearance.lineSpacingPx, 0, 48)}px`,
@@ -624,23 +625,6 @@ function shadowValue(value: SubtitleOverlayAppearance['shadow']): string {
     return '0 2px 5px rgb(0 0 0 / 1), 0 0 2px rgb(0 0 0 / 1)';
   }
   return '0 1px 2px rgb(0 0 0 / 0.9)';
-}
-
-function fontFamilyValue(
-  value: SubtitleLanguageAppearance['fontFamily'],
-): string {
-  switch (value) {
-    case 'mono':
-      return 'ui-monospace, "Cascadia Mono", monospace';
-    case 'rounded':
-      return 'ui-rounded, "Arial Rounded MT Bold", "Microsoft YaHei", sans-serif';
-    case 'serif':
-      return 'Georgia, "Noto Serif CJK SC", "Songti SC", serif';
-    case 'system':
-      return 'system-ui, -apple-system, "Segoe UI", sans-serif';
-    case 'sans':
-      return '"Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif';
-  }
 }
 
 function resolveDocument(

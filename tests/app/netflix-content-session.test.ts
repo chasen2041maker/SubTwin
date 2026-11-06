@@ -416,6 +416,120 @@ describe('Netflix isolated content session', () => {
     });
   });
 
+  it('uses official Traditional Chinese as the native-mode Chinese line when Simplified is absent', () => {
+    const harness = createHarness(settings('unset', false));
+    harness.session.handlePayload(catalog('hant-only', 'authoritative', [
+      descriptor('en-main', 'en'),
+      descriptor('zh-hant', 'zh-Hant'),
+    ]));
+    harness.session.handlePayload(timedText('hant-only', 'tt_1111111111111111', 'en-main', 'en', 'Welcome to the island'));
+    harness.session.handlePayload(timedText('hant-only', 'tt_2222222222222222', 'zh-hant', 'zh-Hant', '歡迎來到島上'));
+
+    harness.ticks.emit({ visibleText: 'Welcome to the island', currentTimeMs: 500 });
+
+    expect(harness.tasks.scheduled).toHaveLength(0);
+    expect(harness.overlay.last()).toEqual({ english: 'Welcome to the island', chinese: '歡迎來到島上' });
+    expect(harness.status.values.at(-1)).toEqual({ mode: 'official' });
+  });
+
+  it('prefers official Simplified Chinese even when a Traditional body was also observed', () => {
+    const harness = createHarness(settings('unset', false));
+    harness.session.handlePayload(catalog('both-scripts', 'authoritative', [
+      descriptor('en-main', 'en'),
+      descriptor('zh-hans', 'zh-Hans'),
+      descriptor('zh-hant', 'zh-Hant'),
+    ]));
+    harness.session.handlePayload(timedText('both-scripts', 'tt_3333333333333333', 'en-main', 'en', 'Hello'));
+    harness.session.handlePayload(timedText('both-scripts', 'tt_4444444444444444', 'zh-hant', 'zh-Hant', '哈囉'));
+    harness.ticks.emit({ visibleText: 'Hello', currentTimeMs: 500 });
+    expect(harness.overlay.states).not.toContainEqual({ english: 'Hello', chinese: '哈囉' });
+
+    harness.session.handlePayload(timedText('both-scripts', 'tt_5555555555555555', 'zh-hans', 'zh-Hans', '你好'));
+    harness.ticks.emit({ visibleText: 'Hello', currentTimeMs: 600 });
+
+    expect(harness.overlay.last()).toEqual({ english: 'Hello', chinese: '你好' });
+  });
+
+  it('leaves a Chinese-original title entirely to Netflix: no tasks, no overlay, passthrough status', () => {
+    const harness = createHarness(settings('deepseek', true));
+    harness.session.handlePayload({
+      ...catalog('chinese-original', 'authoritative', [
+        descriptor('en-main', 'en'),
+        descriptor('zh-hans', 'zh-Hans'),
+        descriptor('zh-hant', 'zh-Hant'),
+      ]),
+      originalLanguage: 'zh',
+    });
+    harness.session.handlePayload(timedTextWithCues(
+      'chinese-original', 'tt_bbbbbbbbbbbbbbbb', 'en-main', 'en', ['Line 0', 'Line 1', 'Line 2', 'Line 3'],
+    ));
+    harness.session.handlePayload(timedTextWithCues(
+      'chinese-original', 'tt_cccccccccccccccc', 'zh-hans', 'zh-Hans', ['第零句', '第一句', '第二句', '第三句'],
+    ));
+
+    harness.ticks.emit({ visibleText: '魏婴，你回来了', currentTimeMs: 500 });
+    harness.ticks.emit({ visibleText: '', currentTimeMs: 1_700 });
+    harness.ticks.emit({ visibleText: 'Line 2', currentTimeMs: 2_500 });
+    harness.session.handlePayload({ type: 'diagnostic', code: 'display_unavailable' });
+
+    expect(harness.tasks.scheduled).toHaveLength(0);
+    expect(harness.overlay.states).toHaveLength(0);
+    expect(harness.status.values.at(-1)).toEqual({ mode: 'chinese-original' });
+    expect(harness.status.values).not.toContainEqual({ mode: 'error', code: 'netflix_unavailable' });
+  });
+
+  it('stops rendering once a later authoritative catalog reveals a Chinese original', () => {
+    const harness = createHarness(settings('unset', false));
+    harness.session.handlePayload(catalog('late-original', 'authoritative', [
+      descriptor('en-main', 'en'),
+      descriptor('zh-main', 'zh-CN'),
+    ]));
+    harness.session.handlePayload(timedText('late-original', 'tt_dddddddddddddddd', 'en-main', 'en', 'Hello'));
+    harness.session.handlePayload(timedText('late-original', 'tt_eeeeeeeeeeeeeeee', 'zh-main', 'zh-CN', '你好'));
+    harness.ticks.emit({ visibleText: 'Hello', currentTimeMs: 500 });
+    expect(harness.overlay.last()).toEqual({ english: 'Hello', chinese: '你好' });
+    const rendered = harness.overlay.states.length;
+    const cleared = harness.overlay.clearCount;
+
+    harness.session.handlePayload({
+      ...catalog('late-original', 'authoritative', [
+        descriptor('en-main', 'en'),
+        descriptor('zh-main', 'zh-CN'),
+      ]),
+      originalLanguage: 'cmn-Hans',
+    });
+    harness.ticks.emit({ visibleText: 'Hello', currentTimeMs: 600 });
+
+    expect(harness.overlay.clearCount).toBeGreaterThan(cleared);
+    expect(harness.overlay.states).toHaveLength(rendered);
+    expect(harness.status.values.at(-1)).toEqual({ mode: 'chinese-original' });
+  });
+
+  it('trusts only authoritative catalogs and resets the Chinese-original flag on the next title', () => {
+    const harness = createHarness(settings('google-free', false));
+    harness.session.handlePayload({
+      ...catalog('provisional-zh', 'provisional', [descriptor('en-main', 'en')]),
+      originalLanguage: 'zh',
+    });
+    expect(harness.status.values).not.toContainEqual({ mode: 'chinese-original' });
+
+    harness.session.handlePayload({
+      ...catalog('provisional-zh', 'authoritative', [descriptor('en-main', 'en')]),
+      originalLanguage: 'zh',
+    });
+    expect(harness.status.values.at(-1)).toEqual({ mode: 'chinese-original' });
+
+    harness.session.handlePayload({
+      ...catalog('english-next', 'authoritative', [descriptor('en-next', 'en')]),
+      originalLanguage: 'en',
+    });
+    harness.ticks.emit({ visibleText: 'An English line to translate', currentTimeMs: 2_000 });
+
+    expect(harness.status.values.at(-1)).toEqual({ mode: 'google-free' });
+    expect(harness.tasks.scheduled.some(({ task }) =>
+      task.cues.some(({ text }) => text === 'An English line to translate'))).toBe(true);
+  });
+
   it('accepts an English body even when a longer Chinese body arrived under the same resource ID', () => {
     const harness = createHarness(settings('google-free', false));
     harness.session.handlePayload(catalog('shared-resource', 'authoritative', [

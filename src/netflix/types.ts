@@ -11,7 +11,8 @@ export type NetflixAdapterVersion = typeof NETFLIX_ADAPTER_VERSION;
 export type NetflixLanguageCategory =
   | 'english'
   | 'other'
-  | 'simplified-chinese';
+  | 'simplified-chinese'
+  | 'traditional-chinese';
 
 export interface NetflixLanguage {
   readonly tag: string;

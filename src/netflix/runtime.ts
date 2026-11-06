@@ -1,5 +1,5 @@
 import { err, ok, type AppError, type Result } from '../shared/result';
-import { normalizeNetflixLanguageTag } from './adapter';
+import { isChineseOriginalLanguage, normalizeNetflixLanguageTag } from './adapter';
 import { createNetflixTimedTextRequestBindings } from './observed-timed-text';
 import {
   NETFLIX_BRIDGE_PROTOCOL,
@@ -641,6 +641,12 @@ export function installMainWorldNetflixRuntime(options: {
       }
     };
     const maybeStartTrackCapture = (): void => {
+      // 华语原声影片保留 Netflix 原字幕：不为抓取正文去切换用户的字幕轨；
+      // 若之前读到的目录还没有原声信息、已经开始切换，立即恢复原来的字幕轨。
+      if (isChineseOriginalLanguage(currentAuthoritativeCatalog?.originalLanguage)) {
+        if (trackCapture !== undefined) stopTrackCapture();
+        return;
+      }
       if (
         disposed ||
         trackCapture !== undefined ||
@@ -653,14 +659,17 @@ export function installMainWorldNetflixRuntime(options: {
         const language = normalizeNetflixLanguageTag(track.language);
         if (
           language === null ||
-          (language.category !== 'english' &&
-            language.category !== 'simplified-chinese') ||
+          language.category === 'other' ||
           selected.has(language.category)
         ) continue;
         selected.set(language.category, track);
       }
-      if (!selected.has('english') || !selected.has('simplified-chinese')) return;
-      const missing = [...selected.values()].filter((track) =>
+      // 没有简体中文官方字幕时，用繁体中文官方字幕作为中文行。
+      const english = selected.get('english');
+      const chinese = selected.get('simplified-chinese') ??
+        selected.get('traditional-chinese');
+      if (english === undefined || chinese === undefined) return;
+      const missing = [english, chinese].filter((track) =>
         (attemptedCaptureTrackIds.get(track.id) ?? 0) < MAX_TRACK_CAPTURE_ATTEMPTS &&
         !observedBodyTrackIds.has(track.id) &&
         ![...approvedObservedResources.values()].some(
@@ -1293,9 +1302,13 @@ function hasExhaustedRequiredTrack(
   failed: ReadonlyMap<string, NetflixCatalogDownloadResource>,
 ): boolean {
   if (catalog === undefined) return false;
+  const chineseCategory = catalog.tracks.some((track) =>
+    normalizeNetflixLanguageTag(track.language)?.category === 'simplified-chinese')
+    ? 'simplified-chinese'
+    : 'traditional-chinese';
   for (const track of catalog.tracks) {
     const category = normalizeNetflixLanguageTag(track.language)?.category;
-    if (category !== 'english' && category !== 'simplified-chinese') continue;
+    if (category !== 'english' && category !== chineseCategory) continue;
     const candidates = [...approved.values()].filter((resource) =>
       resource.titleId === catalog.titleId && resource.trackId === track.id);
     if (candidates.length === 0) return false;
@@ -1319,17 +1332,13 @@ function createRouteMatchedDualCatalog(
   if (routeTitleId === null) return null;
   const matching = resources.filter(({ titleId }) => titleId === routeTitleId);
   let hasEnglish = false;
-  let hasSimplifiedChinese = false;
+  let hasOfficialChinese = false;
   const tracks = new Map<string, NetflixCatalogTrackDescriptor>();
   for (const resource of matching) {
     const language = normalizeNetflixLanguageTag(resource.language);
-    if (language === null) continue;
+    if (language === null || language.category === 'other') continue;
     if (language.category === 'english') hasEnglish = true;
-    if (language.category === 'simplified-chinese') hasSimplifiedChinese = true;
-    if (
-      language.category !== 'english' &&
-      language.category !== 'simplified-chinese'
-    ) continue;
+    else hasOfficialChinese = true;
     const previous = tracks.get(resource.trackId);
     if (
       previous !== undefined &&
@@ -1341,7 +1350,7 @@ function createRouteMatchedDualCatalog(
       kind: resource.kind,
     });
   }
-  if (!hasEnglish || !hasSimplifiedChinese) return null;
+  if (!hasEnglish || !hasOfficialChinese) return null;
   return {
     type: 'catalog',
     titleId: routeTitleId,

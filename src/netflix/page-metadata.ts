@@ -62,19 +62,28 @@ export function summarizeNetflixCatalog(
   const english = summary.tracks.find(
     ({ language }) => normalizeNetflixLanguageTag(language)?.category === 'english',
   );
-  const chinese = summary.tracks.find(
+  const simplified = summary.tracks.find(
     ({ language }) =>
       normalizeNetflixLanguageTag(language)?.category === 'simplified-chinese',
   );
+  // 没有简体中文时，繁体中文官方字幕作为原生双语的中文行。
+  const chinese = simplified ?? summary.tracks.find(
+    ({ language }) =>
+      normalizeNetflixLanguageTag(language)?.category === 'traditional-chinese',
+  );
+  const officialChinese = summary.authority === 'authoritative' && chinese !== undefined;
   return {
     authority: summary.authority,
     englishTrack: english === undefined
       ? '未发现英文字幕'
       : `${english.language} · ${english.kind}`,
     chineseTrack: chinese === undefined
-      ? '未发现简体中文字幕'
+      ? '未发现中文字幕'
       : `${chinese.language} · ${chinese.kind}`,
-    officialChinese: summary.authority === 'authoritative' && chinese !== undefined,
+    officialChinese,
+    ...(officialChinese
+      ? { officialChineseScript: simplified === undefined ? 'traditional' : 'simplified' }
+      : {}),
   };
 }
 

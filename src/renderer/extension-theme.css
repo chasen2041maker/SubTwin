@@ -1,0 +1,159 @@
+/*
+ * 弹窗与设置页共用的视觉语言，与 Netflix 播放页控制台（page-control-surface.css）保持一致：
+ * 深色半透明表面、Netflix 红强调色、绿/黄/红三种状态色。
+ */
+:root {
+  --st-bg: #0e0e11;
+  --st-raised: #16161a;
+  --st-surface: rgb(255 255 255 / 0.04);
+  --st-surface-strong: rgb(255 255 255 / 0.08);
+  --st-border: rgb(255 255 255 / 0.09);
+  --st-border-strong: rgb(255 255 255 / 0.16);
+  --st-text: #f5f5f7;
+  --st-soft: #d4d4d8;
+  --st-muted: #a1a1aa;
+  --st-faint: #71717a;
+  --st-accent: #e50914;
+  --st-accent-strong: #f0141e;
+  --st-accent-soft: rgb(229 9 20 / 0.16);
+  --st-good: #34d399;
+  --st-warn: #fbbf24;
+  --st-bad: #f87171;
+  --st-radius-lg: 16px;
+  --st-radius-md: 12px;
+  --st-radius-sm: 9px;
+  color-scheme: dark;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  color: var(--st-text);
+  background: var(--st-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body { margin: 0; background: var(--st-bg); }
+
+button, input, select { font: inherit; color: inherit; }
+
+h1, h2, h3, h4 { margin: 0; text-wrap: balance; }
+p { margin: 0; text-wrap: pretty; }
+
+:where(button, input, select, summary, a):focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+/* 品牌 */
+.st-brand { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.st-mark {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 11px;
+  background: linear-gradient(145deg, var(--st-accent-strong), #b20710);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.25), 0 6px 18px rgb(229 9 20 / 0.25);
+  color: #fff;
+  font: 800 17px/1 "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+.st-brand h1 { font-size: 17px; font-weight: 700; letter-spacing: 0.01em; }
+.st-brand p { margin-top: 2px; color: var(--st-muted); font-size: 12px; }
+
+/* 开关 */
+.st-switch { position: relative; display: inline-flex; flex: none; cursor: pointer; }
+.st-switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.st-switch input:disabled { cursor: progress; }
+.st-switch span {
+  position: relative;
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: #3f3f46;
+  transition: background 140ms ease;
+}
+.st-switch span::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.4);
+  content: "";
+  transition: transform 140ms ease;
+}
+.st-switch input:checked + span { background: var(--st-accent); }
+.st-switch input:checked + span::after { transform: translateX(18px); }
+.st-switch input:focus-visible + span { outline: 2px solid #fff; outline-offset: 2px; }
+
+/* 状态 */
+.st-status {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 11px;
+  padding: 13px 14px;
+  border: 1px solid var(--st-border);
+  border-radius: var(--st-radius-md);
+  background: var(--st-surface);
+}
+.st-status strong { font-size: 14px; }
+.st-status p { margin-top: 4px; color: var(--st-muted); font-size: 12px; line-height: 1.55; }
+.st-status__dot {
+  width: 9px;
+  height: 9px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--st-good);
+  box-shadow: 0 0 0 3px rgb(52 211 153 / 0.18);
+}
+.st-status[data-tone="pending"] .st-status__dot { background: var(--st-warn); box-shadow: 0 0 0 3px rgb(251 191 36 / 0.18); }
+.st-status[data-tone="idle"] .st-status__dot { background: var(--st-faint); box-shadow: none; }
+.st-status[data-tone="error"] { border-color: rgb(248 113 113 / 0.35); background: rgb(248 113 113 / 0.08); }
+.st-status[data-tone="error"] .st-status__dot { background: var(--st-bad); box-shadow: 0 0 0 3px rgb(248 113 113 / 0.2); }
+
+/* 按钮 */
+.st-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--st-border-strong);
+  border-radius: var(--st-radius-sm);
+  background: var(--st-surface-strong);
+  color: var(--st-text);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.st-button:hover:not(:disabled) { background: rgb(255 255 255 / 0.13); }
+.st-button:disabled { cursor: not-allowed; opacity: 0.5; }
+.st-button--primary {
+  border-color: transparent;
+  background: var(--st-accent);
+  color: #fff;
+}
+.st-button--primary:hover:not(:disabled) { background: var(--st-accent-strong); }
+.st-button--danger { border-color: rgb(248 113 113 / 0.45); color: #fecaca; }
+.st-button--danger:hover:not(:disabled) { background: rgb(248 113 113 / 0.14); }
+
+/* 提示条 */
+.st-note {
+  padding: 9px 11px;
+  border-radius: var(--st-radius-sm);
+  background: var(--st-surface);
+  color: var(--st-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.st-note[data-tone="warn"] { background: rgb(251 191 36 / 0.1); color: #fcd34d; }
+.st-note[data-tone="success"] { background: rgb(52 211 153 / 0.1); color: #a7f3d0; }
+.st-note[data-tone="error"] { background: rgb(248 113 113 / 0.1); color: #fecaca; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}

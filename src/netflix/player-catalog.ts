@@ -329,6 +329,7 @@ export function readNetflixPlayerCatalog(
     titleId,
     authority: 'authoritative',
     tracks: [...tracks.values()],
+    ...readOriginalAudioLanguage(player),
   };
   try {
     if (onMetadata !== undefined) {
@@ -338,6 +339,28 @@ export function readNetflixPlayerCatalog(
     // MAIN-world metadata observation is advisory and must not affect catalog use.
   }
   return ok(catalog);
+}
+
+/** 读取 Netflix 标记为原声（isNative）的音轨语言；读不到时不附带该字段。 */
+function readOriginalAudioLanguage(
+  player: Readonly<Record<string, unknown>>,
+): { readonly originalLanguage?: string } {
+  try {
+    if (typeof player.getAudioTrackList !== 'function') return {};
+    const rawTracks = Reflect.apply(player.getAudioTrackList, player, []) as unknown;
+    if (!Array.isArray(rawTracks) || rawTracks.length > MAX_NETFLIX_PLAYER_TRACKS) return {};
+    const original = rawTracks.find(
+      (track: unknown) => isRecord(track) && track.isNative === true,
+    ) as Readonly<Record<string, unknown>> | undefined;
+    const language = original?.bcp47;
+    return typeof language === 'string' &&
+      language.length <= 35 &&
+      /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(language)
+      ? { originalLanguage: language }
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 function readPlayerMetadata(

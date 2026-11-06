@@ -142,7 +142,7 @@ export interface NetflixTimedTextDownloadOptions {
   readonly signal?: AbortSignal;
 }
 
-type ResourceCategory = 'english' | 'simplified-chinese';
+type ResourceCategory = 'english' | 'simplified-chinese' | 'traditional-chinese';
 
 interface ResourceCandidate extends NetflixCatalogDownloadResource {
   readonly category: ResourceCategory;
@@ -174,7 +174,8 @@ interface TrackArrayContext {
 
 /**
  * Conservatively discovers downloadable English and Simplified Chinese text
- * tracks in Netflix metadata. It never upgrades catalog authority.
+ * tracks in Netflix metadata (Traditional Chinese only for titles without
+ * Simplified Chinese). It never upgrades catalog authority.
  */
 export function extractNetflixCatalogDownloadResources(
   metadata: unknown,
@@ -200,12 +201,20 @@ export function extractNetflixCatalogDownloadResources(
     return catalogDownloadError('netflix_catalog_metadata_failed');
   }
 
-  candidates.sort(compareResourceCandidates);
+  // 繁体中文只是没有简体中文时的后备，有简体中文的影片不必多下载一份。
+  const titlesWithSimplifiedChinese = new Set(
+    candidates
+      .filter(({ category }) => category === 'simplified-chinese')
+      .map(({ titleId }) => titleId),
+  );
+  const eligible = candidates.filter(({ category, titleId }) =>
+    category !== 'traditional-chinese' || !titlesWithSimplifiedChinese.has(titleId));
+  eligible.sort(compareResourceCandidates);
   const selected = new Map<string, NetflixCatalogDownloadResource>();
   const selectedTrackKeys = new Set<string>();
   const selectedCategoryTrackCounts = new Map<string, number>();
   const selectedResourceCounts = new Map<string, number>();
-  for (const candidate of candidates) {
+  for (const candidate of eligible) {
     // Track cardinality remains bounded independently of the bounded profile
     // alternatives retained for a selected track.
     const trackKey = `${candidate.titleId}\u001f${candidate.category}\u001f${candidate.trackId}`;
@@ -496,10 +505,7 @@ function readTargetLanguage(
   ) {
     return { kind: 'invalid' };
   }
-  if (
-    first.category !== 'english' &&
-    first.category !== 'simplified-chinese'
-  ) {
+  if (first.category === 'other') {
     return { kind: 'ignored' };
   }
   return {
@@ -906,8 +912,7 @@ function isValidDownloadResource(resource: NetflixCatalogDownloadResource): bool
   if (
     language === null ||
     language.sourceTag !== resource.language ||
-    (language.category !== 'english' &&
-      language.category !== 'simplified-chinese')
+    language.category === 'other'
   ) return false;
   if (!/^tt_[a-f0-9]{16}$/u.test(resource.resourceId)) return false;
   const identity = canonicalizeNetflixCatalogTimedTextResource(resource.url, {
@@ -983,7 +988,8 @@ function sanitizeMetadataTitleId(value: unknown): string | null {
 }
 
 function categoryOrder(category: ResourceCategory): number {
-  return category === 'english' ? 0 : 1;
+  if (category === 'english') return 0;
+  return category === 'simplified-chinese' ? 1 : 2;
 }
 
 function ownStrings(

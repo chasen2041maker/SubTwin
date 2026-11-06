@@ -4,6 +4,7 @@ import {
   applyNetflixAdapterEvent,
   canonicalizeTimedTextResource,
   createNetflixAdapterState,
+  isChineseOriginalLanguage,
   normalizeNetflixLanguageTag,
 } from '../../src/netflix/adapter';
 import {
@@ -41,7 +42,7 @@ function apply(
 }
 
 describe('Netflix language normalization', () => {
-  it('recognizes English and only explicit Simplified Chinese tags', () => {
+  it('recognizes English plus explicit Simplified and Traditional Chinese tags', () => {
     expect(normalizeNetflixLanguageTag('EN_us')).toEqual({
       category: 'english',
       sourceTag: 'en-US',
@@ -58,8 +59,15 @@ describe('Netflix language normalization', () => {
       tag: 'zh-Hans',
     });
     expect(normalizeNetflixLanguageTag('zh')).toMatchObject({ category: 'other' });
-    expect(normalizeNetflixLanguageTag('zh-Hant')).toMatchObject({ category: 'other' });
-    expect(normalizeNetflixLanguageTag('zh-TW')).toMatchObject({ category: 'other' });
+    expect(normalizeNetflixLanguageTag('zh-Hant')).toEqual({
+      category: 'traditional-chinese',
+      sourceTag: 'zh-Hant',
+      tag: 'zh-Hant',
+    });
+    expect(normalizeNetflixLanguageTag('zh-TW')).toMatchObject({ category: 'traditional-chinese' });
+    expect(normalizeNetflixLanguageTag('zh_HK')).toMatchObject({ category: 'traditional-chinese' });
+    expect(normalizeNetflixLanguageTag('zh-Hans-HK')).toMatchObject({ category: 'simplified-chinese' });
+    expect(normalizeNetflixLanguageTag('yue')).toMatchObject({ category: 'other' });
     expect(normalizeNetflixLanguageTag('Chinese (Simplified)')).toBeNull();
   });
 });
@@ -456,5 +464,15 @@ describe('timed-text resource canonicalization', () => {
     });
     expect(JSON.stringify(result)).not.toContain('secret-');
     expect(JSON.stringify(result)).not.toContain(raw);
+  });
+});
+
+describe('Chinese-original audio detection', () => {
+  it.each(['zh', 'zh-Hant', 'zh_TW', 'cmn-Hans', 'yue', 'YUE-HK'])('treats %s as a Chinese original', (tag) => {
+    expect(isChineseOriginalLanguage(tag)).toBe(true);
+  });
+
+  it.each(['en', 'ja', 'ko', 'zha', '', 'zh<script>', undefined, 42])('does not treat %s as a Chinese original', (tag) => {
+    expect(isChineseOriginalLanguage(tag)).toBe(false);
   });
 });

@@ -943,6 +943,145 @@ describe('isolated and MAIN-world Netflix runtimes', () => {
     runtime.dispose();
   });
 
+  it('captures official Traditional Chinese when the catalog has no Simplified Chinese', () => {
+    const window = new FakeWindow();
+    const switchTo = vi.fn(() => true);
+    const runtime = installMainWorldNetflixRuntime({
+      window,
+      readPlayerCatalog: () => ok({
+        type: 'catalog',
+        titleId: 'title-1',
+        authority: 'authoritative',
+        originalLanguage: 'en',
+        tracks: [
+          { id: 'en-main', language: 'en', kind: 'subtitle' },
+          { id: 'zh-hant', language: 'zh-Hant', kind: 'subtitle' },
+          { id: 'ja-main', language: 'ja', kind: 'subtitle' },
+        ],
+      }),
+      preparePlayerTrackCapture: () => ok({
+        titleId: 'title-1',
+        originalTrackId: 'en-main',
+        switchTo,
+        restore: vi.fn(),
+      }),
+      scheduleCatalogPoll: () => () => undefined,
+      scheduleTrackCaptureTimeout: () => () => undefined,
+      installFetch: () => ({ dispose: vi.fn() }),
+      installXhr: () => ({ dispose: vi.fn() }),
+      extractCatalogResources: () => ok([]),
+    });
+    window.emit({
+      protocol: 'subtwin.netflix.bridge',
+      version: 1,
+      source: NETFLIX_CONTROL_SOURCE,
+      type: 'connect',
+      nonce: NONCE,
+      generation: 1,
+    });
+
+    expect(switchTo).toHaveBeenNthCalledWith(1, 'zh-hant');
+    expect(switchTo).not.toHaveBeenCalledWith('ja-main');
+    runtime.dispose();
+  });
+
+  it('never switches subtitle tracks on a Chinese-original title and forwards its original language', () => {
+    const window = new FakeWindow();
+    const switchTo = vi.fn(() => true);
+    const preparePlayerTrackCapture = vi.fn(() => ok({
+      titleId: 'title-1',
+      originalTrackId: 'zh-hant',
+      switchTo,
+      restore: vi.fn(),
+    }));
+    const runtime = installMainWorldNetflixRuntime({
+      window,
+      readPlayerCatalog: () => ok({
+        type: 'catalog',
+        titleId: 'title-1',
+        authority: 'authoritative',
+        originalLanguage: 'zh',
+        tracks: [
+          { id: 'en-main', language: 'en', kind: 'subtitle' },
+          { id: 'zh-main', language: 'zh-Hans', kind: 'subtitle' },
+          { id: 'zh-hant', language: 'zh-Hant', kind: 'subtitle' },
+        ],
+      }),
+      preparePlayerTrackCapture,
+      scheduleCatalogPoll: () => () => undefined,
+      scheduleTrackCaptureTimeout: () => () => undefined,
+      installFetch: () => ({ dispose: vi.fn() }),
+      installXhr: () => ({ dispose: vi.fn() }),
+      extractCatalogResources: () => ok([]),
+    });
+    window.emit({
+      protocol: 'subtwin.netflix.bridge',
+      version: 1,
+      source: NETFLIX_CONTROL_SOURCE,
+      type: 'connect',
+      nonce: NONCE,
+      generation: 1,
+    });
+
+    expect(preparePlayerTrackCapture).not.toHaveBeenCalled();
+    expect(switchTo).not.toHaveBeenCalled();
+    expect(window.sent.map(({ data }) => data)).toContainEqual(expect.objectContaining({
+      payload: expect.objectContaining({ type: 'catalog', originalLanguage: 'zh' }),
+    }));
+    runtime.dispose();
+  });
+
+  it('restores the original track when a later catalog poll reveals a Chinese original mid-capture', () => {
+    const window = new FakeWindow();
+    const switchTo = vi.fn(() => true);
+    const restore = vi.fn();
+    let poll: (() => void) | undefined;
+    let originalLanguage: string | undefined;
+    const runtime = installMainWorldNetflixRuntime({
+      window,
+      readPlayerCatalog: () => ok({
+        type: 'catalog',
+        titleId: 'title-1',
+        authority: 'authoritative',
+        ...(originalLanguage === undefined ? {} : { originalLanguage }),
+        tracks: [
+          { id: 'en-main', language: 'en', kind: 'subtitle' },
+          { id: 'zh-main', language: 'zh-Hans', kind: 'subtitle' },
+        ],
+      }),
+      preparePlayerTrackCapture: () => ok({
+        titleId: 'title-1',
+        originalTrackId: 'zh-main',
+        switchTo,
+        restore,
+      }),
+      scheduleCatalogPoll: (callback) => {
+        poll = callback;
+        return () => undefined;
+      },
+      scheduleTrackCaptureTimeout: () => () => undefined,
+      installFetch: () => ({ dispose: vi.fn() }),
+      installXhr: () => ({ dispose: vi.fn() }),
+      extractCatalogResources: () => ok([]),
+    });
+    window.emit({
+      protocol: 'subtwin.netflix.bridge',
+      version: 1,
+      source: NETFLIX_CONTROL_SOURCE,
+      type: 'connect',
+      nonce: NONCE,
+      generation: 1,
+    });
+    expect(switchTo).toHaveBeenCalledOnce();
+
+    originalLanguage = 'zh';
+    poll?.();
+
+    expect(restore).toHaveBeenCalledOnce();
+    expect(switchTo).toHaveBeenCalledOnce();
+    runtime.dispose();
+  });
+
   it('binds a self-declared OCA TTML language to exactly one authoritative Player track', () => {
     const window = new FakeWindow();
     let probeOptions: {

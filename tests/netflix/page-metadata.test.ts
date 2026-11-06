@@ -89,7 +89,35 @@ describe('Netflix page metadata', () => {
       englishTrack: 'en-US · closed-caption',
       chineseTrack: 'zh-Hans · subtitle',
       officialChinese: true,
+      officialChineseScript: 'simplified',
     });
     expect(JSON.stringify(summarizeNetflixCatalog(null))).not.toContain('session');
+  });
+
+  it('falls back to official Traditional Chinese only when Simplified Chinese is absent', () => {
+    expect(summarizeNetflixCatalog({
+      sessionId: 'session-private-id',
+      generation: 1,
+      authority: 'authoritative',
+      tracks: [
+        { id: 'en', language: 'en', kind: 'subtitle' },
+        { id: 'zh-hant', language: 'zh-Hant', kind: 'subtitle' },
+      ],
+    })).toEqual({
+      authority: 'authoritative',
+      englishTrack: 'en · subtitle',
+      chineseTrack: 'zh-Hant · subtitle',
+      officialChinese: true,
+      officialChineseScript: 'traditional',
+    });
+    expect(summarizeNetflixCatalog({
+      sessionId: 'session-private-id',
+      generation: 1,
+      authority: 'authoritative',
+      tracks: [
+        { id: 'zh-hant', language: 'zh-Hant', kind: 'subtitle' },
+        { id: 'zh-hans', language: 'zh-Hans', kind: 'subtitle' },
+      ],
+    })).toMatchObject({ chineseTrack: 'zh-Hans · subtitle', officialChineseScript: 'simplified' });
   });
 });
