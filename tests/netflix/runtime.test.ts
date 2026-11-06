@@ -943,6 +943,81 @@ describe('isolated and MAIN-world Netflix runtimes', () => {
     runtime.dispose();
   });
 
+  it('stops capture when the watch page is left and retries it when the same title is reopened', () => {
+    const window = new FakeWindow();
+    const timeouts: Array<{ callback: () => void; cancelled: boolean }> = [];
+    const fireTimeouts = (): void => {
+      for (const timeout of timeouts.splice(0)) {
+        if (!timeout.cancelled) timeout.callback();
+      }
+    };
+    let poll: (() => void) | undefined;
+    const captures: Array<{ switchTo: ReturnType<typeof vi.fn>; restore: ReturnType<typeof vi.fn> }> = [];
+    const runtime = installMainWorldNetflixRuntime({
+      window,
+      readPlayerCatalog: () => window.location.pathname.startsWith('/watch/')
+        ? ok({
+            type: 'catalog',
+            titleId: 'title-1',
+            authority: 'authoritative',
+            tracks: [
+              { id: 'en-main', language: 'en', kind: 'subtitle' },
+              { id: 'zh-main', language: 'zh-Hans', kind: 'subtitle' },
+            ],
+          })
+        : err({
+            code: 'netflix_player_api_unavailable' as const,
+            message: 'Unavailable.',
+            retryable: false,
+          }),
+      preparePlayerTrackCapture: () => {
+        const capture = { switchTo: vi.fn(() => true), restore: vi.fn() };
+        captures.push(capture);
+        return ok({ titleId: 'title-1', originalTrackId: 'en-main', ...capture });
+      },
+      scheduleCatalogPoll: (callback) => {
+        poll = callback;
+        return () => undefined;
+      },
+      scheduleTrackCaptureTimeout: (callback) => {
+        const timeout = { callback, cancelled: false };
+        timeouts.push(timeout);
+        return () => { timeout.cancelled = true; };
+      },
+      installFetch: () => ({ dispose: vi.fn() }),
+      installXhr: () => ({ dispose: vi.fn() }),
+      extractCatalogResources: () => ok([]),
+    });
+    window.emit({
+      protocol: 'subtwin.netflix.bridge',
+      version: 1,
+      source: NETFLIX_CONTROL_SOURCE,
+      type: 'connect',
+      nonce: NONCE,
+      generation: 1,
+    });
+    const catalogsSent = () => window.sent.filter(({ data }) =>
+      (data as { payload?: { type?: string } }).payload?.type === 'catalog').length;
+    expect(captures).toHaveLength(1);
+    expect(captures[0]?.switchTo).toHaveBeenCalledWith('zh-main');
+    expect(catalogsSent()).toBe(1);
+
+    // 采集还在进行时离开播放页：旧播放器已不可用，必须立即停止并恢复原字幕轨，
+    // 不能让超时在后台把重试次数耗尽。
+    window.location.pathname = '/browse';
+    poll?.();
+    expect(captures[0]?.restore).toHaveBeenCalledOnce();
+    for (let index = 0; index < 4; index += 1) fireTimeouts();
+
+    window.location.pathname = '/watch/title-1';
+    poll?.();
+
+    expect(captures).toHaveLength(2);
+    expect(captures[1]?.switchTo).toHaveBeenCalledWith('zh-main');
+    expect(catalogsSent()).toBe(2);
+    runtime.dispose();
+  });
+
   it('captures official Traditional Chinese when the catalog has no Simplified Chinese', () => {
     const window = new FakeWindow();
     const switchTo = vi.fn(() => true);

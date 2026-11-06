@@ -724,9 +724,24 @@ export function installMainWorldNetflixRuntime(options: {
         // A private Netflix API change keeps the conservative network gate locked.
       }
     };
+    // 离开播放页（例如回到浏览页）后旧播放器已经失效：继续切换字幕轨只会空等超时、
+    // 把重试次数耗尽，导致再次打开同一部影片时再也拿不到没抓到的字幕正文。
+    // 因此立即停止抓取并恢复原轨，清掉重试计数与已发布记录；已拿到的正文仍保留。
+    const leaveWatchRoute = (): void => {
+      if (observedRouteTitleId === null) return;
+      observedRouteTitleId = null;
+      stopTrackCapture();
+      attemptedCaptureTrackIds.clear();
+      publishedDiagnostics.clear();
+      lastCatalogSignature = undefined;
+    };
     const alignRouteTitle = (): void => {
       const routeTitleId = readWatchRouteTitleId(options.window.location.pathname);
-      if (routeTitleId === null || routeTitleId === observedRouteTitleId) return;
+      if (routeTitleId === null) {
+        leaveWatchRoute();
+        return;
+      }
+      if (routeTitleId === observedRouteTitleId) return;
       observedRouteTitleId = routeTitleId;
       resetPublishedStateForTitle(routeTitleId);
       if (currentAuthoritativeCatalog?.titleId !== routeTitleId) {
@@ -1138,6 +1153,9 @@ export function installMainWorldNetflixRuntime(options: {
 
       const publishPlayerCatalog = (): void => {
         if (!disposed && active === nextActive) {
+          if (readWatchRouteTitleId(options.window.location.pathname) === null) {
+            leaveWatchRoute();
+          }
           refreshPlayerCatalog();
           scanPerformanceTimedText();
         }
