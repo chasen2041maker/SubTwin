@@ -104,6 +104,9 @@ export function PageControlSurface(props: PageControlSurfaceProps): ReactNode {
     top: `${props.position.y}px`,
   };
 
+  const settings = props.model.settings;
+  const sourceHint = providerHint(props.model);
+
   return (
     <div className="subtwin-controls">
       <button
@@ -129,159 +132,249 @@ export function PageControlSurface(props: PageControlSurfaceProps): ReactNode {
           data-subtwin-control="panel"
         >
           <header className="subtwin-controls__header">
-            <div>
-              <p className="subtwin-controls__eyebrow">NETFLIX DUAL SUBTITLES</p>
-              <h2>SubTwin</h2>
+            <div className="subtwin-controls__brand">
+              <span aria-hidden="true" className="subtwin-controls__mark">双</span>
+              <div>
+                <h2>SubTwin</h2>
+                <p>Netflix 中英双语字幕</p>
+              </div>
             </div>
-            <button
-              aria-label="关闭 SubTwin 控制台"
-              className="subtwin-controls__icon-button"
-              onClick={() => props.onExpandedChange(false)}
-              type="button"
-            >×</button>
+            <div className="subtwin-controls__header-actions">
+              <label className="subtwin-controls__switch" title="开启或关闭双语字幕">
+                <input
+                  aria-label="开启双语字幕"
+                  checked={settings.enabled}
+                  onChange={(event) => props.onEnabledChange(event.currentTarget.checked)}
+                  role="switch"
+                  type="checkbox"
+                />
+                <span aria-hidden="true" />
+              </label>
+              <button
+                aria-label="关闭 SubTwin 控制台"
+                className="subtwin-controls__icon-button"
+                onClick={() => props.onExpandedChange(false)}
+                type="button"
+              >×</button>
+            </div>
           </header>
 
-          <section className="subtwin-controls__status" aria-live="polite">
-            <span className="subtwin-controls__status-dot" data-mode={props.model.status.mode} />
+          <section
+            aria-live="polite"
+            className="subtwin-controls__status"
+            data-mode={statusTone(props.model)}
+          >
+            <span className="subtwin-controls__status-dot" />
             <div>
-              <strong>{shortStatus(props.model.status)}</strong>
-              <p>{runtimeStatusMessage(props.model.status)}</p>
+              <strong>{props.model.paused ? '本页已暂停' : shortStatus(props.model.status)}</strong>
+              <p>{props.model.paused
+                ? '已恢复 Netflix 原字幕，点击下方"继续当前页"重新显示双语。'
+                : runtimeStatusMessage(props.model.status)}</p>
             </div>
           </section>
 
-          <dl className="subtwin-controls__metadata" aria-label="当前播放信息">
-            <Metadata label="影片" value={props.model.metadata.title} />
-            <Metadata label="播放" value={playbackLabel(props.model.metadata.playback)} />
-            <Metadata label="音轨" value={props.model.metadata.audioTrack} />
-            <Metadata label="字幕轨" value={props.model.metadata.subtitleTrack} />
-            <Metadata label="英文目录" value={props.model.catalog.englishTrack} />
-            <Metadata label="中文目录" value={props.model.catalog.chineseTrack} />
-            <Metadata label="字幕链路" value={props.model.pipeline} />
-            <Metadata
-              label="中文字幕"
-              value={props.model.catalog.officialChinese
-                ? 'Netflix 官方简体中文'
-                : '未发现官方简体中文'}
-            />
-            <Metadata label="字幕来源" value={providerLabel(props.model.settings.provider)} />
-          </dl>
-
-          <section className="subtwin-controls__section" aria-label="运行控制">
-            <Toggle
-              checked={props.model.settings.enabled}
-              label="开启双语字幕"
-              onChange={props.onEnabledChange}
-            />
-            <SelectField
+          <section className="subtwin-controls__card" aria-label="字幕来源设置">
+            <h3>字幕来源</h3>
+            <Segmented
               label="字幕来源"
-              onChange={(provider) => props.onProviderChange(
-                provider as TranslationProviderSetting,
-              )}
+              onChange={(provider) => props.onProviderChange(provider as TranslationProviderSetting)}
               options={[
-                ['unset', 'Netflix 原生双语'],
-                ['google-free', 'Google 翻译'],
-                [
-                  'deepseek',
-                  props.model.settings.deepseekKeyReady
-                    ? 'DeepSeek 翻译'
-                    : 'DeepSeek 翻译（需先配置 Key）',
-                ],
+                { value: 'unset', label: 'Netflix 原生双语', title: '原生双语', detail: '官方中文' },
+                { value: 'google-free', label: 'Google 翻译', title: 'Google', detail: '免费翻译' },
+                {
+                  value: 'deepseek',
+                  label: settings.deepseekKeyReady ? 'DeepSeek 翻译' : 'DeepSeek 翻译（需先配置 Key）',
+                  title: 'DeepSeek',
+                  detail: settings.deepseekKeyReady ? '上下文翻译' : '需配置 Key',
+                },
               ]}
-              value={props.model.settings.provider}
+              value={settings.provider}
             />
-            <button
-              aria-label={props.model.paused ? '继续当前页' : '暂停当前标签页'}
-              aria-pressed={props.model.paused}
-              className="subtwin-controls__pause"
-              disabled={!props.model.settings.enabled}
-              onClick={() => props.onPausedChange(!props.model.paused)}
-              type="button"
-            >
-              {props.model.paused ? '继续当前页' : '暂停当前页'}
-            </button>
+            {sourceHint === null ? null : (
+              <p className="subtwin-controls__hint" data-tone={sourceHint.tone}>{sourceHint.text}</p>
+            )}
           </section>
 
-          <section className="subtwin-controls__section" aria-label="字幕显示">
-            <div className="subtwin-controls__two-column">
-              <Toggle
+          <section className="subtwin-controls__card" aria-label="字幕显示">
+            <h3>显示</h3>
+            <div className="subtwin-controls__chips">
+              <Chip
                 checked={appearance.english.visible}
                 label="显示英文字幕"
+                text="英文"
                 onChange={(visible) => props.onAppearanceChange({
                   ...appearance,
                   english: { ...appearance.english, visible },
                 })}
               />
-              <Toggle
+              <Chip
                 checked={appearance.chinese.visible}
                 label="显示中文字幕"
+                text="中文"
                 onChange={(visible) => props.onAppearanceChange({
                   ...appearance,
                   chinese: { ...appearance.chinese, visible },
                 })}
               />
             </div>
-            <SelectField
+            <Segmented
+              compact
               label="字幕上下顺序"
               onChange={(order) => props.onAppearanceChange({
                 ...appearance,
                 order: order as SubtitleAppearanceSettings['order'],
               })}
               options={[
-                ['english-first', '英文在上'],
-                ['chinese-first', '中文在上'],
+                { value: 'english-first', label: '英文在上', title: '英文在上' },
+                { value: 'chinese-first', label: '中文在上', title: '中文在上' },
               ]}
               value={appearance.order}
             />
           </section>
 
-          <LanguageControls
-            appearance={appearance.english}
-            language="英文"
-            onChange={(english) => props.onAppearanceChange({ ...appearance, english })}
-          />
-          <LanguageControls
-            appearance={appearance.chinese}
-            language="中文"
-            onChange={(chinese) => props.onAppearanceChange({ ...appearance, chinese })}
-          />
+          <details className="subtwin-controls__group">
+            <summary>文字样式</summary>
+            <div className="subtwin-controls__columns">
+              <LanguageControls
+                appearance={appearance.english}
+                language="英文"
+                onChange={(english) => props.onAppearanceChange({ ...appearance, english })}
+              />
+              <LanguageControls
+                appearance={appearance.chinese}
+                language="中文"
+                onChange={(chinese) => props.onAppearanceChange({ ...appearance, chinese })}
+              />
+            </div>
+          </details>
 
-          <section className="subtwin-controls__section" aria-label="画面位置与背景">
-            <SelectField
-              label="字幕阴影"
-              onChange={(shadow) => props.onAppearanceChange({
-                ...appearance,
-                shadow: shadow as SubtitleAppearanceSettings['shadow'],
-              })}
-              options={[
-                ['none', '无'],
-                ['soft', '柔和'],
-                ['strong', '强'],
-              ]}
-              value={appearance.shadow}
-            />
-            <RangeField label="字幕行距" max={48} min={0} step={1} suffix="px"
-              value={appearance.lineSpacingPx}
-              onChange={(lineSpacingPx) => props.onAppearanceChange({ ...appearance, lineSpacingPx })} />
-            <RangeField label="单行长度" max={100} min={50} step={1} suffix="%"
-              value={appearance.maxLineWidthPercent}
-              onChange={(maxLineWidthPercent) => props.onAppearanceChange({
-                ...appearance,
-                maxLineWidthPercent,
-              })} />
-            <RangeField label="字幕垂直位置" max={80} min={0} step={1} suffix="%"
-              value={appearance.verticalOffsetPercent}
-              onChange={(verticalOffsetPercent) => props.onAppearanceChange({ ...appearance, verticalOffsetPercent })} />
-            <RangeField label="字幕背景不透明度" max={1} min={0} step={0.05} suffix=""
-              value={appearance.backgroundOpacity}
-              onChange={(backgroundOpacity) => props.onAppearanceChange({ ...appearance, backgroundOpacity })} />
-          </section>
+          <details className="subtwin-controls__group">
+            <summary>位置与背景</summary>
+            <div className="subtwin-controls__stack">
+              <Segmented
+                compact
+                label="字幕阴影"
+                onChange={(shadow) => props.onAppearanceChange({
+                  ...appearance,
+                  shadow: shadow as SubtitleAppearanceSettings['shadow'],
+                })}
+                options={[
+                  { value: 'none', label: '无阴影', title: '无阴影' },
+                  { value: 'soft', label: '柔和阴影', title: '柔和' },
+                  { value: 'strong', label: '强阴影', title: '强' },
+                ]}
+                value={appearance.shadow}
+              />
+              <RangeField label="字幕垂直位置" text="垂直位置" max={80} min={0} step={1} suffix="%"
+                value={appearance.verticalOffsetPercent}
+                onChange={(verticalOffsetPercent) => props.onAppearanceChange({ ...appearance, verticalOffsetPercent })} />
+              <RangeField label="字幕行距" text="行距" max={48} min={0} step={1} suffix="px"
+                value={appearance.lineSpacingPx}
+                onChange={(lineSpacingPx) => props.onAppearanceChange({ ...appearance, lineSpacingPx })} />
+              <RangeField label="单行长度" text="单行长度" max={100} min={50} step={1} suffix="%"
+                value={appearance.maxLineWidthPercent}
+                onChange={(maxLineWidthPercent) => props.onAppearanceChange({
+                  ...appearance,
+                  maxLineWidthPercent,
+                })} />
+              <RangeField label="字幕背景不透明度" text="背景不透明度" max={1} min={0} step={0.05} suffix=""
+                value={appearance.backgroundOpacity}
+                onChange={(backgroundOpacity) => props.onAppearanceChange({ ...appearance, backgroundOpacity })} />
+              <p className="subtwin-controls__tip">控制台打开时，可以直接上下拖动画面里的字幕。</p>
+            </div>
+          </details>
+
+          <details className="subtwin-controls__group">
+            <summary>诊断信息</summary>
+            <dl className="subtwin-controls__metadata" aria-label="当前播放信息">
+              <Metadata label="影片" value={props.model.metadata.title} />
+              <Metadata label="播放" value={playbackLabel(props.model.metadata.playback)} />
+              <Metadata label="音轨" value={props.model.metadata.audioTrack} />
+              <Metadata label="原字幕" value={props.model.metadata.subtitleTrack} />
+              <Metadata label="英文字幕" value={props.model.catalog.englishTrack} />
+              <Metadata label="中文字幕" value={props.model.catalog.chineseTrack} />
+              <Metadata
+                label="官方中文"
+                value={props.model.catalog.officialChinese
+                  ? 'Netflix 官方简体中文'
+                  : '未发现官方简体中文'}
+              />
+              <Metadata label="字幕链路" value={props.model.pipeline} />
+            </dl>
+          </details>
 
           <footer className="subtwin-controls__footer" data-save-state={props.model.saveState}>
-            {saveStateLabel(props.model.saveState)}
+            <button
+              aria-label={props.model.paused ? '继续当前页' : '暂停当前标签页'}
+              aria-pressed={props.model.paused}
+              className="subtwin-controls__pause"
+              disabled={!settings.enabled}
+              onClick={() => props.onPausedChange(!props.model.paused)}
+              type="button"
+            >
+              {props.model.paused ? '继续当前页' : '暂停当前页'}
+            </button>
+            <span>{saveStateLabel(props.model.saveState)}</span>
           </footer>
         </aside>
       ) : null}
     </div>
+  );
+}
+
+interface SegmentedOption {
+  readonly value: string;
+  readonly label: string;
+  readonly title: string;
+  readonly detail?: string;
+}
+
+function Segmented(props: {
+  readonly compact?: boolean;
+  readonly label: string;
+  readonly onChange: (value: string) => void;
+  readonly options: readonly SegmentedOption[];
+  readonly value: string;
+}): ReactNode {
+  return (
+    <div
+      aria-label={props.label}
+      className="subtwin-controls__segmented"
+      data-compact={props.compact === true}
+      role="radiogroup"
+      style={{ '--subtwin-segments': props.options.length } as CSSProperties}
+    >
+      {props.options.map((option) => (
+        <button
+          aria-checked={option.value === props.value}
+          aria-label={option.label}
+          key={option.value}
+          onClick={() => {
+            if (option.value !== props.value) props.onChange(option.value);
+          }}
+          role="radio"
+          type="button"
+        >
+          <span>{option.title}</span>
+          {option.detail === undefined ? null : <small>{option.detail}</small>}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Chip(props: {
+  readonly checked: boolean;
+  readonly label: string;
+  readonly onChange: (checked: boolean) => void;
+  readonly text: string;
+}): ReactNode {
+  return (
+    <label className="subtwin-controls__chip">
+      <input aria-label={props.label} checked={props.checked} type="checkbox"
+        onChange={(event) => props.onChange(event.currentTarget.checked)} />
+      <span>{props.text}</span>
+    </label>
   );
 }
 
@@ -291,75 +384,50 @@ function LanguageControls(props: {
   readonly onChange: (appearance: SubtitleLanguageAppearance) => void;
 }): ReactNode {
   return (
-    <section className="subtwin-controls__section" aria-label={`${props.language}字幕样式`}>
-      <SelectField
-        label={`${props.language}字体`}
-        onChange={(fontFamily) => props.onChange({
-          ...props.appearance,
-          fontFamily: fontFamily as SubtitleFontFamily,
-        })}
-        options={[
-          ['sans', '清晰无衬线'],
-          ['rounded', '圆体'],
-          ['system', '系统字体'],
-          ['serif', '衬线体'],
-          ['mono', '等宽体'],
-        ]}
-        value={props.appearance.fontFamily}
-      />
-      <RangeField label={`${props.language}字号`} max={72} min={12} step={1} suffix="px"
+    <section className="subtwin-controls__language" aria-label={`${props.language}字幕样式`}>
+      <h4>{props.language}</h4>
+      <label className="subtwin-controls__field">
+        <span>字体</span>
+        <select aria-label={`${props.language}字体`} value={props.appearance.fontFamily}
+          onChange={(event) => props.onChange({
+            ...props.appearance,
+            fontFamily: event.currentTarget.value as SubtitleFontFamily,
+          })}>
+          {FONT_OPTIONS.map(([value, label]) => (
+            <option key={value} value={value}>{label}</option>
+          ))}
+        </select>
+      </label>
+      <RangeField label={`${props.language}字号`} text="字号" max={72} min={12} step={1} suffix="px"
         value={props.appearance.fontSizePx}
         onChange={(fontSizePx) => props.onChange({ ...props.appearance, fontSizePx })} />
-      <RangeField label={`${props.language}粗细`} max={900} min={100} step={100} suffix=""
+      <RangeField label={`${props.language}粗细`} text="粗细" max={900} min={100} step={100} suffix=""
         value={props.appearance.fontWeight}
         onChange={(fontWeight) => props.onChange({ ...props.appearance, fontWeight })} />
-      <label className="subtwin-controls__field">
-        <span>{props.language}颜色</span>
+      <label className="subtwin-controls__color">
+        <span>颜色</span>
         <input aria-label={`${props.language}颜色`} type="color" value={props.appearance.color}
           onChange={(event) => props.onChange({
             ...props.appearance,
             color: event.currentTarget.value.toUpperCase(),
           })} />
+        <code>{props.appearance.color.toUpperCase()}</code>
       </label>
     </section>
   );
 }
 
-function Toggle(props: {
-  readonly checked: boolean;
-  readonly label: string;
-  readonly onChange: (checked: boolean) => void;
-}): ReactNode {
-  return (
-    <label className="subtwin-controls__toggle">
-      <span>{props.label}</span>
-      <input aria-label={props.label} checked={props.checked} type="checkbox"
-        onChange={(event) => props.onChange(event.currentTarget.checked)} />
-    </label>
-  );
-}
-
-function SelectField(props: {
-  readonly label: string;
-  readonly onChange: (value: string) => void;
-  readonly options: readonly (readonly [string, string])[];
-  readonly value: string;
-}): ReactNode {
-  return (
-    <label className="subtwin-controls__field">
-      <span>{props.label}</span>
-      <select aria-label={props.label} value={props.value}
-        onChange={(event) => props.onChange(event.currentTarget.value)}>
-        {props.options.map(([value, label]) => (
-          <option key={value} value={value}>{label}</option>
-        ))}
-      </select>
-    </label>
-  );
-}
+const FONT_OPTIONS: readonly (readonly [SubtitleFontFamily, string])[] = [
+  ['sans', '清晰无衬线'],
+  ['rounded', '圆体'],
+  ['system', '系统字体'],
+  ['serif', '衬线体'],
+  ['mono', '等宽体'],
+];
 
 function RangeField(props: {
   readonly label: string;
+  readonly text: string;
   readonly max: number;
   readonly min: number;
   readonly onChange: (value: number) => void;
@@ -369,7 +437,7 @@ function RangeField(props: {
 }): ReactNode {
   return (
     <label className="subtwin-controls__range">
-      <span>{props.label}</span>
+      <span>{props.text}</span>
       <output>{props.value}{props.suffix}</output>
       <input aria-label={props.label} max={props.max} min={props.min} step={props.step}
         type="range" value={props.value}
@@ -379,7 +447,34 @@ function RangeField(props: {
 }
 
 function Metadata(props: { readonly label: string; readonly value: string }): ReactNode {
+  // Netflix 播放器控件隐藏时读不到这些信息，占位文字只会让面板看起来像出错。
+  if (props.value.trim().length === 0 || props.value.startsWith('等待')) return null;
   return <div className="subtwin-controls__metadata-row"><dt>{props.label}</dt><dd>{props.value}</dd></div>;
+}
+
+function statusTone(model: PageControlSurfaceModel): string {
+  if (!model.settings.enabled || model.paused) return 'idle';
+  if (model.status.mode === 'error') return 'error';
+  if (model.status.mode === 'discovering' || model.status.mode === 'unset') return 'pending';
+  return 'active';
+}
+
+function providerHint(
+  model: PageControlSurfaceModel,
+): { readonly tone: 'info' | 'warn'; readonly text: string } | null {
+  if (model.catalog.authority !== 'authoritative') return null;
+  const provider = model.settings.provider;
+  if (provider === 'unset') {
+    return model.catalog.officialChinese
+      ? { tone: 'info', text: '本片有 Netflix 官方简体中文，双语字幕无需调用翻译。' }
+      : { tone: 'warn', text: '本片没有官方简体中文，原生双语只能显示英文；改用 Google 或 DeepSeek 即可显示中英双语。' };
+  }
+  if (provider === 'deepseek' && !model.settings.deepseekKeyReady) {
+    return { tone: 'warn', text: '还没有配置 DeepSeek API Key，请在扩展设置页填写。' };
+  }
+  return model.catalog.officialChinese
+    ? { tone: 'info', text: '本片也有官方简体中文，可切换到"原生双语"免去翻译。' }
+    : null;
 }
 
 export function clampFloatingPosition(
@@ -649,11 +744,6 @@ function shortStatus(status: RuntimeStatus): string {
   return '等待设置';
 }
 
-function providerLabel(provider: RuntimeSettingsState['provider']): string {
-  if (provider === 'deepseek') return 'DeepSeek 翻译';
-  if (provider === 'google-free') return 'Google 翻译';
-  return 'Netflix 原生双语';
-}
 
 function playbackLabel(playback: PagePlaybackMetadata['playback']): string {
   if (playback === 'playing') return '播放中';

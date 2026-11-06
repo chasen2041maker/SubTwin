@@ -283,6 +283,7 @@ describe('bounded atomic bilingual cue display', () => {
 
   it('revokes pending waits on a native gap and ignores their late result', () => {
     const h = harness();
+    h.controller.tick({ visibleText: 'First line', currentTimeMs: 1_000 });
     h.controller.tick({ visibleText: '', currentTimeMs: 1_100 });
     const clears = h.clear.mock.calls.length;
     vi.advanceTimersByTime(WAIT_MS);

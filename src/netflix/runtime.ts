@@ -283,7 +283,9 @@ type EmbeddedTimedTextDownloader = (
 type CatalogMetadataSource = 'network' | 'player';
 
 const PLAYER_CATALOG_POLL_INTERVAL_MS = 1_500;
-const TRACK_CAPTURE_TIMEOUT_MS = 3_000;
+// 中文剧等片源的字幕请求常在 3 秒后才返回；过早切走会让 Netflix 丢弃这次请求，
+// 英文正文永远拿不到，双语也就无法开始。
+const TRACK_CAPTURE_TIMEOUT_MS = 8_000;
 const MAX_TRACK_CAPTURE_ATTEMPTS = 2;
 const CATALOG_DOWNLOAD_MAX_ATTEMPTS = 3;
 const CATALOG_DOWNLOAD_RETRY_BASE_MS = 250;

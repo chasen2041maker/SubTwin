@@ -132,6 +132,49 @@ describe('PageControlSurface', () => {
     expect(markup).toContain('DeepSeek 翻译（需先配置 Key）');
   });
 
+  it('marks the selected source and warns when official Chinese is missing for native mode', () => {
+    const markup = renderToStaticMarkup(
+      <PageControlSurface
+        expanded
+        model={{
+          ...model,
+          settings: { ...model.settings, provider: 'unset' },
+          catalog: { ...model.catalog, chineseTrack: '未发现简体中文字幕', officialChinese: false },
+          metadata: { ...model.metadata, title: '等待 Netflix 影片' },
+        }}
+        position={{ x: 1200, y: 600 }}
+        onAppearanceChange={vi.fn()}
+        onEnabledChange={vi.fn()}
+        onExpandedChange={vi.fn()}
+        onPausedChange={vi.fn()}
+        onPositionChange={vi.fn()}
+        onProviderChange={vi.fn()}
+      />,
+    );
+
+    expect(markup).toMatch(/aria-checked="true" aria-label="Netflix 原生双语"/u);
+    expect(markup).toContain('本片没有官方简体中文');
+    expect(markup).not.toContain('等待 Netflix 影片');
+  });
+
+  it('does not re-emit the source that is already selected', () => {
+    const onProviderChange = vi.fn();
+    const controls = collectHostElements(PageControlSurface({
+      expanded: true,
+      model,
+      position: { x: 1200, y: 600 },
+      onAppearanceChange: vi.fn(),
+      onEnabledChange: vi.fn(),
+      onExpandedChange: vi.fn(),
+      onPausedChange: vi.fn(),
+      onPositionChange: vi.fn(),
+      onProviderChange,
+    }));
+
+    click(findControl(controls, 'Google 翻译'));
+    expect(onProviderChange).not.toHaveBeenCalled();
+  });
+
   it('changes the pause button accessible name when the page is paused', () => {
     const markup = renderToStaticMarkup(
       <PageControlSurface
@@ -172,8 +215,8 @@ describe('PageControlSurface', () => {
     click(findControl(controls, '暂停当前标签页'));
     changeChecked(findControl(controls, '显示英文字幕'), false);
     changeChecked(findControl(controls, '显示中文字幕'), false);
-    changeValue(findControl(controls, '字幕来源'), 'deepseek');
-    changeValue(findControl(controls, '字幕上下顺序'), 'chinese-first');
+    click(findControl(controls, 'DeepSeek 翻译（需先配置 Key）'));
+    click(findControl(controls, '英文在上'));
     changeValue(findControl(controls, '英文字体'), 'mono');
     changeValue(findControl(controls, '中文字体'), 'serif');
     changeValue(findControl(controls, '英文字号'), '41');
@@ -182,7 +225,7 @@ describe('PageControlSurface', () => {
     changeValue(findControl(controls, '中文粗细'), '600');
     changeValue(findControl(controls, '英文颜色'), '#123456');
     changeValue(findControl(controls, '中文颜色'), '#abcdef');
-    changeValue(findControl(controls, '字幕阴影'), 'strong');
+    click(findControl(controls, '强阴影'));
     changeValue(findControl(controls, '字幕行距'), '17');
     changeValue(findControl(controls, '单行长度'), '100');
     changeValue(findControl(controls, '字幕垂直位置'), '63');
@@ -194,7 +237,7 @@ describe('PageControlSurface', () => {
     expect(onAppearanceChange.mock.calls.map(([appearance]) => appearance)).toEqual([
       { ...model.settings.appearance, english: { ...model.settings.appearance.english, visible: false } },
       { ...model.settings.appearance, chinese: { ...model.settings.appearance.chinese, visible: false } },
-      { ...model.settings.appearance, order: 'chinese-first' },
+      { ...model.settings.appearance, order: 'english-first' },
       { ...model.settings.appearance, english: { ...model.settings.appearance.english, fontFamily: 'mono' } },
       { ...model.settings.appearance, chinese: { ...model.settings.appearance.chinese, fontFamily: 'serif' } },
       { ...model.settings.appearance, english: { ...model.settings.appearance.english, fontSizePx: 41 } },
@@ -231,7 +274,7 @@ describe('PageControlSurface', () => {
     expect(controlCss).toContain('.subtwin-controls__panel');
     expect(controlCss).toMatch(/\.subtwin-controls__launcher[\s\S]*pointer-events:\s*auto/iu);
     expect(controlCss).toMatch(/\.subtwin-controls__panel[\s\S]*pointer-events:\s*auto/iu);
-    expect(controlCss).toContain('width: min(440px, calc(100vw - 28px))');
+    expect(controlCss).toContain('width: min(400px, calc(100vw - 28px))');
     expect(controlCss).toMatch(/\.subtwin-controls__range input[\s\S]*min-height:\s*28px/iu);
     expect(controlCss).not.toMatch(/animation:\s*[^n]/iu);
   });

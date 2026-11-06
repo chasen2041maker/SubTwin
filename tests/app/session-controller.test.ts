@@ -242,6 +242,70 @@ describe('subtitle session controller', () => {
     });
   });
 
+  it('follows the video clock when the Netflix native subtitle is off or not English', () => {
+    const harness = createHarness({
+      englishTrack: track('english', 'en', [
+        cue('en-1', 0, 1_000, 'One'),
+        cue('en-2', 1_000, 2_000, 'Two'),
+      ]),
+      officialChineseTrack: track('chinese', 'zh-Hans', [
+        cue('zh-1', 0, 1_000, '一'),
+        cue('zh-2', 1_000, 2_000, '二'),
+      ]),
+      route: route('official'),
+    });
+
+    harness.controller.tick({ visibleText: '', currentTimeMs: 100 });
+    expect(harness.overlay.lastState()).toEqual({ english: 'One', chinese: '一' });
+    harness.controller.tick({ visibleText: '室友好', currentTimeMs: 1_100 });
+    expect(harness.overlay.lastState()).toEqual({ english: 'Two', chinese: '二' });
+  });
+
+  it('treats an empty native subtitle as silence once Netflix has shown the English line', () => {
+    const harness = createHarness({
+      englishTrack: track('english', 'en', [cue('en-1', 0, 5_000, 'One')]),
+      officialChineseTrack: track('chinese', 'zh-Hans', [cue('zh-1', 0, 5_000, '一')]),
+      route: route('official'),
+    });
+
+    harness.controller.tick({ visibleText: 'One', currentTimeMs: 100 });
+    const clears = harness.overlay.clearCount;
+    harness.controller.tick({ visibleText: '', currentTimeMs: 4_000 });
+    expect(harness.overlay.clearCount).toBeGreaterThan(clears);
+  });
+
+  it('keeps official sound captions in the overlay style when no Chinese line exists', () => {
+    const harness = createHarness({
+      englishTrack: track('english', 'en', [
+        cue('en-1', 0, 1_000, 'One'),
+        cue('en-2', 3_000, 4_000, '[whistle blows]'),
+      ]),
+      officialChineseTrack: track('chinese', 'zh-Hans', [cue('zh-1', 0, 1_000, '一')]),
+      route: route('official'),
+    });
+
+    harness.controller.tick({ visibleText: '[whistle blows]', currentTimeMs: 3_100 });
+    expect(harness.overlay.lastState()).toEqual({ english: '[whistle blows]', chinese: null });
+  });
+
+  it('clears a transient translation error once a prefetched batch succeeds', () => {
+    const harness = createHarness({
+      englishTrack: numberedTrack(30),
+      route: route('deepseek', 'bulk'),
+      currentTimeMs: 100,
+    });
+
+    harness.tasks.find('deepseek', 'cue-8').callbacks.onError({
+      code: 'provider_unavailable',
+      retryable: true,
+      message: 'Synthetic outage',
+    });
+    expect(harness.status.last()).toEqual({ mode: 'error', code: 'provider_unavailable' });
+
+    harness.tasks.find('deepseek', 'cue-28').callbacks.onResult(batch('cue-28', '恢复了'));
+    expect(harness.status.last()).toEqual({ mode: 'deepseek' });
+  });
+
   it('renders cache and provider results only while their generations are current', () => {
     const harness = createHarness({
       route: route('deepseek', 'bulk'),

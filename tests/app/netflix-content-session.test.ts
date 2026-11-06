@@ -100,7 +100,7 @@ describe('Netflix isolated content session', () => {
 
     harness.ticks.emit({ visibleText: 'Hello', currentTimeMs: 500 });
 
-    expect(harness.diagnostics.map(({ code }) => code)).toEqual([
+    expect(harness.diagnostics.map(({ code }) => code).filter((code) => code !== 'route_changed')).toEqual([
       'timed_text_received',
       'timed_text_accepted',
       'timed_text_received',
@@ -341,6 +341,103 @@ describe('Netflix isolated content session', () => {
     expect(harness.tasks.scheduled.slice(beforeStrongConfirmation).some(
       ({ task }) => task.priority === 'bulk',
     )).toBe(true);
+  });
+
+  it('defaults to bilingual from the preferred English track when Netflix shows Chinese on entry', () => {
+    const harness = createHarness(settings('google-free', false));
+    harness.session.handlePayload(catalog('chinese-entry', 'authoritative', [
+      descriptor('en-cc', 'en', 'closed-caption'),
+      descriptor('en-sub', 'en-US', 'subtitle'),
+      descriptor('zh-hant', 'zh-Hant'),
+    ]));
+    harness.session.handlePayload(timedTextWithCues(
+      'chinese-entry', 'tt_6666666666666666', 'en-cc', 'en', ['Caption line 0', 'Caption line 1', 'Caption line 2', 'Caption line 3', 'Caption line 4', 'Caption line 5', 'Caption line 6', 'Caption line 7', 'Caption line 8', 'Caption line 9', 'Caption line 10', 'Caption line 11'],
+    ));
+    harness.session.handlePayload(timedTextWithCues(
+      'chinese-entry', 'tt_7777777777777777', 'en-sub', 'en-US', ['Subtitle line 0', 'Subtitle line 1', 'Subtitle line 2', 'Subtitle line 3', 'Subtitle line 4', 'Subtitle line 5', 'Subtitle line 6', 'Subtitle line 7', 'Subtitle line 8', 'Subtitle line 9', 'Subtitle line 10', 'Subtitle line 11'],
+    ));
+
+    harness.ticks.emit({ visibleText: '室友好', currentTimeMs: 500 });
+    expect(harness.tasks.scheduled).toHaveLength(0);
+    harness.ticks.emit({ visibleText: '星期三，這位是依妮', currentTimeMs: 1_500 });
+
+    expect(harness.tasks.scheduled.length).toBeGreaterThan(0);
+    expect(harness.tasks.scheduled.some(({ task }) => task.priority === 'bulk')).toBe(true);
+    expect(harness.tasks.scheduled.every(({ task }) =>
+      task.cues.every(({ text }) => text.startsWith('Subtitle line')))).toBe(true);
+  });
+
+  it('defaults to bilingual when Netflix subtitles are off on entry', () => {
+    const harness = createHarness(settings('google-free', false));
+    harness.session.handlePayload(catalog('off-entry', 'authoritative', [
+      descriptor('en-main', 'en'),
+    ]));
+    harness.session.handlePayload(timedTextWithCues(
+      'off-entry', 'tt_8888888888888888', 'en-main', 'en', ['Spoken line 0', 'Spoken line 1', 'Spoken line 2', 'Spoken line 3', 'Spoken line 4', 'Spoken line 5', 'Spoken line 6', 'Spoken line 7', 'Spoken line 8', 'Spoken line 9', 'Spoken line 10', 'Spoken line 11'],
+    ));
+
+    harness.ticks.emit({ visibleText: '', currentTimeMs: 700 });
+    expect(harness.tasks.scheduled).toHaveLength(0);
+    harness.ticks.emit({ visibleText: '', currentTimeMs: 1_700 });
+
+    expect(harness.tasks.scheduled.some(({ task }) => task.priority === 'bulk')).toBe(true);
+  });
+
+  it('keeps waiting for native evidence while an English line is merely between cues', () => {
+    const harness = createHarness(settings('google-free', false));
+    harness.session.handlePayload(catalog('gap-entry', 'authoritative', [
+      descriptor('en-main', 'en'),
+    ]));
+    harness.session.handlePayload(timedTextWithCues(
+      'gap-entry', 'tt_9999999999999999', 'en-main', 'en', ['Spoken line 0', 'Spoken line 1', 'Spoken line 2', 'Spoken line 3', 'Spoken line 4', 'Spoken line 5', 'Spoken line 6', 'Spoken line 7', 'Spoken line 8', 'Spoken line 9', 'Spoken line 10', 'Spoken line 11'],
+    ));
+
+    harness.ticks.emit({ visibleText: '', currentTimeMs: 700 });
+    harness.ticks.emit({ visibleText: 'Spoken line 1', currentTimeMs: 1_200 });
+    harness.ticks.emit({ visibleText: '', currentTimeMs: 2_700 });
+
+    expect(harness.tasks.scheduled.every(({ task }) => task.priority === 'urgent')).toBe(true);
+  });
+
+  it('does not report a capture timeout as an error once English subtitles are parsed', () => {
+    const harness = createHarness(settings('google-free', false));
+    harness.session.handlePayload(catalog('timeout-title', 'authoritative', [
+      descriptor('en-main', 'en'),
+      descriptor('zh-hans', 'zh-Hans'),
+    ]));
+    harness.session.handlePayload(timedTextWithCues(
+      'timeout-title', 'tt_aaaaaaaaaaaaaaaa', 'en-main', 'en', ['Spoken line 0', 'Spoken line 1', 'Spoken line 2', 'Spoken line 3', 'Spoken line 4', 'Spoken line 5', 'Spoken line 6', 'Spoken line 7', 'Spoken line 8', 'Spoken line 9', 'Spoken line 10', 'Spoken line 11'],
+    ));
+    harness.session.handlePayload({ type: 'diagnostic', code: 'display_unavailable' });
+
+    expect(harness.status.values).not.toContainEqual({
+      mode: 'error',
+      code: 'netflix_unavailable',
+    });
+  });
+
+  it('accepts an English body even when a longer Chinese body arrived under the same resource ID', () => {
+    const harness = createHarness(settings('google-free', false));
+    harness.session.handlePayload(catalog('shared-resource', 'authoritative', [
+      descriptor('zh-hant', 'zh-Hant'),
+      descriptor('en-main', 'en'),
+    ]));
+    harness.session.handlePayload(timedTextWithCues(
+      'shared-resource', 'tt_bbbbbbbbbbbbbbbb', 'zh-hant', 'zh-Hant',
+      Array.from({ length: 14 }, (_, index) => `繁體字幕第${index}句`),
+    ));
+    harness.session.handlePayload(timedTextWithCues(
+      'shared-resource', 'tt_bbbbbbbbbbbbbbbb', 'en-main', 'en',
+      Array.from({ length: 10 }, (_, index) => `English line number ${index}`),
+    ));
+
+    const codes = harness.diagnostics.map(({ code }) => code);
+    expect(codes.filter((code) => code === 'timed_text_accepted')).toHaveLength(2);
+    expect(codes).not.toContain('timed_text_ignored');
+    harness.ticks.emit({ visibleText: '繁體字幕第0句', currentTimeMs: 500 });
+    harness.ticks.emit({ visibleText: '繁體字幕第1句', currentTimeMs: 1_500 });
+    expect(harness.tasks.scheduled.some(({ task }) =>
+      task.cues.some(({ text }) => text.startsWith('English line number')))).toBe(true);
   });
 
   it('selects the native-matching English variant and upgrades only that track to bulk', () => {

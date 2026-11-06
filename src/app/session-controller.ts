@@ -154,6 +154,10 @@ export function createSubtitleSessionController(
   let lastTimeMs: number | undefined;
   let lastRenderSignature: string | null = null;
   let nativeGap = false;
+  // 只有 Netflix 正在显示同一条英文字幕时，原字幕变空才代表"此刻没人说话"。
+  // 原字幕关闭或显示中文等其他语言时，改用视频时钟定位字幕。
+  let nativeShowsEnglish = false;
+  let translationErrorShown = false;
   let appearanceRevision = 0;
   let taskSequence = 0;
   let sortedEnglishCues: readonly SubtitleCue[] = sortCues(englishTrack?.cues ?? []);
@@ -291,8 +295,10 @@ export function createSubtitleSessionController(
     } else {
       cueDisplay.reset();
     }
+    // 官方中文里本来就没有对应句（多为 [音效] 说明）时，用同样的样式只显示英文，
+    // 避免这几句突然换回 Netflix 原字幕的样式；中文正文完全不可用时才交回原字幕。
     if (
-      (effectiveOfficial() && state.chinese === null) ||
+      (effectiveOfficial() && state.chinese === null && officialTranslations.size === 0) ||
       (online && appearance.chinese.visible && state.chinese === null) ||
       (route.sourceMode === 'official-alignment' && !effectiveOfficial())
     ) {
@@ -336,17 +342,22 @@ export function createSubtitleSessionController(
     if (!isTaskCurrent(task)) return;
     const requestedIds = new Set(task.cues.map(({ id }) => id));
     let activeChanged = false;
+    let accepted = false;
     for (const translation of batch.translations) {
       if (!isAcceptableTranslation(translation, requestedIds)) continue;
+      accepted = true;
       const text = translation.text.trim();
       if (providerTranslations.get(translation.cueId) === text) continue;
       providerTranslations.set(translation.cueId, text);
       if (currentCue()?.id === translation.cueId) activeChanged = true;
     }
-    if (activeChanged) {
+    // 预取让译文多在字幕出现前到达；只要有译文成功返回，就说明服务已恢复，
+    // 不能让之前某一批的临时失败一直把状态卡在"需要处理"。
+    if (activeChanged || (accepted && translationErrorShown)) {
+      translationErrorShown = false;
       publishRouteStatus();
-      renderActiveCue();
     }
+    if (activeChanged) renderActiveCue();
   };
 
   const handleTaskError = (
@@ -359,6 +370,7 @@ export function createSubtitleSessionController(
     const active = currentCue();
     if (active !== null && !providerTranslations.has(active.id) &&
       task.cues.some(({ id }) => id === active.id)) cueDisplay.fail(active.id);
+    translationErrorShown = true;
     publish({ mode: 'error', code: runtimeErrorForTranslation(error) });
     if (isTerminalProviderError(error)) {
       invalidate('provider-change', false);
@@ -488,7 +500,7 @@ export function createSubtitleSessionController(
       : readCurrentTime(options.tickSource);
     if (clockTime !== undefined) lastTimeMs = clockTime;
     const visible = normalizeDisplayText(tick.visibleText ?? '');
-    if (tick.visibleText !== undefined) nativeGap = visible === null;
+    if (tick.visibleText !== undefined) nativeGap = visible === null && nativeShowsEnglish;
     if (nativeGap) return null;
     if (visible !== null) {
       const nativeIndex = findCueByVisibleText(
@@ -497,6 +509,7 @@ export function createSubtitleSessionController(
         clockTime,
         activeCueIndex,
       );
+      nativeShowsEnglish = nativeIndex !== null;
       if (nativeIndex !== null) return nativeIndex;
     }
     return clockTime === undefined
@@ -720,6 +733,7 @@ export function createSubtitleSessionController(
       officialChineseTrack = change.officialChineseTrack ?? null;
       route = change.route;
       nativeGap = false;
+      nativeShowsEnglish = false;
       lastTimeMs = readCurrentTime(options.tickSource);
       restartCurrentState();
     },

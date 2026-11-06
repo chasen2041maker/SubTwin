@@ -32,6 +32,12 @@ import {
 const MAX_BUFFERED_TIMED_TEXTS = 16;
 const MAX_FAILED_TIMED_TEXT_BODIES_PER_RESOURCE = 3;
 const NATIVE_MATCH_TOLERANCE_MS = 2_000;
+// Netflix 原字幕不是英文（中文、其他语言或关闭）时，无法靠画面文字确认英文轨。
+// 连续看到这么多句对不上英文的原字幕，或这么多句英文字幕时间内原字幕一直为空，
+// 就直接选用首选英文轨，保证无论进入时选了什么字幕都默认显示中英双语。
+const DEFAULT_ENGLISH_EVIDENCE = 2;
+const CJK_TEXT = /[぀-ヿ㐀-鿿가-힯]/u;
+const SILENT_NATIVE_SETTLE_MS = 600;
 
 export type NetflixContentRestartReason = 'episode-change' | 'player-remount';
 
@@ -51,8 +57,10 @@ export interface NetflixContentCatalogSummary {
 
 export interface NetflixContentDiagnostic {
   readonly code:
+    | 'route_changed'
     | 'timed_text_accepted'
     | 'timed_text_descriptor_missing'
+    | 'timed_text_ignored'
     | 'timed_text_parse_failed'
     | 'timed_text_received';
   readonly detail?: string;
@@ -160,6 +168,9 @@ export function createNetflixContentSession(
   let failedResourceFingerprints = new Map<string, Set<string>>();
   let nativeEvidenceByTrack = new Map<string, Set<string>>();
   let stronglyConfirmedTrackId: string | null = null;
+  let lastRouteSignature: string | null = null;
+  let foreignNativeTexts = new Set<string>();
+  let silentNativeCueIds = new Set<string>();
   let pendingTimedText: NetflixTimedTextPayload[] = [];
   let pendingWatchTitleId: string | null = null;
   let controller: SubtitleSessionController | undefined;
@@ -300,6 +311,16 @@ export function createNetflixContentSession(
     const officialChineseTrack = selectParsedTrack('simplified-chinese');
     const decision = route();
     const trackHash = currentTrackHash(englishTrack);
+    const routeSignature = [
+      decision.mode,
+      decision.schedulingScope,
+      englishTrack?.id ?? 'no-english',
+      officialChineseTrack === null ? 'no-zh' : 'zh',
+    ].join(' ');
+    if (routeSignature !== lastRouteSignature) {
+      lastRouteSignature = routeSignature;
+      safeDiagnostic({ code: 'route_changed', detail: routeSignature });
+    }
     if (controller === undefined) {
       controller = createSubtitleSessionController({
         sessionId: adapter.session.sessionId,
@@ -369,6 +390,8 @@ export function createNetflixContentSession(
     failedResourceFingerprints = new Map();
     nativeEvidenceByTrack = new Map();
     stronglyConfirmedTrackId = null;
+    foreignNativeTexts = new Set();
+    silentNativeCueIds = new Set();
     liveCueSequence = 0;
     lastLiveCueText = null;
     pendingTimedText = initialPending;
@@ -471,11 +494,11 @@ export function createNetflixContentSession(
   };
 
   const ingestTimedText = (payload: NetflixTimedTextPayload): boolean => {
-    if (
-      adapter === null ||
-      titleId === null ||
-      payload.titleId !== titleId
-    ) return false;
+    if (adapter === null || titleId === null) return false;
+    if (payload.titleId !== titleId) {
+      safeDiagnostic({ code: 'timed_text_ignored', detail: `other-title ${payload.language}` });
+      return false;
+    }
     const descriptor = resolveDescriptor(payload);
     if (descriptor === null) {
       safeDiagnostic({ code: 'timed_text_descriptor_missing' });
@@ -484,13 +507,20 @@ export function createNetflixContentSession(
     const bodyFingerprint = hashTranslationSource(
       `${payload.format}\u001f${payload.body}`,
     );
-    const failures = failedResourceFingerprints.get(payload.resourceId);
-    const accepted = acceptedResources.get(payload.resourceId);
+    // 资源 ID 由 CDN 地址推导，不同语言的字幕可能落到同一个 ID 上；
+    // "是否更完整"只在同一条字幕轨内比较，否则中文正文会把英文正文挤掉。
+    const resourceKey = `${payload.resourceId}\u001f${descriptor.id}`;
+    const failures = failedResourceFingerprints.get(resourceKey);
+    const accepted = acceptedResources.get(resourceKey);
+    if (accepted?.fingerprint === bodyFingerprint) {
+      safeDiagnostic({ code: 'timed_text_ignored', detail: `duplicate ${descriptor.language}` });
+      return false;
+    }
     if (
-      accepted?.fingerprint === bodyFingerprint ||
       failures?.has(bodyFingerprint) === true ||
       (failures?.size ?? 0) >= MAX_FAILED_TIMED_TEXT_BODIES_PER_RESOURCE
     ) {
+      safeDiagnostic({ code: 'timed_text_ignored', detail: `known-failure ${descriptor.language}` });
       return false;
     }
     const canonicalPayload: NetflixTimedTextPayload = {
@@ -518,15 +548,19 @@ export function createNetflixContentSession(
       }
       const nextFailures = failures ?? new Set<string>();
       nextFailures.add(bodyFingerprint);
-      failedResourceFingerprints.set(payload.resourceId, nextFailures);
+      failedResourceFingerprints.set(resourceKey, nextFailures);
       return false;
     }
     const candidate = timedTextResourceQuality(parsed.value, bodyFingerprint);
     if (accepted !== undefined && !isBetterTimedTextResource(candidate, accepted)) {
+      safeDiagnostic({
+        code: 'timed_text_ignored',
+        detail: `not-better ${descriptor.language} ${candidate.cueCount}<=${accepted.cueCount}`,
+      });
       return false;
     }
-    acceptedResources.set(payload.resourceId, candidate);
-    failedResourceFingerprints.delete(payload.resourceId);
+    acceptedResources.set(resourceKey, candidate);
+    failedResourceFingerprints.delete(resourceKey);
     parsedTracks.set(descriptor.id, parsed.value);
     safeDiagnostic({
       code: 'timed_text_accepted',
@@ -568,15 +602,66 @@ export function createNetflixContentSession(
     for (const payload of pending) handleTimedText(payload);
   };
 
+  const hasActiveEnglishTrack = (): boolean =>
+    adapter?.tracks.some(({ active, language, lifecycle }) =>
+      active && lifecycle !== 'disposed' && language.category === 'english') === true;
+
+  /** 原字幕无法证明英文轨时，选用首选英文轨（普通字幕优先于 CC）。 */
+  function activateDefaultEnglishTrack(): void {
+    const preferred = parsedTrackCandidates('english')[0];
+    const base = eventBase();
+    if (preferred === undefined || base === null) return;
+    foreignNativeTexts = new Set();
+    silentNativeCueIds = new Set();
+    if (!applyEvent({
+      ...base,
+      type: 'track-activity-changed',
+      trackId: preferred.id,
+      active: true,
+    })) return;
+    // 双语都由 SubTwin 用这条轨渲染，画面与译文必然一致，可直接整集预翻译。
+    stronglyConfirmedTrackId = preferred.id;
+    reconcile();
+  }
+
+  function noteForeignNative(visibleText: string): void {
+    if (hasActiveEnglishTrack() || parsedTrackCandidates('english').length === 0) return;
+    silentNativeCueIds = new Set();
+    foreignNativeTexts.add(visibleText);
+    if (foreignNativeTexts.size >= DEFAULT_ENGLISH_EVIDENCE) activateDefaultEnglishTrack();
+  }
+
+  function noteSilentNative(tick: SubtitleSessionTick): void {
+    if (hasActiveEnglishTrack()) return;
+    const preferred = parsedTrackCandidates('english')[0];
+    const currentTimeMs = tick.currentTimeMs ?? options.tickSource.currentTimeMs();
+    if (preferred === undefined || currentTimeMs === undefined) return;
+    const cue = preferred.cues.find((candidate) =>
+      candidate.startMs + SILENT_NATIVE_SETTLE_MS <= currentTimeMs &&
+      currentTimeMs < candidate.endMs);
+    if (cue === undefined) return;
+    silentNativeCueIds.add(cue.id);
+    if (silentNativeCueIds.size >= DEFAULT_ENGLISH_EVIDENCE) activateDefaultEnglishTrack();
+  }
+
   function confirmActiveTrack(tick: SubtitleSessionTick): void {
     if (adapter === null) return;
     const visibleText = normalizeVisibleText(tick.visibleText);
-    if (visibleText === null) return;
+    if (visibleText === null) {
+      noteSilentNative(tick);
+      return;
+    }
+    silentNativeCueIds = new Set();
 
     const matches = parsedTrackCandidates('english').flatMap((track) => {
       const cue = findNativeCueMatch(track, visibleText, tick.currentTimeMs);
       return cue === null ? [] : [{ track, cue }];
     });
+    if (matches.length === 0) {
+      noteForeignNative(visibleText);
+      return;
+    }
+    foreignNativeTexts = new Set();
     // If two tracks display the same line at the same time, that line does not
     // identify the user's selection. Waiting is safer than translating a track
     // that may not be the one Netflix is showing.
@@ -634,6 +719,8 @@ export function createNetflixContentSession(
       return;
     }
     if (visibleText === lastLiveCueText) return;
+    // 原字幕是中日韩文字时不是英文源，不能当作英文送去翻译。
+    if (CJK_TEXT.test(visibleText)) return;
 
     const englishDescriptors = descriptors
       .filter((descriptor) =>
@@ -692,7 +779,11 @@ export function createNetflixContentSession(
     handlePayload(payload) {
       if (disposed) return;
       if (payload.type === 'diagnostic') {
-        if (payload.code === 'display_unavailable') {
+        // 只是某条辅助字幕（如官方中文）捕获超时；英文轨已经可用时不算故障。
+        if (
+          payload.code === 'display_unavailable' &&
+          parsedTrackCandidates('english').length === 0
+        ) {
           safeStatus({ mode: 'error', code: 'netflix_unavailable' });
         }
       } else if (payload.type === 'catalog') handleCatalog(payload);
@@ -753,6 +844,8 @@ export function createNetflixContentSession(
       failedResourceFingerprints.clear();
       nativeEvidenceByTrack.clear();
       stronglyConfirmedTrackId = null;
+      foreignNativeTexts.clear();
+      silentNativeCueIds.clear();
       pendingTimedText = [];
       pendingWatchTitleId = null;
       try {
